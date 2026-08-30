@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f3f6f8">
+  <title>报告生成工具</title>
+  <style>
+    :root {
+      --canvas: #f3f6f8;
+      --panel: #ffffff;
+      --panel-soft: #eef3f5;
+      --ink: #142b3a;
+      --ink-2: #385160;
+      --muted: #5b707c;
+      --line: #d6e0e5;
+      --line-strong: #b7c7cf;
+      --accent: #0f766e;
+      --accent-dark: #0b5f59;
+      --accent-soft: #dcefed;
+      --danger: #b42318;
+      --warning: #8a5100;
+      --shadow: 0 18px 48px rgba(20, 43, 58, .09);
+      --radius: 12px;
+      --radius-small: 8px;
+      --ui: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      --data: Bahnschrift, "DIN Alternate", "Arial Narrow", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { min-width: 320px; background: var(--canvas); }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      overflow-x: hidden;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(20, 43, 58, .025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(20, 43, 58, .025) 1px, transparent 1px),
+        var(--canvas);
+      background-size: 24px 24px;
+      font: 14px/1.55 var(--ui);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, input { font: inherit; }
+    button { color: inherit; touch-action: manipulation; -webkit-tap-highlight-color: rgba(15, 118, 110, .12); }
+    p { text-wrap: pretty; }
+    ::selection { color: #fff; background: var(--accent); }
+    :focus-visible { outline: 3px solid rgba(15, 118, 110, .28); outline-offset: 2px; }
+    .skip-link {
+      position: fixed;
+      left: 16px;
+      top: 12px;
+      z-index: 10;
+      padding: 10px 14px;
+      color: #fff;
+      border-radius: var(--radius-small);
+      background: var(--accent-dark);
+      transform: translateY(-160%);
+      transition: transform 140ms ease;
+    }
+    .skip-link:focus { transform: translateY(0); }
+
+    .app-shell {
+      width: min(1480px, calc(100% - 32px));
+      min-height: calc(100dvh - 32px);
+      margin: 16px auto;
+      display: grid;
+      grid-template-columns: 232px minmax(510px, 1fr) minmax(280px, 360px);
+      overflow: hidden;
+      background: var(--panel);
+      border: 1px solid var(--line-strong);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 22px 18px 18px;
+      color: #edf7f7;
+      background: var(--ink);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 30px;
+    }
+
+    .brand-mark {
+      position: relative;
+      width: 38px;
+      height: 38px;
+      border: 1px solid rgba(255,255,255,.42);
+      border-radius: 9px;
+      background: rgba(255,255,255,.05);
+    }
+
+    .brand-mark::before,
+    .brand-mark::after {
+      content: "";
+      position: absolute;
+      left: 9px;
+      right: 9px;
+      height: 2px;
+      background: #70c7bf;
+      box-shadow: 0 6px 0 rgba(112,199,191,.62), 0 12px 0 rgba(112,199,191,.28);
+    }
+    .brand-mark::before { top: 11px; }
+    .brand-mark::after { top: 9px; left: 16px; right: 16px; transform: rotate(90deg); }
+
+    .brand strong { display: block; font-size: 14px; letter-spacing: .02em; }
+    .brand span { display: block; margin-top: 1px; color: #9fb3bd; font: 11px/1.3 var(--data); letter-spacing: .08em; }
+
+    .side-label {
+      margin: 0 8px 8px;
+      color: #8ea4af;
+      font-size: 11px;
+    }
+
+    .template-nav { display: grid; gap: 7px; }
+    .template-button {
+      position: relative;
+      width: 100%;
+      min-height: 54px;
+      padding: 9px 12px 9px 42px;
+      text-align: left;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      cursor: pointer;
+      transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+    }
+    .template-button:hover { background: rgba(255,255,255,.07); }
+    .template-button:active { transform: scale(.96); }
+    .template-button[aria-pressed="true"] {
+      color: #fff;
+      background: rgba(112,199,191,.13);
+      border-color: rgba(112,199,191,.35);
+    }
+    .template-code {
+      position: absolute;
+      left: 12px;
+      top: 14px;
+      width: 22px;
+      height: 22px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(255,255,255,.24);
+      border-radius: 6px;
+      color: #9fb3bd;
+      font: 11px/1 var(--data);
+    }
+    .template-button[aria-pressed="true"] .template-code {
+      color: #d8fbf7;
+      border-color: #70c7bf;
+    }
+    .template-button strong { display: block; font-size: 13px; font-weight: 650; }
+    .template-button small { color: #9fb3bd; font-size: 11px; }
+
+    .flow-mini {
+      margin-top: 30px;
+      padding: 14px 8px 0;
+      border-top: 1px solid rgba(255,255,255,.1);
+    }
+    .flow-step {
+      position: relative;
+      min-height: 48px;
+      padding-left: 27px;
+      color: #9fb3bd;
+      font-size: 12px;
+    }
+    .flow-step:not(:last-child)::before {
+      content: "";
+      position: absolute;
+      top: 14px;
+      bottom: -3px;
+      left: 6px;
+      width: 1px;
+      background: rgba(255,255,255,.18);
+    }
+    .flow-step::after {
+      content: "";
+      position: absolute;
+      top: 5px;
+      left: 1px;
+      width: 9px;
+      height: 9px;
+      border: 2px solid #6f8793;
+      border-radius: 50%;
+      background: var(--ink);
+    }
+    .flow-step.is-current { color: #fff; }
+    .flow-step.is-current::after { border-color: #70c7bf; background: #70c7bf; box-shadow: 0 0 0 4px rgba(112,199,191,.13); }
+    .flow-step b { display: block; margin-bottom: 1px; font-weight: 600; }
+    .flow-step span { font: 10px var(--data); letter-spacing: .05em; }
+
+    .side-foot {
+      margin-top: auto;
+      padding: 13px 8px 0;
+      border-top: 1px solid rgba(255,255,255,.1);
+      color: #8ea4af;
+      font-size: 11px;
+    }
+
+    .workspace {
+      min-width: 0;
+      padding: 26px clamp(22px, 3vw, 42px) 30px;
+      overflow: auto;
+    }
+
+    .workspace-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    .workspace-header h1 {
+      margin: 0;
+      font-size: clamp(24px, 2.4vw, 34px);
+      line-height: 1.18;
+      letter-spacing: -.035em;
+      font-weight: 720;
+      text-wrap: balance;
+    }
+    .workspace-header p { max-width: 58ch; margin: 8px 0 0; color: var(--muted); }
+
+    .health {
+      flex: 0 0 auto;
+      min-width: 154px;
+      padding: 9px 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-small);
+      background: var(--panel-soft);
+    }
+    .health span { display: block; color: var(--muted); font-size: 11px; }
+    .health strong { display: block; margin-top: 2px; color: var(--accent-dark); font-size: 12px; }
+    .health strong.is-warning { color: var(--warning); }
+    .health strong.is-error { color: var(--danger); }
+
+    .section { margin-top: 27px; }
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 11px;
+    }
+    .section-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
+    .section-head p { margin: 0; color: var(--muted); font-size: 12px; }
+
+    .form-stack {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+    }
+
+    .file-row {
+      display: grid;
+      grid-template-columns: 174px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 14px;
+      min-height: 66px;
+      padding: 10px 12px 10px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .file-row:last-child { border-bottom: 0; }
+    .file-label { min-width: 0; }
+    .file-label label { display: block; font-weight: 650; }
+    .file-label small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+    .path-field {
+      width: 100%;
+      min-width: 0;
+      height: 40px;
+      padding: 0 11px;
+      color: var(--ink-2);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-small);
+      background: var(--panel-soft);
+      font-size: 12px;
+      text-overflow: ellipsis;
+    }
+    .path-field::placeholder { color: #526873; opacity: 1; }
+    .path-field:not(:placeholder-shown) { color: var(--ink); background: #fff; }
+
+    .button {
+      min-height: 42px;
+      padding: 0 15px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-small);
+      background: #fff;
+      font-weight: 650;
+      white-space: nowrap;
+      cursor: pointer;
+      transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+    }
+    .button:hover { border-color: #8da2ac; background: var(--panel-soft); }
+    .button:active { transform: scale(.96); }
+    .button.primary { color: #fff; border-color: var(--accent); background: var(--accent); }
+    .button.primary:hover { border-color: var(--accent-dark); background: var(--accent-dark); }
+    .button.primary:disabled { color: #738892; border-color: #d4dee3; background: #e6edef; cursor: not-allowed; transform: none; }
+    .button:disabled { cursor: not-allowed; opacity: .72; transform: none; }
+    .button.ghost { color: var(--accent-dark); border-color: transparent; background: transparent; }
+    .button.ghost:hover { background: var(--accent-soft); }
+
+    .threshold-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .threshold {
+      position: relative;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-small);
+      background: var(--panel-soft);
+    }
+    .threshold label { display: block; margin-bottom: 7px; color: var(--ink-2); font-size: 12px; }
+    .threshold:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(15, 118, 110, .18); }
+    .number-wrap { display: flex; align-items: center; gap: 6px; }
+    .number-wrap input {
+      width: 100%;
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      outline: 0;
+      color: var(--ink);
+      background: transparent;
+      font: 700 24px/1 var(--data);
+      font-variant-numeric: tabular-nums;
+    }
+    .number-wrap span { color: var(--muted); font-size: 12px; }
+
+    .output-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 10px;
+    }
+    .output-item {
+      min-width: 0;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-small);
+      background: #fff;
+    }
+    .output-item span { display: block; color: var(--muted); font-size: 11px; }
+    .output-item strong { display: block; margin-top: 4px; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+
+    .monitor {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      padding: 26px 22px 22px;
+      border-left: 1px solid var(--line);
+      background: #f8fafb;
+    }
+    .monitor-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .monitor-head h2 { margin: 0; font-size: 15px; }
+    .status-text { color: var(--muted); font: 11px var(--data); }
+    .status-text.running { color: var(--accent-dark); }
+    .status-text.error { color: var(--danger); }
+
+    .progress-block { margin-top: 18px; }
+    .progress-meta { display: flex; justify-content: space-between; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+    .progress-meta strong { color: var(--ink); font: 650 12px var(--data); font-variant-numeric: tabular-nums; }
+    .progress-track { height: 5px; overflow: hidden; border-radius: 999px; background: #dfe7ea; }
+    .progress-bar { width: 100%; height: 100%; background: var(--accent); clip-path: inset(0 100% 0 0); }
+
+    .run-stages { display: grid; gap: 11px; margin: 22px 0; }
+    .run-stage {
+      position: relative;
+      min-height: 35px;
+      padding-left: 32px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .run-stage:not(:last-child)::before { content: ""; position: absolute; left: 10px; top: 19px; bottom: -13px; width: 1px; background: var(--line-strong); }
+    .run-stage::after { content: ""; position: absolute; left: 5px; top: 5px; width: 9px; height: 9px; border: 2px solid var(--line-strong); border-radius: 50%; background: #f8fafb; }
+    .run-stage strong { display: block; color: var(--ink-2); font-weight: 650; }
+    .run-stage.is-active strong { color: var(--accent-dark); }
+    .run-stage.is-active::after { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+    .run-stage.is-done::after { border-color: var(--accent); background: var(--accent-soft); }
+
+    .log-panel {
+      min-height: 170px;
+      flex: 1;
+      overflow: auto;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-small);
+      color: #d7e4e8;
+      background: #18313f;
+      font: 11px/1.72 "Cascadia Mono", Consolas, monospace;
+      scrollbar-color: #456372 #18313f;
+      scrollbar-width: thin;
+    }
+    .log-line { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 8px; }
+    .log-time { color: #84a1ae; font-variant-numeric: tabular-nums; }
+    .log-line.ok .log-message { color: #91d8cf; }
+    .log-line.error .log-message { color: #ffafa8; }
+
+    .run-actions { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 12px; }
+    .run-actions .primary { width: 100%; }
+    .monitor-note { margin: 12px 0 0; color: var(--muted); font-size: 11px; }
+
+    .toast {
+      position: fixed;
+      z-index: 20;
+      right: 28px;
+      top: 28px;
+      max-width: min(360px, calc(100vw - 32px));
+      padding: 12px 15px;
+      color: #fff;
+      border-radius: var(--radius-small);
+      background: var(--ink);
+      box-shadow: 0 14px 34px rgba(20,43,58,.2);
+      opacity: 0;
+      transform: translateY(10px);
+      pointer-events: none;
+      transition: opacity 180ms ease, transform 180ms ease;
+    }
+    .toast.is-visible { opacity: 1; transform: translateY(0); }
+
+    .only-gd[hidden], .only-cq[hidden] { display: none !important; }
+
+    @media (max-width: 1120px) {
+      .app-shell { grid-template-columns: 210px minmax(500px, 1fr); }
+      .sidebar { grid-row: 1 / span 2; }
+      .monitor { grid-column: 2; border-top: 1px solid var(--line); border-left: 0; }
+      .run-stages { grid-template-columns: repeat(4, 1fr); }
+      .run-stage { padding: 27px 8px 0 0; }
+      .run-stage:not(:last-child)::before { top: 10px; left: 15px; right: -11px; bottom: auto; width: auto; height: 1px; }
+      .run-stage::after { top: 5px; left: 7px; }
+      .log-panel { min-height: 150px; }
+    }
+
+    @media (max-width: 760px) {
+      body { background: var(--canvas); }
+      .app-shell { width: 100%; min-height: 100dvh; margin: 0; grid-template-columns: 1fr; border: 0; border-radius: 0; }
+      .sidebar { padding: 16px; }
+      .brand { margin-bottom: 16px; }
+      .template-nav { grid-template-columns: 1fr 1fr; }
+      .flow-mini, .side-foot { display: none; }
+      .workspace { padding: 22px 16px 26px; }
+      .workspace-header { display: block; }
+      .health { margin-top: 16px; }
+      .file-row { grid-template-columns: 1fr auto; gap: 8px; }
+      .file-label { grid-column: 1 / -1; }
+      .threshold-grid, .output-strip { grid-template-columns: 1fr; }
+      .monitor { grid-column: 1; padding: 22px 16px; }
+      .run-stages { grid-template-columns: 1fr 1fr; }
+      .run-stage:not(:last-child)::before { display: none; }
+      .run-actions {
+        position: sticky;
+        bottom: 0;
+        z-index: 2;
+        grid-template-columns: 1fr;
+        padding: 10px 0 max(4px, env(safe-area-inset-bottom));
+        background: #f8fafb;
+      }
+      .run-actions .button { width: 100%; }
+      .button { min-height: 44px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <!--
+  THESIS: 工程资料路由台，把文件选择、校验和报告生成组织成一条可追踪流程，拒绝传统桌面表单的灰色控件堆叠。
+  OWN-WORLD: 冷白测绘底格、墨蓝工作台、青绿单一强调色、细线流程节点、紧凑数据排版。
+  STORY: 用户先确认项目模板，再补齐来源文件，随后在同一视野内观察生成阶段与日志并打开结果。
+  FIRST VIEWPORT: 左侧模板导航，中央主配置区，右侧运行监控；主要操作固定在右栏底部。
+  FORM: 工程资料路由板，方向种子 103c5e1a。
+  FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+  -->
+  <a class="skip-link" href="#mainWorkspace">跳到资料配置</a>
+  <main class="app-shell">
+    <aside class="sidebar" aria-label="项目模板导航">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div><strong>报告生成工具</strong><span>REPORT WORKBENCH</span></div>
+      </div>
+
+      <p class="side-label">选择项目模板</p>
+      <div class="template-nav" aria-label="项目模板">
+        <button class="template-button" type="button" aria-pressed="true" data-template="cq">
+          <span class="template-code">CQ</span>
+          <strong>重庆项目</strong>
+          <small>分段统计与检测报告</small>
+        </button>
+        <button class="template-button" type="button" aria-pressed="false" data-template="gd">
+          <span class="template-code">GD</span>
+          <strong>广东项目</strong>
+          <small>多地市批量报告</small>
+        </button>
+      </div>
+
+      <div class="flow-mini" aria-label="生成流程">
+        <div class="flow-step is-current"><b>资料输入</b><span>INPUT</span></div>
+        <div class="flow-step"><b>数据识别</b><span>SCAN</span></div>
+        <div class="flow-step"><b>统计计算</b><span>ANALYZE</span></div>
+        <div class="flow-step"><b>报告输出</b><span>EXPORT</span></div>
+      </div>
+
+      <div class="side-foot" id="environmentStatus">数据仅在本机处理<br>正在连接桌面服务…</div>
+    </aside>
+
+    <section class="workspace" id="mainWorkspace" tabindex="-1" aria-labelledby="pageTitle">
+      <header class="workspace-header">
+        <div>
+          <h1 id="pageTitle">重庆项目资料配置</h1>
+          <p id="pageDescription">选择检测资料所在位置。系统将生成统计工作簿和第五部分检测报告。</p>
+        </div>
+        <div class="health" aria-live="polite">
+          <span>配置状态</span>
+          <strong id="configStatus">等待选择资料</strong>
+        </div>
+      </header>
+
+      <section class="section" aria-labelledby="sourceTitle">
+        <div class="section-head">
+          <h2 id="sourceTitle">资料来源</h2>
+          <p id="sourceHint">5 项输入</p>
+        </div>
+        <div class="form-stack" id="sourceForm">
+          <div class="file-row">
+            <div class="file-label"><label for="projectPath">项目资料文件夹</label><small>选择后自动补全可识别路径</small></div>
+            <input class="path-field" id="projectPath" name="projectPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
+            <button class="button choose-button" type="button" data-target="projectPath">选择文件夹</button>
+          </div>
+          <div class="file-row only-cq">
+            <div class="file-label"><label for="summaryPath">分段汇总表</label><small>G210 采集路段信息汇总</small></div>
+            <input class="path-field" id="summaryPath" name="summaryPath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
+            <button class="button choose-button" type="button" data-target="summaryPath">选择文件</button>
+          </div>
+          <div class="file-row only-cq">
+            <div class="file-label"><label for="detailPath">检测明细文件夹</label><small>交安设施现场检测明细</small></div>
+            <input class="path-field" id="detailPath" name="detailPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
+            <button class="button choose-button" type="button" data-target="detailPath">选择文件夹</button>
+          </div>
+          <div class="file-row only-cq">
+            <div class="file-label"><label for="diseasePath">病害清单文件夹</label><small>用于匹配螺栓缺失图片</small></div>
+            <input class="path-field" id="diseasePath" name="diseasePath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
+            <button class="button choose-button" type="button" data-target="diseasePath">选择文件夹</button>
+          </div>
+
+          <div class="file-row only-gd" hidden>
+            <div class="file-label"><label for="markingPath">标线数据文件夹</label><small>可由项目资料自动识别</small></div>
+            <input class="path-field" id="markingPath" name="markingPath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时扫描项目文件夹…">
+            <button class="button choose-button" type="button" data-target="markingPath">更改位置</button>
+          </div>
+          <div class="file-row only-gd" hidden>
+            <div class="file-label"><label for="guardrailPath">护栏数据文件夹</label><small>可由项目资料自动识别</small></div>
+            <input class="path-field" id="guardrailPath" name="guardrailPath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时扫描项目文件夹…">
+            <button class="button choose-button" type="button" data-target="guardrailPath">更改位置</button>
+          </div>
+          <div class="file-row only-gd" hidden>
+            <div class="file-label"><label for="manualPath">人工自动化对比表</label><small>用于一致性检验</small></div>
+            <input class="path-field" id="manualPath" name="manualPath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
+            <button class="button choose-button" type="button" data-target="manualPath">选择文件</button>
+          </div>
+          <div class="file-row only-gd" hidden>
+            <div class="file-label"><label for="routePath">路线分类表</label><small>高速公路与普通国省道分类</small></div>
+            <input class="path-field" id="routePath" name="routePath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
+            <button class="button choose-button" type="button" data-target="routePath">选择文件</button>
+          </div>
+          <div class="file-row">
+            <div class="file-label"><label for="outputPath">输出文件夹</label><small>保存生成的 Word 与 Excel</small></div>
+            <input class="path-field" id="outputPath" name="outputPath" type="text" autocomplete="off" readonly placeholder="默认使用项目资料文件夹…">
+            <button class="button choose-button" type="button" data-target="outputPath">选择文件夹</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="section only-gd" hidden aria-labelledby="thresholdTitle">
+        <div class="section-head">
+          <h2 id="thresholdTitle">一致性阈值</h2>
+          <p>可直接修改</p>
+        </div>
+        <div class="threshold-grid">
+          <div class="threshold"><label for="markingThreshold">标线相对偏差</label><div class="number-wrap"><input id="markingThreshold" name="markingThreshold" type="number" inputmode="decimal" autocomplete="off" value="7" min="0" max="100"><span>%</span></div></div>
+          <div class="threshold"><label for="heightThreshold">护栏高度绝对偏差</label><div class="number-wrap"><input id="heightThreshold" name="heightThreshold" type="number" inputmode="decimal" autocomplete="off" value="5" min="0" max="100"><span>mm</span></div></div>
+          <div class="threshold"><label for="boltThreshold">螺栓缺失相对偏差</label><div class="number-wrap"><input id="boltThreshold" name="boltThreshold" type="number" inputmode="decimal" autocomplete="off" value="5" min="0" max="100"><span>%</span></div></div>
+        </div>
+      </section>
+
+      <section class="section" aria-labelledby="outputTitle">
+        <div class="section-head"><h2 id="outputTitle">预计输出</h2><p>路径随项目变化</p></div>
+        <div class="output-strip only-cq">
+          <div class="output-item"><span>统计工作簿</span><strong>重庆G210护栏统计.xlsx</strong></div>
+          <div class="output-item"><span>检测报告</span><strong>重庆G210交安设施检测报告.docx</strong></div>
+        </div>
+        <div class="output-strip only-gd" hidden>
+          <div class="output-item"><span>城市报告</span><strong>各地市在役公路检测评价报告第五部分.docx</strong></div>
+          <div class="output-item"><span>图表工作簿</span><strong>各地市交安设施统计图表.xlsx</strong></div>
+        </div>
+      </section>
+    </section>
+
+    <aside class="monitor" aria-label="运行监控">
+      <div class="monitor-head"><h2>生成监控</h2><span class="status-text" id="runStatus">READY</span></div>
+      <div class="progress-block">
+        <div class="progress-meta"><span id="progressLabel">尚未开始</span><strong id="progressValue">0%</strong></div>
+        <div class="progress-track" role="progressbar" aria-label="生成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-bar" id="progressBar"></div></div>
+      </div>
+
+      <div class="run-stages" aria-label="运行阶段">
+        <div class="run-stage" data-stage="0"><strong>校验资料</strong><span>检查输入路径</span></div>
+        <div class="run-stage" data-stage="1"><strong>识别数据</strong><span>读取表头和记录</span></div>
+        <div class="run-stage" data-stage="2"><strong>统计生成</strong><span>生成图表与章节</span></div>
+        <div class="run-stage" data-stage="3"><strong>保存结果</strong><span>写入输出文件夹</span></div>
+      </div>
+
+      <div class="log-panel" id="logPanel" aria-live="polite" aria-label="运行日志">
+        <div class="log-line"><span class="log-time">--:--</span><span class="log-message">等待配置项目资料</span></div>
+        <div class="log-line"><span class="log-time">--:--</span><span class="log-message">桌面服务连接后即可选择本地文件</span></div>
+      </div>
+
+      <div class="run-actions">
+        <button class="button primary" id="runButton" type="button" disabled>开始生成</button>
+        <button class="button" id="openButton" type="button" disabled>打开输出</button>
+      </div>
+      <p class="monitor-note">运行时请关闭正在占用的 Excel 或 Word 文件。</p>
+    </aside>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
