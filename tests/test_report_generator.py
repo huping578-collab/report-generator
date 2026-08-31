@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -449,6 +451,227 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         self.assertIn("平均偏差", text)
         self.assertIn("一致性占比", text)
         self.assertNotIn("1.00～3.00", text)
+
+
+REAL_E2E_ENV = "REPORT_E2E_REAL"
+# 真实数据路径：与京炜交通\广东项目\交安报告生成 工具端到端脚本同源。
+_GD_BASE = Path(r"D:/京炜交通/广东项目")
+_ROUTE_XLSX = _GD_BASE / "附件3_4_抽检路段明细统计.xlsx"
+_MANUAL_XLSX = _GD_BASE / "交安报告生成" / "人工自动化对比.xlsx"
+_TPL_DOCX = Path(r"D:/京炜交通/米奇妙妙屋工具箱/报告生成/templates/广东项目第五章模板.docx")
+_FOSHAN = {
+    "name": "佛山",
+    "marking": _GD_BASE / "交安报告生成" / "佛山标线数据" / "佛山市标线统计数据",
+    "guardrail": _GD_BASE / "交安报告生成" / "广东省-佛山市-交安设施现场检测-明细-20260729150003",
+}
+_ZHUHAI = {
+    "name": "珠海",
+    "marking": _GD_BASE / "交安报告生成" / "珠海项目报告" / "珠海标线统计数据",
+    "guardrail": _GD_BASE / "交安报告生成" / "珠海项目报告" / "广东省-珠海市-交安设施现场检测-明细-20260828104102",
+}
+
+
+def _scan_city(city: dict, route_index) -> dict:
+    """真实数据扫描：与 run_guangdong_project 中标线/护栏分别扫描的同款逻辑。"""
+    scanned = {"height": [], "bolt": [], "marking": [], "notes": [], "issues": []}
+    for key, kinds in (("marking", ("marking",)), ("guardrail", ("height", "bolt", "notes"))):
+        root = city.get(key)
+        if not root or not root.is_dir():
+            continue
+        partial = engine.GuangdongInputScanner(root, route_index).scan()
+        for kind in kinds:
+            scanned[kind].extend(partial.get(kind, []))
+        scanned["issues"].extend(partial.get("issues", []))
+    return scanned
+
+
+def _run_real_pipeline(cities: list[dict], artifact_root: Path) -> dict:
+    """绕开 run_guangdong_project 硬编码的模板路径：直接拼装 scan+build_bundles+run_bundles。"""
+    if not _TPL_DOCX.is_file():
+        raise FileNotFoundError(f"真实数据测试缺少模板：{_TPL_DOCX}")
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    route_index = engine.RouteCategoryIndex.from_file(_ROUTE_XLSX)
+    manual_records, manual_issues = engine.ManualAutoComparator.read_file(_MANUAL_XLSX)
+    thresholds = {"marking": 7, "height": 5, "bolt": 5}
+
+    result = {"success": [], "failed": {}, "warnings": []}
+    for city in cities:
+        # 每个城市独立 scan/build/run，避免跨城市路线记录进入同一个 bundle。
+        scanned = _scan_city(city, route_index)
+        scanned["issues"] = list(manual_issues) + scanned["issues"]
+        bundles = engine.GuangdongBatchRunner.build_bundles(scanned, route_index, manual_records, thresholds)
+        partial = engine.GuangdongBatchRunner.run_bundles(
+            bundles, artifact_root, _TPL_DOCX, thresholds
+        )
+        result["success"].extend(partial["success"])
+        result["failed"].update(partial["failed"])
+        result["warnings"].extend(partial["warnings"])
+    return result
+
+
+def _collect_docx_text(docx_path: Path) -> str:
+    document = Document(str(docx_path))
+    return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+
+def _collect_segment_order(text: str, marker: str) -> list[str]:
+    """按指标汇总表分段提取 a. 区段标题中的桩号范围。"""
+    import re
+
+    summary_markers = (
+        "标线逆反射区段汇总表",
+        "护栏中心高度区段汇总表",
+        "护栏螺栓缺失区段汇总表",
+    )
+    aliases = {
+        "标线逆反射区段": "标线逆反射区段汇总表",
+        "护栏中心高度": "护栏中心高度区段汇总表",
+        "螺栓": "护栏螺栓缺失区段汇总表",
+    }
+    wanted = aliases.get(marker, marker)
+    if wanted not in summary_markers:
+        raise ValueError(f"未知指标汇总表 marker：{marker}")
+
+    title = re.compile(r"^\s*[a-z]\.\s+")
+    pattern = re.compile(r"K\+?\d+(?:\.\d+)?[~～]K\+?\d+(?:\.\d+)?")
+    result: list[str] = []
+    active = False
+    for line in text.splitlines():
+        found = next((item for item in summary_markers if item in line), None)
+        if found is not None:
+            active = found == wanted
+            continue
+        if not active or not title.match(line):
+            continue
+        match = pattern.search(line)
+        if match:
+            result.append(match.group(0))
+    return result
+
+
+@unittest.skipUnless(os.environ.get(REAL_E2E_ENV) == "1", f"set {REAL_E2E_ENV}=1 to run")
+class RealDataE2ETests(unittest.TestCase):
+    """真实佛山/珠海端到端回归；产物仅落在 tests/artifacts/real-data/，不进 git。"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        for path in (
+            _ROUTE_XLSX,
+            _MANUAL_XLSX,
+            _TPL_DOCX,
+            _FOSHAN["marking"],
+            _FOSHAN["guardrail"],
+            _ZHUHAI["marking"],
+            _ZHUHAI["guardrail"],
+        ):
+            if not path.is_file() and not path.is_dir():
+                raise unittest.SkipTest(f"真实数据不可用：{path}")
+
+    def _run(self, cities: list[dict], sub: str) -> dict:
+        artifact_root = Path(__file__).resolve().parent / "artifacts" / "real-data" / sub
+        if artifact_root.exists():
+            # 清空旧产物，避免上轮 run 的 docx 干扰本次断言。
+            import shutil
+
+            shutil.rmtree(artifact_root, ignore_errors=True)
+        return _run_real_pipeline(cities, artifact_root)
+
+    def test_foshan_minimal_integration_runs_end_to_end(self) -> None:
+        result = self._run([_FOSHAN], "foshan")
+        self.assertIn("佛山市", result["success"])
+        foshan_dir = Path(__file__).resolve().parent / "artifacts" / "real-data" / "foshan" / "佛山市"
+        docx_path = next(foshan_dir.glob("*第五部分.docx"), None)
+        self.assertIsNotNone(docx_path, f"未生成佛山 docx：{foshan_dir}")
+        self._assert_docx_complete(docx_path, "佛山")
+        text = _collect_docx_text(docx_path)
+        self.assertEqual(text.count("区段内无护栏"), 0)
+        self.assertEqual(text.count("共检测0个有效点，其中。"), 0)
+
+    def test_foshan_and_zhuhai_full_e2e_artifact_checks(self) -> None:
+        result = self._run([_FOSHAN, _ZHUHAI], "foshan-zhuhai")
+        self.assertIn("佛山市", result["success"])
+        self.assertIn("珠海市", result["success"], msg=f"珠海失败：{result['failed']}")
+        self.assertFalse(result["failed"], f"运行失败：{result['failed']}")
+
+        artifact_root = Path(__file__).resolve().parent / "artifacts" / "real-data" / "foshan-zhuhai"
+        foshan_docx = next((artifact_root / "佛山市").glob("*第五部分.docx"), None)
+        zhuhai_docx = next((artifact_root / "珠海市").glob("*第五部分.docx"), None)
+        self.assertIsNotNone(foshan_docx, "佛山 docx 缺失")
+        self.assertIsNotNone(zhuhai_docx, "珠海 docx 缺失")
+        self._assert_docx_complete(foshan_docx, "佛山")
+        self._assert_docx_complete(zhuhai_docx, "珠海")
+
+        # 仅抽取检查中用得到的城市子串，避免佛山段落污染珠海或反之。
+        foshan_text = _collect_docx_text(foshan_docx)
+        zhuhai_text = _collect_docx_text(zhuhai_docx)
+
+        for label, text in (("佛山", foshan_text), ("珠海", zhuhai_text)):
+            self.assertEqual(text.count("区段内无护栏"), 0, f"{label}出现旧句：区段内无护栏")
+            self.assertEqual(text.count("共检测0个有效点，其中。"), 0, f"{label}出现残句：共检测0个有效点，其中。")
+
+        # 标线/高度/螺栓三章节共同区段顺序一致：抽取各章节首次出现的区段链，比较相等。
+        for label, text in (("佛山", foshan_text), ("珠海", zhuhai_text)):
+            for marker in ("标线逆反射区段", "护栏中心高度", "螺栓"):
+                segments = _collect_segment_order(text, marker)
+                self.assertGreater(len(segments), 1, f"{label}/{marker} 区段数不足，无法比序")
+            marking = _collect_segment_order(text, "标线逆反射区段")
+            height = _collect_segment_order(text, "护栏中心高度")
+            bolt = _collect_segment_order(text, "螺栓")
+            common = [s for s in marking if s in set(height) & set(bolt)]
+            self.assertGreater(len(common), 1, f"{label} 共同区段数={len(common)}，无法比序")
+            height_in_common = [s for s in height if s in set(common)]
+            bolt_in_common = [s for s in bolt if s in set(common)]
+            self.assertEqual(common, height_in_common, f"{label} 标线/高度共同区段相对顺序不一致")
+            self.assertEqual(common, bolt_in_common, f"{label} 标线/螺栓共同区段相对顺序不一致")
+
+        # 抽查珠海 docx 的一个螺栓对比表：物理 w:tc 8/10/10、两个父表头 gridSpan=2。
+        bolt_table_index, bolt_table = self._find_bolt_comparison_table(zhuhai_docx)
+        with zipfile.ZipFile(zhuhai_docx) as archive:
+            xml = archive.read(f"word/document.xml")
+        self._assert_two_level_bolt_header(
+            xml, bolt_table_index, label=f"珠海 螺栓对比表 #{bolt_table_index}"
+        )
+
+    def _find_bolt_comparison_table(self, docx_path: Path):
+        document = Document(str(docx_path))
+        for index, table in enumerate(document.tables):
+            text = "\n".join(cell.text or "" for row in table.rows for cell in row.cells)
+            rows = table._tbl.findall("./w:tr", table._tbl.nsmap)
+            cell_counts = [len(row.findall("./w:tc", table._tbl.nsmap)) for row in rows]
+            if "拼接螺栓" in text and cell_counts[:3] == [8, 10, 10]:
+                return index, table
+        self.fail(f"未在 {docx_path} 中找到物理列为8/10/10的螺栓对比表")
+
+    def _assert_docx_complete(self, docx_path: Path, label: str) -> None:
+        with zipfile.ZipFile(docx_path) as archive:
+            self.assertIsNone(archive.testzip(), f"{label} docx ZIP 存在损坏成员")
+
+    def _assert_two_level_bolt_header(self, document_xml: bytes, table_index: int, label: str) -> None:
+        from xml.etree import ElementTree as ET
+
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        root = ET.fromstring(document_xml)
+        tables = root.findall(f".//{{{ns['w']}}}tbl")
+        if not 0 <= table_index < len(tables):
+            self.fail(f"{label} XML 表格索引越界：{table_index}/{len(tables)}")
+        table = tables[table_index]
+        text = "".join(t.text or "" for t in table.iter(f"{{{ns['w']}}}t"))
+        self.assertIn("拼接螺栓", text, f"{label} XML 表格内容不符")
+        rows = table.findall(f"{{{ns['w']}}}tr")
+        cell_counts = [len(r.findall(f"{{{ns['w']}}}tc")) for r in rows]
+        self.assertGreaterEqual(len(cell_counts), 3, f"{label} 行数不足：{cell_counts}")
+        self.assertEqual(cell_counts[:3], [8, 10, 10], f"{label} 物理列不符：{cell_counts}")
+        self.assertTrue(all(count == 10 for count in cell_counts[2:]), f"{label} 数据行物理列不符：{cell_counts}")
+        grid = table.find(f"{{{ns['w']}}}tblGrid")
+        grid_columns = [] if grid is None else grid.findall(f"{{{ns['w']}}}gridCol")
+        self.assertEqual(len(grid_columns), 10, f"{label} 物理网格列不符：{len(grid_columns)}")
+        top = rows[0].findall(f"{{{ns['w']}}}tc")
+        spans = []
+        for cell in top:
+            span = cell.find(f"{{{ns['w']}}}tcPr/{{{ns['w']}}}gridSpan")
+            spans.append(int(span.get(f"{{{ns['w']}}}val")) if span is not None else 1)
+        self.assertEqual(spans.count(2), 2, f"{label} 父表头 gridSpan=2 应有2个：{spans}")
+        self.assertEqual(len(spans), 8, f"{label} 父表头数量不符：{spans}")
 
 
 if __name__ == "__main__":
