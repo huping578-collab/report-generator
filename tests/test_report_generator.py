@@ -391,41 +391,36 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         self.assertNotIn("区段内无护栏", text)
         self.assertNotIn("共检测0个有效点，其中。", text)
 
-    def test_add_table_emits_expected_physical_and_logical_grid(self) -> None:
+    def test_comparison_table_emits_expected_two_level_bolt_header_xml(self) -> None:
         document = Document()
-        headers = [
-            "路线",
-            "护栏类型",
-            "护栏位置",
-            "方向",
-            "桩号范围",
-            "人工复核螺栓缺失数量",
-            "拼接螺栓缺失数量",
-            "自动化螺栓缺失数量",
-            "连接螺栓缺失数量",
-            "备注",
-        ]
-        try:
-            table = engine.GuangdongChapterWriter._add_table(
-                document,
-                headers,
-                [["G1", "二波", "左侧", "上行", "K1+000～K2+000", 1, 2, ""]],
-                merge={
-                    5: ("人工复核螺栓缺失数量", 2),
-                    7: ("自动化螺栓缺失数量", 2),
-                },
-            )
-        except TypeError as exc:
-            self.fail(f"_add_table 尚不支持两级合并表头：{exc}")
-
-        top_cells = table._tbl.findall("./w:tr", table._tbl.nsmap)[0].findall("./w:tc", table._tbl.nsmap)
+        engine.GuangdongChapterWriter._comparison_table(
+            document,
+            [{
+                "indicator": "bolt",
+                "route": "G1",
+                "gtype": "二波",
+                "position": "左侧",
+                "direction": "上行",
+                "segment": "K1+000～K2+000",
+                "msplice": 1,
+                "mconn": 2,
+                "asplice": 1,
+                "aconn": 2,
+                "remark": "",
+            }],
+            {"marking": 7, "height": 5, "bolt": 5},
+        )
+        table = document.tables[1]
+        xml_rows = table._tbl.findall("./w:tr", table._tbl.nsmap)
+        cell_counts = [len(row.findall("./w:tc", table._tbl.nsmap)) for row in xml_rows]
+        top_cells = xml_rows[0].findall("./w:tc", table._tbl.nsmap)
         spans = []
         for cell in top_cells:
             span = cell.find("./w:tcPr/w:gridSpan", cell.nsmap)
             spans.append(int(span.get(qn("w:val"))) if span is not None else 1)
         grid_columns = table._tbl.findall("./w:tblGrid/w:gridCol", table._tbl.nsmap)
-        self.assertEqual(len(top_cells), 8)
-        self.assertEqual(sum(spans), 10)
+
+        self.assertEqual(cell_counts, [8, 10, 10])
         self.assertEqual(len(grid_columns), 10)
         self.assertEqual(spans, [1, 1, 1, 1, 1, 2, 2, 1])
 

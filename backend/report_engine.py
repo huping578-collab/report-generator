@@ -2486,7 +2486,7 @@ class GuangdongChapterWriter:
                     p+=n-1; i+=n
                 else:
                     phys_of[i]=p; p+=1; i+=1
-            physical=len(headers)
+            physical=p
             table=doc.add_table(rows=2,cols=physical); table.style="Table Grid"
             # 清空默认两行，手工构建 tr
             tbl=table._tbl
@@ -2508,7 +2508,7 @@ class GuangdongChapterWriter:
             while i < len(headers):
                 if i in merge and merge[i][0]:
                     parent,n=merge[i]
-                    top.append(_tc(parent, span=n))
+                    top.append(_tc(parent, span=n-1))
                     for j in range(i+1, i+n):
                         sub.append(_tc(headers[j]))
                     i+=n
