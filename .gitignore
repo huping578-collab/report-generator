@@ -6,7 +6,9 @@ __pycache__/
 logs/
 build/
 dist/
-artifacts/
+/artifacts/
+tests/artifacts/*
+!tests/artifacts/.gitkeep
 *.spec.bak
 *.log
 .DS_Store

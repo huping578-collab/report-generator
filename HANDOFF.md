@@ -30,16 +30,11 @@ frontend/
   app.js                   # 交互 + pywebview 桥接调用 + 状态机
 templates/                 # 模板放置（.docx 用户提供，gitignore 排除；说明文件入库）
 tests/
-  test_bridge.py           # 桥接单元测试（8 项中的 6 项）
-  test_minimal_docx.py     # 程序化报告测试（8 项中的 2 项）
-  cdp_verify.mjs           # 无依赖 Chrome CDP 浏览器回归（14 项断言 + 截图）
+  test_report_generator.py # 唯一长期测试程序
+  artifacts/               # 测试产物目录；Git 仅保留 .gitkeep
 build-tools/
   create_icon.py           # 生成 assets/app.ico（PIL）
-  report_generator.spec    # PyInstaller spec（collect_all webview + pythonnet）
-  launch-and-probe.ps1     # 启动 EXE 并检测窗口句柄
-  capture-window.ps1       # PrintWindow 抓窗口 PNG 到 artifacts/screenshots
-  probe_webview.py         # WebView 环境探针（LOADED_OK 即正常）
-  smoke_webview.py         # 最小 pywebview 冒烟
+report_generator.spec      # PyInstaller spec（collect_all webview + pythonnet）
 build.bat                  # 一键构建（调用 spec + 复制模板说明/使用说明）
 README.md / 使用说明.txt   # 面向开发 / 最终用户
 DESIGN.md / PRODUCT.md     # 设计系统与产品文档
@@ -61,11 +56,9 @@ python -m venv .venv
 
 | 项目 | 命令 | 结果 |
 |---|---|---|
-| 桥接单元测试 | `.venv\Scripts\python.exe -m unittest discover -s tests -v` | 8 passed |
-| 浏览器回归 | `node tests\cdp_verify.mjs` | 14 passed（1440×900 桌面 + 375×812 移动，含键盘焦点、reduced-motion、44px 触控、无横向溢出） |
+| 报告生成回归 | `.venv\Scripts\python.exe -m unittest tests.test_report_generator -v` | 13 passed |
 | 源码模式 GUI | `.venv\Scripts\python.exe app.py` | 窗口出现，pywebview loaded |
-| 打包 EXE | `powershell -File build-tools\launch-and-probe.ps1` | hwnd≠0，responding=True |
-| 打包窗口截图 | `powershell -File build-tools\capture-window.ps1` → `artifacts/screenshots/exe-window.png` | 三栏完整渲染 |
+| 打包 EXE | `build.bat` | 生成 `dist\报告生成工具\报告生成工具.exe` |
 
 ## 6. 关键决策与坑位（必须知道的）
 
@@ -91,7 +84,9 @@ python -m venv .venv
 ## 8. 交接约定
 
 - 日常改动先本地 commit（`git add -A && git commit`），推送需用户明确说"上传/合并"。
-- 改前端后跑 `node tests\cdp_verify.mjs`；改后端后跑 unittest；改桥接后两者都跑。
-- 动了 `app.py`/依赖后重新 `build.bat` 并跑 `launch-and-probe.ps1` + `capture-window.ps1` 验证窗口。
+- 后续测试只修改 `tests/test_report_generator.py`，不要新增其他测试程序。
+- 测试产物仅写入 `tests/artifacts/`；Git 只保留该目录的 `.gitkeep`。
+- 改前端、后端或桥接后均运行 `.venv\Scripts\python.exe -m unittest tests.test_report_generator -v`。
+- 动了 `app.py` 或依赖后重新运行 `build.bat`。
 - `frontend/index.html` 与原型项目 `C:\FakeD\HermesTeam\projects\报告生成工具桌面化\frontend\报告生成工具-界面原型.html` 同源（原型已另存，如需对照可查）。
 - 原程序副本：`C:\文件\工作工具台\报告生成工具V0.1-5.py`（未改动，仅拷贝进 backend 改名 report_engine.py）。

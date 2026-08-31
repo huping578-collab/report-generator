@@ -31,11 +31,10 @@ Windows 11 自带 WebView2；Windows 10 需安装 Microsoft Edge WebView2 Runtim
 ## 测试
 
 ```bat
-.venv\Scripts\python.exe -m unittest discover -s tests -v
-node tests\cdp_verify.mjs
+.venv\Scripts\python.exe -m unittest tests.test_report_generator -v
 ```
 
-第二条命令使用本机 Chrome 进行 1440px 与 375px 浏览器回归并生成截图。
+长期测试程序仅保留 `tests/test_report_generator.py`。测试输出统一写入 `tests/artifacts/`，该目录在 Git 中只保留 `.gitkeep`。
 
 ## 构建 Windows 桌面版
 
@@ -61,8 +60,8 @@ bridge.py                  HTML 与 Python 的本地桥接
 backend/report_engine.py   原报告业务逻辑
 frontend/index.html        已确认的桌面界面
 frontend/app.js            交互与桌面桥接调用
-build-tools/               图标与构建辅助文件
-tests/                     Python 与浏览器回归测试
+build-tools/create_icon.py 图标生成脚本
+tests/                     唯一 Python 测试程序与测试产物目录
 templates/                 用户提供的 Word 模板
 ```
 
