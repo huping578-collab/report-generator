@@ -3033,12 +3033,12 @@ class GuangdongChapterWriter:
             height_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in height_summary_rows]
             _table(["路线","方向","检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],height_rows,"护栏中心高度区段汇总表")
             height_images=_images("height")
+            segment_key=lambda key:(key[0],key[1],str(key[2]).removesuffix("段"))
             height_groups={}
             for row in height_summary_rows:
-                height_groups.setdefault((row.get("route"),row.get("direction"),row.get("segment")),[]).append(row)
+                height_groups.setdefault(segment_key((row.get("route"),row.get("direction"),row.get("segment"))),[]).append(row)
             for note_key,counts in sorted(note_counts.items()):
-                if note_key not in height_groups and not any(str(k[2]).removesuffix("段")==str(note_key[2]) for k in height_groups):
-                    height_groups.setdefault(note_key,[])
+                height_groups.setdefault(segment_key(note_key),[])
             for idx,(key,rows) in enumerate(sorted(height_groups.items(),key=lambda item:tuple(str(x) for x in item[0])),1):
                 route_name,direction_name,segment_name=key
                 seg_text=cls._segment_text(segment_name)
@@ -3603,7 +3603,7 @@ def run_guangdong_project(config, log=lambda _x: None):
     if not any(scanned[k] for k in ("marking","height","bolt")): raise ValueError("未识别到任何有效数据")
     manual,manual_issues=ManualAutoComparator.read_file(config.manual_xlsx); scanned["issues"].extend(manual_issues)
     bundles=GuangdongBatchRunner.build_bundles(scanned,route_index,manual,config.thresholds)
-    template=Path(__file__).resolve().parent/"templates"/"广东项目第五章模板.docx"
+    template=resource_template_path("广东项目第五章模板.docx")
     return GuangdongBatchRunner.run_bundles(bundles,config.output_dir,template,config.thresholds,log)
 
 

@@ -143,6 +143,40 @@ class DesktopBridgeTests(unittest.TestCase):
             engine.application_root() / "templates" / "x.docx",
         )
 
+    def test_guangdong_run_uses_resource_template_for_bundles(self) -> None:
+        values = {
+            "projectPath": str(self.project),
+            "markingPath": "",
+            "guardrailPath": "",
+            "manualPath": str(self.manual),
+            "routePath": str(self.route),
+            "outputPath": str(self.output),
+            "markingThreshold": "7",
+            "heightThreshold": "5",
+            "boltThreshold": "5",
+        }
+        scanned = {
+            "marking": [{"city": "佛山市", "route": "G1"}],
+            "height": [],
+            "bolt": [],
+            "notes": [],
+            "issues": [],
+        }
+        expected_template = self.root / "resource-template.docx"
+        route_index = type("RouteIndex", (), {"mapping": {}})()
+        with (
+            patch.object(engine.RouteCategoryIndex, "from_file", return_value=route_index),
+            patch.object(engine.GuangdongInputScanner, "scan", return_value=scanned),
+            patch.object(engine.ManualAutoComparator, "read_file", return_value=([], [])),
+            patch.object(engine.GuangdongBatchRunner, "build_bundles", return_value={}),
+            patch.object(engine.GuangdongBatchRunner, "run_bundles", return_value={}) as run_bundles,
+            patch.object(engine, "resource_template_path", return_value=expected_template) as resource_path,
+        ):
+            self.bridge._run_guangdong(values)
+
+        resource_path.assert_called_once_with("广东项目第五章模板.docx")
+        self.assertEqual(run_bundles.call_args.args[2], expected_template)
+
 
 def build_demo_segments():
     return [
@@ -393,6 +427,59 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         self.assertNotIn("区段内无护栏", text)
         self.assertNotIn("共检测0个有效点，其中。", text)
 
+    def test_writer_deduplicates_height_and_note_segments_with_suffix(self) -> None:
+        bundle = {
+            "marking": [],
+            "height": [{
+                "category": "高速公路",
+                "route": "G1",
+                "direction": "上行",
+                "segment": "K1+000～K2+000",
+                "guardrail_type": "二波",
+                "height": 600,
+            }],
+            "bolt": [],
+            "notes": [{
+                "category": "高速公路",
+                "route": "G1",
+                "direction": "上行",
+                "segment": "K1+000～K2+000段",
+                "guardrail_note": "桥梁地段",
+            }],
+            "comparison_detail": [],
+            "weak_segments": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.docx"
+            Document().save(template)
+            output = engine.GuangdongChapterWriter.write(
+                "佛山市",
+                bundle,
+                root / "output",
+                template,
+                {"marking": 7, "height": 5, "bolt": 5},
+            )
+            document = Document(output)
+            headings = []
+            height_text = []
+            in_height_section = False
+            for paragraph in document.paragraphs:
+                if paragraph.text == "（2）护栏中心高度":
+                    in_height_section = True
+                elif paragraph.text == "（3）螺栓安装情况":
+                    in_height_section = False
+                elif in_height_section:
+                    height_text.append(paragraph.text)
+                    if (
+                        paragraph.style.name == "Heading 5"
+                        and "K1+000～K2+000段" in paragraph.text
+                    ):
+                        headings.append(paragraph.text)
+
+        self.assertEqual(headings, ["a. K1+000～K2+000段"])
+        self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", "\n".join(height_text))
+
     def test_comparison_table_emits_expected_two_level_bolt_header_xml(self) -> None:
         document = Document()
         engine.GuangdongChapterWriter._comparison_table(
@@ -454,21 +541,40 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
 
 
 REAL_E2E_ENV = "REPORT_E2E_REAL"
-# 真实数据路径：与京炜交通\广东项目\交安报告生成 工具端到端脚本同源。
-_GD_BASE = Path(r"D:/京炜交通/广东项目")
-_ROUTE_XLSX = _GD_BASE / "附件3_4_抽检路段明细统计.xlsx"
-_MANUAL_XLSX = _GD_BASE / "交安报告生成" / "人工自动化对比.xlsx"
-_TPL_DOCX = Path(r"D:/京炜交通/米奇妙妙屋工具箱/报告生成/templates/广东项目第五章模板.docx")
-_FOSHAN = {
-    "name": "佛山",
-    "marking": _GD_BASE / "交安报告生成" / "佛山标线数据" / "佛山市标线统计数据",
-    "guardrail": _GD_BASE / "交安报告生成" / "广东省-佛山市-交安设施现场检测-明细-20260729150003",
+_REAL_E2E_PATHS = {
+    "route_xlsx": ("REPORT_E2E_ROUTE_XLSX", "file"),
+    "manual_xlsx": ("REPORT_E2E_MANUAL_XLSX", "file"),
+    "template": ("REPORT_E2E_TEMPLATE_DOCX", "file"),
+    "foshan_marking": ("REPORT_E2E_FOSHAN_MARKING_DIR", "dir"),
+    "foshan_guardrail": ("REPORT_E2E_FOSHAN_GUARDRAIL_DIR", "dir"),
+    "zhuhai_marking": ("REPORT_E2E_ZHUHAI_MARKING_DIR", "dir"),
+    "zhuhai_guardrail": ("REPORT_E2E_ZHUHAI_GUARDRAIL_DIR", "dir"),
 }
-_ZHUHAI = {
-    "name": "珠海",
-    "marking": _GD_BASE / "交安报告生成" / "珠海项目报告" / "珠海标线统计数据",
-    "guardrail": _GD_BASE / "交安报告生成" / "珠海项目报告" / "广东省-珠海市-交安设施现场检测-明细-20260828104102",
-}
+
+
+def _required_real_path(key: str) -> Path:
+    env_name, kind = _REAL_E2E_PATHS[key]
+    value = os.environ.get(env_name, "").strip()
+    if not value:
+        raise AssertionError(f"真实数据测试必须设置环境变量：{env_name}")
+    path = Path(value)
+    valid = path.is_file() if kind == "file" else path.is_dir()
+    if not valid:
+        raise AssertionError(f"{env_name} 路径不存在或类型错误：{path}")
+    return path
+
+
+def _real_e2e_inputs() -> dict[str, Path]:
+    return {key: _required_real_path(key) for key in _REAL_E2E_PATHS}
+
+
+class RealDataConfigurationTests(unittest.TestCase):
+    def test_real_e2e_requires_input_environment_variables(self) -> None:
+        env = {REAL_E2E_ENV: "1"}
+        env.update({env_name: "" for env_name, _ in _REAL_E2E_PATHS.values()})
+        with patch.dict(os.environ, env, clear=False):
+            with self.assertRaisesRegex(AssertionError, "REPORT_E2E_ROUTE_XLSX"):
+                _real_e2e_inputs()
 
 
 def _scan_city(city: dict, route_index) -> dict:
@@ -485,13 +591,17 @@ def _scan_city(city: dict, route_index) -> dict:
     return scanned
 
 
-def _run_real_pipeline(cities: list[dict], artifact_root: Path) -> dict:
-    """绕开 run_guangdong_project 硬编码的模板路径：直接拼装 scan+build_bundles+run_bundles。"""
-    if not _TPL_DOCX.is_file():
-        raise FileNotFoundError(f"真实数据测试缺少模板：{_TPL_DOCX}")
+def _run_real_pipeline(
+    cities: list[dict],
+    artifact_root: Path,
+    route_xlsx: Path,
+    manual_xlsx: Path,
+    template: Path,
+) -> dict:
+    """使用运行环境提供的真实输入：直接拼装 scan+build_bundles+run_bundles。"""
     artifact_root.mkdir(parents=True, exist_ok=True)
-    route_index = engine.RouteCategoryIndex.from_file(_ROUTE_XLSX)
-    manual_records, manual_issues = engine.ManualAutoComparator.read_file(_MANUAL_XLSX)
+    route_index = engine.RouteCategoryIndex.from_file(route_xlsx)
+    manual_records, manual_issues = engine.ManualAutoComparator.read_file(manual_xlsx)
     thresholds = {"marking": 7, "height": 5, "bolt": 5}
 
     result = {"success": [], "failed": {}, "warnings": []}
@@ -501,7 +611,7 @@ def _run_real_pipeline(cities: list[dict], artifact_root: Path) -> dict:
         scanned["issues"] = list(manual_issues) + scanned["issues"]
         bundles = engine.GuangdongBatchRunner.build_bundles(scanned, route_index, manual_records, thresholds)
         partial = engine.GuangdongBatchRunner.run_bundles(
-            bundles, artifact_root, _TPL_DOCX, thresholds
+            bundles, artifact_root, template, thresholds
         )
         result["success"].extend(partial["success"])
         result["failed"].update(partial["failed"])
@@ -555,17 +665,20 @@ class RealDataE2ETests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        for path in (
-            _ROUTE_XLSX,
-            _MANUAL_XLSX,
-            _TPL_DOCX,
-            _FOSHAN["marking"],
-            _FOSHAN["guardrail"],
-            _ZHUHAI["marking"],
-            _ZHUHAI["guardrail"],
-        ):
-            if not path.is_file() and not path.is_dir():
-                raise unittest.SkipTest(f"真实数据不可用：{path}")
+        paths = _real_e2e_inputs()
+        cls.route_xlsx = paths["route_xlsx"]
+        cls.manual_xlsx = paths["manual_xlsx"]
+        cls.template = paths["template"]
+        cls.foshan = {
+            "name": "佛山",
+            "marking": paths["foshan_marking"],
+            "guardrail": paths["foshan_guardrail"],
+        }
+        cls.zhuhai = {
+            "name": "珠海",
+            "marking": paths["zhuhai_marking"],
+            "guardrail": paths["zhuhai_guardrail"],
+        }
 
     def _run(self, cities: list[dict], sub: str) -> dict:
         artifact_root = Path(__file__).resolve().parent / "artifacts" / "real-data" / sub
@@ -574,10 +687,10 @@ class RealDataE2ETests(unittest.TestCase):
             import shutil
 
             shutil.rmtree(artifact_root, ignore_errors=True)
-        return _run_real_pipeline(cities, artifact_root)
+        return _run_real_pipeline(cities, artifact_root, self.route_xlsx, self.manual_xlsx, self.template)
 
     def test_foshan_minimal_integration_runs_end_to_end(self) -> None:
-        result = self._run([_FOSHAN], "foshan")
+        result = self._run([self.foshan], "foshan")
         self.assertIn("佛山市", result["success"])
         foshan_dir = Path(__file__).resolve().parent / "artifacts" / "real-data" / "foshan" / "佛山市"
         docx_path = next(foshan_dir.glob("*第五部分.docx"), None)
@@ -588,7 +701,7 @@ class RealDataE2ETests(unittest.TestCase):
         self.assertEqual(text.count("共检测0个有效点，其中。"), 0)
 
     def test_foshan_and_zhuhai_full_e2e_artifact_checks(self) -> None:
-        result = self._run([_FOSHAN, _ZHUHAI], "foshan-zhuhai")
+        result = self._run([self.foshan, self.zhuhai], "foshan-zhuhai")
         self.assertIn("佛山市", result["success"])
         self.assertIn("珠海市", result["success"], msg=f"珠海失败：{result['failed']}")
         self.assertFalse(result["failed"], f"运行失败：{result['failed']}")
