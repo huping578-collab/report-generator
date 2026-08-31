@@ -65,7 +65,7 @@ python -m venv .venv
 1. **模板路径**：`report_engine.builtin_template_paths()` 原按 `__file__` 定位，打包后会指向 PyInstaller 内部目录。已改为 `application_root()`：源码模式=项目根，冻结模式=EXE 同级目录。文件：`backend/report_engine.py:104-118`。
 2. **程序化生成模式**：重庆 `require_template=False`，模板缺失时 `make_docx` 转到 `minimal_docx.py`（python-docx 从头顶起：标题、章节编号、表格、matplotlib 图片、题注、横向/竖向页面）。广东强制 `require_template=True`（未提供则前端禁用开始生成）。
 3. **`server_args={"log": True}` 不可用**：pywebview 6.2.1 的 BottleServer 不接受该参数，`webview.start()` 直接抛 TypeError 秒退。曾因旧 EXE 用此参数构建导致"启动后无窗口"，务必用当前 `app.py`（无此参数）重建。
-4. **构建前必须关掉运行中的 EXE**：PyInstaller COLLECT 要清理旧 `dist/报告生成工具`，Process 里残留的 EXE 会锁 `base_library.zip` 导致 PermissionError。`launch-and-probe.ps1` 启动后记得关。
+4. **构建前必须关掉运行中的 EXE**：PyInstaller COLLECT 要清理旧 `dist/报告生成工具`，运行中的 EXE 会锁 `base_library.zip` 导致 PermissionError；构建前先关闭，避免锁定 `dist` 产物。
 5. **EXE 启动故障排查**：`logs/startup.log` 捕获 stderr/异常，位于 EXE 同级目录（源码模式在项目根）。空文件但窗口没出现 → 查 WebView2 运行时。
 6. **git-bash + PowerShell 脚本**：内联 `$_` 会被 MSYS 转义破坏（`Get-Process | Where-Object { $_... }` 会报 CommandNotFoundException）。一律写成 `.ps1` 文件再 `powershell -File` 执行。
 7. **中文字符路径 OK**：`C:\文件\工作工具台\报告生成工具` 全程可用；pywebview/PyInstaller 均正常。
