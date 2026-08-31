@@ -101,7 +101,6 @@ def validate_thresholds(marking, height, bolt):
 
 
 def application_root():
-    """Return the writable app folder in source and packaged modes."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
@@ -1075,10 +1074,6 @@ def report_images(temp_dir, segments, stats, records):
                 textprops={"fontsize": 8},
             )
             axis.legend(wedges, [label for label, _, _ in nonzero], loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
-            axis.set_title(
-                f"{format_station(segment['start'])}-{format_station(segment['end'])}",
-                fontfamily="SimHei", fontweight="normal", color="black", fontsize=10.5,
-            )
             figure.subplots_adjust(left=0.02, right=0.76, top=0.88, bottom=0.05)
             figure.savefig(pie_path, transparent=False); plt.close(figure)
             images[key] = {"line": line_path, "pie": pie_path}
@@ -1119,7 +1114,6 @@ def make_docx(
     if not config.template_docx.exists():
         if not require_template:
             from backend import minimal_docx
-
             log("未检测到内置 Word 模板，切换到程序化报告生成模式。")
             return minimal_docx.run(
                 config, segments,
@@ -2088,13 +2082,25 @@ class GuangdongInputScanner:
             raise ValueError(f"{Path(source).name}/{sheet}：桩号无法解析：{station_raw}")
         if kind == "height":
             value = _float(_first(row, "梁板中心高度(mm)", "护栏中心高度(mm)", "梁板中心高度", "护栏中心高度", "梁板中心高度毫米", "护栏中心高度mm"))
-            remark = str(_first(row, "异常标记", "备注", default="") or "").strip()
-            if value is None or value <= 0 or remark not in ("", "无备注"): return None
+            remark = str(_first(row, "异常标记", "备注标记", "备注", default="") or "").strip()
+            if remark not in ("", "无备注"):
+                # 桥梁/隧道路段标记行：不参与高度统计，但记录供报告生成区段说明
+                if "桥梁" in remark or "隧道" in remark:
+                    base.update(guardrail_note=remark)
+                    return base
+                return None
+            if value is None or value <= 0: return None
             base.update(guardrail_type=_guardrail_type(_first(row, "护栏类型")), height=value)
         elif kind == "bolt":
+            remark = str(_first(row, "备注标记", "异常标记", "备注", default="") or "").strip()
             vals = [_float(_first(row, name, name+"颗")) for name in ("拼接螺栓数量","拼接螺栓缺失数量","连接螺栓数量","连接螺栓缺失数量")]
-            if any(v is None for v in vals): return None
+            if any(v is None for v in vals):
+                if remark and ("桥梁" in remark or "隧道" in remark):
+                    base.update(guardrail_note=remark); return base
+                return None
             base.update(splice=vals[0], splice_missing=vals[1], connection=vals[2], connection_missing=vals[3])
+            if remark and ("桥梁" in remark or "隧道" in remark):
+                base["guardrail_note"] = remark
         else:
             value = _float(_first(row, "逆反亮度系数", "逆反射亮度系数"))
             if value is None: return None
@@ -2108,7 +2114,7 @@ class GuangdongInputScanner:
 
     def _process_file(self, path):
         """单个文件处理（并行任务单元）"""
-        records = {"height": [], "bolt": [], "marking": [], "issues": []}
+        records = {"height": [], "bolt": [], "marking": [], "notes": [], "issues": []}
         try:
             tables = self._xlsx_tables(path) if path.suffix.lower() == ".xlsx" else [(str(path.stem), *self._csv_table(path))]
             for sheet, headers, rows in tables:
@@ -2118,7 +2124,11 @@ class GuangdongInputScanner:
                     row = dict(zip(headers, values))
                     try:
                         record = self._convert(kind, row, path, sheet)
-                        if record: records[kind].append(record)
+                        if record:
+                            if record.get("guardrail_note"):
+                                records["notes"].append(record)
+                            else:
+                                records[kind].append(record)
                     except Exception as exc:
                         records["issues"].append(str(exc))
         except Exception as exc:
@@ -2144,7 +2154,7 @@ class GuangdongInputScanner:
             self.log(f"待识别文件 {len(files)} 个（已跳过 {len(skipped_dir)} 个排除文件夹内文件、{len(huge)} 个超大文件）")
         else:
             self.log(f"待识别文件 {len(files)} 个")
-        result = {"height": [], "bolt": [], "marking": [], "issues": self.issues}
+        result = {"height": [], "bolt": [], "marking": [], "notes": [], "issues": self.issues}
         # ponytail: 并行处理，max_workers=4 避免内存溢出，必要时可调高
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {executor.submit(self._process_file, f): f for f in files}
@@ -2152,7 +2162,7 @@ class GuangdongInputScanner:
             for future in as_completed(futures):
                 partial = future.result()
                 done += 1
-                for kind in ("height", "bolt", "marking"):
+                for kind in ("height", "bolt", "marking", "notes"):
                     result[kind].extend(partial[kind])
                 result["issues"].extend(partial["issues"])
                 if done % 10 == 0 or done == len(files):
@@ -2368,16 +2378,21 @@ class ManualAutoComparator:
             for row_index, values in enumerate(rows[start:], start=start+1):
                 if not any(v not in (None,"") for v in values): continue
                 row=dict(zip(headers,values)); city=_first(row,"地市","地区"); route=_first(row,"路线","路线编号"); direction=_first(row,"方向"); segment=_first(row,"桩号范围","桩号","计算区间")
+                # 原样保留展示字段，供报告生成三张分项对比表
+                display={"gtype":str(_first(row,"护栏类型",default="") or "").strip(),
+                         "position":str(_first(row,"护栏位置","标线位置",default="") or "").strip(),
+                         "remark":str(_first(row,"备注",default="") or "").strip()}
                 if indicator=="bolt":
                     manual=(_float(values[7]) or 0)+(_float(values[8]) or 0) if len(values)>10 else None
                     automatic=(_float(values[9]) or 0)+(_float(values[10]) or 0) if len(values)>10 else None
+                    display.update(msplice=_float(values[7]),mconn=_float(values[8]),asplice=_float(values[9]),aconn=_float(values[10]))
                 elif indicator=="height":
                     manual=_float(_first(row,"人工复核护栏中心平均高度mm","人工护栏中心高度","人工值")); automatic=_float(_first(row,"自动化护栏中心高度mm","自动化护栏中心高度","自动化值"))
                 else:
                     manual=_float(_first(row,"人工逆反射亮度系数平均值","人工值")); automatic=_float(_first(row,"自动化逆反射亮度系数平均值","自动化值"))
                 if not city or not route or manual is None or automatic is None:
                     issues.append(f"{Path(path).name}/{title}/第{row_index}行：人工对比记录字段缺失或非数值"); continue
-                records.append({"indicator":indicator,"city":str(city).strip(),"route":_route(route),"direction":str(direction or ""),"segment":str(segment or ""),"manual":manual,"automatic":automatic})
+                records.append({"indicator":indicator,"city":str(city).strip(),"route":_route(route),"direction":str(direction or ""),"segment":str(segment or ""),"manual":manual,"automatic":automatic,**display})
         wb.close(); return records,issues
 
     @staticmethod
@@ -2437,13 +2452,13 @@ class GuangdongChapterWriter:
         return text if text.endswith("段") or text == "—" else text + "段"
 
     @staticmethod
-    def _add_table(doc, headers, rows):
-        """表格：所有单元格文字无缩进、水平居中、垂直居中；表头加粗仿宋_GB2312。"""
+    def _add_table(doc, headers, rows, merge=None):
+        """表格：所有单元格文字无缩进、水平居中、垂直居中；表头加粗仿宋_GB2312。
+        merge={起始列: 跨列数}：两级表头——第一行主表头（横向合并），其下列子表头；单列表头纵向合并两行。"""
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
-        table=doc.add_table(rows=1,cols=len(headers)); table.style="Table Grid"
-        for index, header in enumerate(headers):
-            cell=table.rows[0].cells[index]; cell.text=str(header)
+
+        def _style(cell, bold=False):
             for p in cell.paragraphs:
                 p.alignment=1  # 水平居中
                 pPr=p._p.get_or_add_pPr()
@@ -2456,25 +2471,68 @@ class GuangdongChapterWriter:
                 if vAlign is None:
                     vAlign=OxmlElement('w:vAlign'); tcPr.append(vAlign)
                 vAlign.set(qn('w:val'),'center')  # 垂直居中
-                for run in p.runs: run.bold=True; run.font.name="仿宋_GB2312"
-        if not rows: rows=[["—"]+["" for _ in headers[1:]]]
+                for run in p.runs:
+                    run.bold=bold; run.font.name="仿宋_GB2312"
+
+        if merge:
+            # 两级表头：merge={列号: (主表头名, 跨列数)}，原生 XML 构建（gridSpan/vMerge），物理列 = 逻辑列 - Σ(跨列数-1)
+            from docx.table import _Cell
+            merge = {c: (v[0], int(v[1])) for c, v in merge.items()}
+            phys_of={}; p=0; i=0
+            while i < len(headers):
+                if i in merge:
+                    n=merge[i][1]
+                    for j in range(i, i+n): phys_of[j]=p
+                    p+=n-1; i+=n
+                else:
+                    phys_of[i]=p; p+=1; i+=1
+            physical=len(headers)
+            table=doc.add_table(rows=2,cols=physical); table.style="Table Grid"
+            # 清空默认两行，手工构建 tr
+            tbl=table._tbl
+            for tr in list(tbl.findall(qn('w:tr'))): tbl.remove(tr)
+            def _tc(text, span=None, vmerge=None, bold=True):
+                tc=OxmlElement('w:tc'); tcPr=OxmlElement('w:tcPr')
+                if span: sp=OxmlElement('w:gridSpan'); sp.set(qn('w:val'),str(span)); tcPr.append(sp)
+                if vmerge is not None:
+                    vm=OxmlElement('w:vMerge'); vm.set(qn('w:val'),vmerge) if vmerge!="continue" else None; tcPr.append(vm)
+                tc.append(tcPr); par=OxmlElement('w:p'); r=OxmlElement('w:r')
+                rPr=OxmlElement('w:rPr')
+                if bold: b=OxmlElement('w:b'); rPr.append(b)
+                fonts=OxmlElement('w:rFonts'); fonts.set(qn('w:eastAsia'),"仿宋_GB2312"); fonts.set(qn('w:ascii'),"Times New Roman"); fonts.set(qn('w:hAnsi'),"Times New Roman"); rPr.append(fonts)
+                r.append(rPr)
+                t=OxmlElement('w:t'); t.text=str(text); r.append(t); par.append(r); tc.append(par)
+                return tc
+            top=OxmlElement('w:tr'); sub=OxmlElement('w:tr')
+            i=0
+            while i < len(headers):
+                if i in merge and merge[i][0]:
+                    parent,n=merge[i]
+                    top.append(_tc(parent, span=n))
+                    for j in range(i+1, i+n):
+                        sub.append(_tc(headers[j]))
+                    i+=n
+                elif i in merge:
+                    top.append(_tc(headers[i], vmerge="restart"))
+                    sub.append(_tc("", vmerge="continue"))
+                    i+=1
+                else:
+                    top.append(_tc(headers[i], vmerge="restart"))
+                    sub.append(_tc("", vmerge="continue"))
+                    i+=1
+            tbl.append(top); tbl.append(sub)
+        else:
+            table=doc.add_table(rows=1,cols=len(headers)); table.style="Table Grid"
+            for index, header in enumerate(headers):
+                cell=table.rows[0].cells[index]; cell.text=str(header); _style(cell, True)
+        if not rows:
+            blank_cols = physical if merge else len(headers)
+            rows = [["—"] + [""] * (blank_cols - 1)]
         for row in rows:
             cells=table.add_row().cells
             for index,value in enumerate(row):
                 cells[index].text=str(value)
-                for p in cells[index].paragraphs:
-                    p.alignment=1  # 水平居中
-                    pPr=p._p.get_or_add_pPr()
-                    ind=pPr.find(qn('w:ind'))
-                    if ind is None:
-                        ind=OxmlElement('w:ind'); pPr.append(ind)
-                    ind.set(qn('w:firstLineChars'),'0'); ind.set(qn('w:firstLine'),'0')
-                    tcPr=cells[index]._tc.get_or_add_tcPr()
-                    vAlign=tcPr.find(qn('w:vAlign'))
-                    if vAlign is None:
-                        vAlign=OxmlElement('w:vAlign'); tcPr.append(vAlign)
-                    vAlign.set(qn('w:val'),'center')  # 垂直居中
-                    for run in p.runs: run.font.name="仿宋_GB2312"
+                _style(cells[index])
         return table
 
     @classmethod
@@ -2658,31 +2716,43 @@ class GuangdongChapterWriter:
 
     @classmethod
     def _comparison_table(cls, doc, detail, thresholds, table_adder=None):
-        """人工复核与自动化检测对比：标线/螺栓缺失按相对偏差(%)，护栏中心高度按绝对偏差(mm)。"""
-        if detail:
-            summary = ManualAutoComparator.summarize(detail)
-        else:
-            summary = {}
+        """人工复核对比：先给判断标准说明，再按 护栏中心高度/螺栓缺失/标线逆反射 生成三张分项对比表。"""
         cls._body(doc, f"人工复核分别采用以下一致性判断标准：标线逆反射亮度系数按相对偏差判断，阈值{thresholds['marking']}%；波形梁护栏中心高度按绝对偏差判断，阈值{thresholds['height']} mm；波形梁护栏螺栓缺失数量按相对偏差判断，阈值{thresholds['bolt']}%。相对偏差为自动化检测值与人工复核值之差的绝对值占人工复核值的百分比，绝对偏差为二者之差的绝对值；偏差在阈值范围内的记录判定为一致，一致性占比为一致记录数占可计算记录数的比例。")
+        # 精简版偏差分析：只保留平均偏差+一致性占比，不输出 min～max 偏差范围
+        summary = ManualAutoComparator.summarize(detail)
         names = {"marking": "标线逆反射亮度系数", "height": "波形梁护栏中心高度", "bolt": "波形梁护栏螺栓缺失"}
-        comparison_rows = []
         sentences = []
         for key, name in names.items():
             s = summary.get(key, {})
-            comparison_rows.append([name, s.get("paired_count", 0), s.get("computable_count", 0), cls._fmt(s.get("min")), cls._fmt(s.get("max")), cls._fmt(s.get("average")), cls._pct(s.get("consistency_rate")), s.get("zero_manual_count", 0)])
             if s.get("computable_count"):
-                if key in ("marking", "bolt"):
-                    unit = "%"; metric = "相对偏差"
-                else:
-                    unit = " mm"; metric = "绝对偏差"
-                sentences.append(f"{name}:自动化检测与人工复核偏差范围{cls._fmt(s.get('min'))}～{cls._fmt(s.get('max'))}{unit}（{metric}），平均偏差{cls._fmt(s.get('average'))}{unit}，一致性占比{cls._pct(s.get('consistency_rate'))}")
+                unit = "%" if key in ("marking", "bolt") else " mm"
+                sentences.append(f"{name}:自动化检测与人工复核平均偏差{cls._fmt(s.get('average'))}{unit}，一致性占比{cls._pct(s.get('consistency_rate'))}")
         if sentences:
             cls._body(doc, "偏差范围与一致性占比分析：" + "；".join(sentences) + "。")
-        headers = ["复核项目", "有效配对数", "可计算数", "最小偏差", "最大偏差", "平均偏差", "一致性占比", "人工零值数"]
-        if table_adder is None:
-            cls._add_table(doc, headers, comparison_rows)
-        else:
-            table_adder(headers, comparison_rows, "人工复核自动化检测一致性对比表")
+        fmt = lambda v: "" if v is None else (f"{v:g}" if isinstance(v, float) else str(v))
+        def emit(headers, rows, title, merge=None):
+            if table_adder is None:
+                cls._add_table(doc, headers, rows, merge=merge)
+            else:
+                table_adder(headers, rows, title, merge)
+
+        height=[r for r in detail if r.get("indicator")=="height"]
+        bolt=[r for r in detail if r.get("indicator")=="bolt"]
+        marking=[r for r in detail if r.get("indicator")=="marking"]
+
+        emit(["路线","护栏类型","护栏位置","方向","桩号范围","人工复核护栏中心平均高度(mm)","自动化护栏中心高度(mm)","备注"],
+             [[r.get("route"),r.get("gtype"),r.get("position"),r.get("direction"),r.get("segment"),fmt(r.get("manual")),fmt(r.get("automatic")),r.get("remark")] for r in height],
+             "人工复核护栏中心高度对比表")
+
+        # 螺栓两级表头：主表头横跨2个子列（拼接/连接），无空单元格
+        if bolt:
+            emit(["路线","护栏类型","护栏位置","方向","桩号范围","人工复核螺栓缺失数量","拼接螺栓缺失数量","连接螺栓缺失数量","自动化螺栓缺失数量","拼接螺栓缺失数量","连接螺栓缺失数量","备注"],
+                 [[r.get("route"),r.get("gtype"),r.get("position"),r.get("direction"),r.get("segment"),fmt(r.get("msplice")),fmt(r.get("mconn")),fmt(r.get("asplice")),fmt(r.get("aconn")),r.get("remark")] for r in bolt],
+                 "人工复核螺栓缺失对比表", merge={5:("人工复核螺栓缺失数量",3),8:("自动化螺栓缺失数量",3)})
+
+        emit(["路线","标线位置","方向","桩号范围","人工逆反射亮度系数平均值","自动化逆反射亮度系数平均值"],
+             [[r.get("route"),r.get("position"),r.get("direction"),r.get("segment"),fmt(r.get("manual")),fmt(r.get("automatic"))] for r in marking],
+             "人工复核标线逆反射对比表")
 
     @staticmethod
     def _set_run_fonts(run, east_asia="仿宋_GB2312", latin="Times New Roman"):
@@ -2839,6 +2909,32 @@ class GuangdongChapterWriter:
     def _bolt_segment_sentence(row):
         return (f"该区段识别现有拼接螺栓{int(row.get('splice', 0) or 0):,}颗、连接螺栓{int(row.get('connection', 0) or 0):,}颗，检出缺失螺栓{int(row.get('missing_total', 0) or 0):,}颗，螺栓缺失率为{GuangdongChapterWriter._pct(row.get('missing_rate'))}。")
 
+    @staticmethod
+    def _guardrail_note_counts(notes):
+        """按区段聚合桥梁/隧道标记：{(路线,方向,区段): {"桥梁":n,"隧道":n}}。"""
+        result = {}
+        for row in notes or []:
+            remark = str(row.get("guardrail_note") or "")
+            key = (row.get("route"), row.get("direction"), row.get("segment"))
+            counts = result.setdefault(key, {"桥梁": 0, "隧道": 0})
+            if "桥梁" in remark: counts["桥梁"] += 1
+            if "隧道" in remark: counts["隧道"] += 1
+        return result
+
+    @staticmethod
+    def _guardrail_note_sentence(counts):
+        if not counts or not (counts["桥梁"] or counts["隧道"]): return None
+        if counts["桥梁"] and counts["隧道"]: return "该区段为桥梁和隧道路段，区段内无护栏"
+        if counts["桥梁"]: return "该区段为桥梁路段，区段内无护栏"
+        return "该区段为隧道路段，区段内无护栏"
+
+    @staticmethod
+    def _guardrail_no_valid_point_sentence(counts):
+        if not counts or not (counts["桥梁"] or counts["隧道"]): return None
+        if counts["桥梁"] and counts["隧道"]: return "当前区段为桥梁和隧道路段，无有效检测点位。"
+        if counts["桥梁"]: return "当前区段为桥梁路段，无有效检测点位。"
+        return "当前区段为隧道路段，无有效检测点位。"
+
     @classmethod
     def write(cls,city,bundle,output_dir,template,thresholds):
         from docx import Document
@@ -2867,9 +2963,9 @@ class GuangdongChapterWriter:
             cap.style="Caption"
             cls._format_chart_caption(cap)
 
-        def _table(headers,rows,title):
+        def _table(headers,rows,title,merge=None):
             _caption("table",title)
-            return cls._add_table(doc,headers,rows)
+            return cls._add_table(doc,headers,rows,merge=merge)
 
         def _figure(path,title):
             doc.add_picture(path,width=Pt(440))
@@ -2890,9 +2986,10 @@ class GuangdongChapterWriter:
 
             cls._heading(doc,"2.标线、护栏自动化检测",3)
             cls._heading(doc,"（1）标线逆反射亮度系数",4)
+            segment_sort_key=lambda row: tuple(str(row.get(field) or "") for field in ("route","direction","segment"))
             marking_summary=GuangdongStatistics.marking_summary(all_mark)
             cls._body(doc,f"{category}标线检测共获得{marking_summary['valid_count']:,}个有效计算单元，平均逆反射亮度系数为{cls._fmt(marking_summary['average'])}，合格单元{marking_summary['qualified_count']:,}个，合格率为{cls._pct(marking_summary['qualified_rate'])}。" if all_mark else f"{category}未读取到有效标线逆反射数据。")
-            pair_summary=GuangdongStatistics.marking_segment_pair_summary(all_mark)
+            pair_summary=sorted(GuangdongStatistics.marking_segment_pair_summary(all_mark),key=segment_sort_key)
             def _pair_cells(row, pos):
                 return [row.get(f"{pos}_valid_count"), cls._fmt(row.get(f"{pos}_average")), cls._pct(row.get(f"{pos}_qualified_rate"))]
             pair_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),*[cell for pos in sorted(row.get("_side_names") or {}) for cell in _pair_cells(row,pos)]] for row in pair_summary]
@@ -2924,36 +3021,65 @@ class GuangdongChapterWriter:
                     if item["valid_count"]: parts.append(f"{kind}护栏{item['valid_count']:,}个有效点，平均高度{cls._fmt(item['average'])} mm，合格率{cls._pct(item['qualified_rate'])}")
                 cls._body(doc,f"{category}波形梁护栏中心高度有效检测点共{total_height:,}个，其中"+"；".join(parts)+"。")
             else: cls._body(doc,f"{category}未读取到有效护栏中心高度数据。")
-            height_summary_rows=GuangdongStatistics.height_segment_summary(all_height)
+            height_summary_rows=sorted(GuangdongStatistics.height_segment_summary(all_height),key=lambda row:(*segment_sort_key(row),str(row.get("guardrail_type") or "")))
+            note_counts=cls._guardrail_note_counts([r for r in bundle.get("notes",[]) if r.get("category")==category])
+            def _note_counts_for(route_name,direction_name,segment_name):
+                segment_name=str(segment_name)
+                for key in ((route_name,direction_name,segment_name),(route_name,direction_name,segment_name.removesuffix("段")),(route_name,direction_name,segment_name+"段")):
+                    if key in note_counts: return note_counts[key]
+                return None
+            def _note_for(route_name,direction_name,segment_name):
+                return cls._guardrail_note_sentence(_note_counts_for(route_name,direction_name,segment_name))
             height_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in height_summary_rows]
             _table(["路线","方向","检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],height_rows,"护栏中心高度区段汇总表")
             height_images=_images("height")
             height_groups={}
             for row in height_summary_rows:
                 height_groups.setdefault((row.get("route"),row.get("direction"),row.get("segment")),[]).append(row)
+            for note_key,counts in sorted(note_counts.items()):
+                if note_key not in height_groups and not any(str(k[2]).removesuffix("段")==str(note_key[2]) for k in height_groups):
+                    height_groups.setdefault(note_key,[])
             for idx,(key,rows) in enumerate(sorted(height_groups.items(),key=lambda item:tuple(str(x) for x in item[0])),1):
                 route_name,direction_name,segment_name=key
                 seg_text=cls._segment_text(segment_name)
+                note_sentence=_note_for(route_name,direction_name,segment_name)
                 cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
-                cls._body(doc,cls._height_segment_sentence(rows))
-                _table(["检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],[[seg_text,_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in rows],f"{seg_text}护栏中心高度统计表")
+                total=sum(int(row.get("valid_count") or 0) for row in rows)
+                if total > 0:
+                    cls._body(doc,cls._height_segment_sentence(rows))
+                elif note_sentence:
+                    cls._body(doc,cls._guardrail_no_valid_point_sentence(_note_counts_for(*key)))
+                else:
+                    cls._body(doc,cls._height_segment_sentence(rows))
+                if rows:
+                    _table(["检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],[[seg_text,_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in rows],f"{seg_text}护栏中心高度统计表")
                 safe_seg=str(segment_name).replace("/","_").replace("\\","_").replace(" ","_")
-                for kind in ("二波","三波"):
-                    for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_line." in p]:
-                        try: _figure(img,f"{seg_text}{kind}护栏中心高度检测结果")
-                        except Exception: pass
-                    for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_pie." in p]:
-                        try: _figure(img,f"{seg_text}{kind}护栏中心高度结果分布")
-                        except Exception: pass
+                if not note_sentence or rows:
+                    for kind in ("二波","三波"):
+                        for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_line." in p]:
+                            try: _figure(img,f"{seg_text}{kind}护栏中心高度检测结果")
+                            except Exception: pass
+                        for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_pie." in p]:
+                            try: _figure(img,f"{seg_text}{kind}护栏中心高度结果分布")
+                            except Exception: pass
 
             cls._heading(doc,"（3）螺栓安装情况",4)
             bs=GuangdongStatistics.bolt_summary(all_bolt)
             cls._body(doc,f"{category}共识别现有拼接螺栓{int(bs['splice']):,}颗、连接螺栓{int(bs['connection']):,}颗，检出缺失螺栓{int(bs['missing_total']):,}颗，螺栓缺失率为{cls._pct(bs['missing_rate'])}。" if all_bolt else f"{category}未读取到有效波形梁护栏螺栓数据。")
-            bolt_summary_rows=GuangdongStatistics.bolt_segment_summary(all_bolt)
+            bolt_summary_rows=sorted(GuangdongStatistics.bolt_segment_summary(all_bolt),key=segment_sort_key)
+            bolt_existing={(r.get("route"),r.get("direction"),str(r.get("segment") or "").removesuffix("段")) for r in bolt_summary_rows}
+            bolt_note_keys={(k[0],k[1],str(k[2]).removesuffix("段")) for k in note_counts if (k[0],k[1],str(k[2]).removesuffix("段")) not in bolt_existing}
             bolt_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),int(row.get("splice",0) or 0),int(row.get("connection",0) or 0),int(row.get("missing_total",0) or 0),cls._pct(row.get("missing_rate"))] for row in bolt_summary_rows]
             _table(["路线","方向","检测区段","拼接螺栓（颗）","连接螺栓（颗）","缺失数量（颗）","缺失率"],bolt_rows,"护栏螺栓缺失区段汇总表")
             bolt_images=_images("bolt")
-            for idx,row in enumerate(bolt_summary_rows,1):
+            bolt_groups={(row.get("route"),row.get("direction"),str(row.get("segment") or "").removesuffix("段")):row for row in bolt_summary_rows}
+            for note_key in bolt_note_keys: bolt_groups[note_key]=None
+            for idx,(bolt_key,row) in enumerate(sorted(bolt_groups.items(),key=lambda item:tuple(str(x or "") for x in item[0])),1):
+                if row is None:
+                    seg_text=cls._segment_text(bolt_key[2])
+                    cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
+                    cls._body(doc,cls._guardrail_no_valid_point_sentence(_note_counts_for(*bolt_key)))
+                    continue
                 seg_text=cls._segment_text(row.get("segment"))
                 cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
                 cls._body(doc,cls._bolt_segment_sentence(row))
@@ -2961,7 +3087,6 @@ class GuangdongChapterWriter:
                 for img in [p for p in bolt_images if str(row.get("segment") or "").replace("/","_").replace("\\","_").replace(" ","_") in Path(p).name and "_bar." in p]:
                     try: _figure(img,f"{seg_text}护栏螺栓缺失检测结果")
                     except Exception: pass
-
             cls._heading(doc,"（4）人工复核对比情况",4)
             cls._comparison_table(doc,all_detail,thresholds,table_adder=_table)
 
@@ -3020,7 +3145,6 @@ def _gd_height_charts(rows, route, direction, chart_dir, prefix=""):
             ax.set_xticks(ticks)
             ax.set_xticklabels([format_station(kind_rows[i]["station_m"]) for i in ticks], rotation=30, ha="right", fontsize=7)
             ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
-            ax.set_title(f"{seg_text}{kind}护栏中心高度检测结果", fontfamily="SimHei", fontweight="normal", color="black", fontsize=10)
             fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.30)
             fig.savefig(line_path, transparent=False, bbox_inches="tight", pad_inches=0.15)
             plt.close(fig)
@@ -3049,7 +3173,6 @@ def _gd_height_charts(rows, route, direction, chart_dir, prefix=""):
                     textprops={"fontsize": 8},
                 )
                 ax.legend(wedges, [lbl for lbl, _, _ in nonzero], loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
-                ax.set_title(f"{seg_text}{kind}护栏中心高度结果分布", fontfamily="SimHei", fontweight="normal", color="black", fontsize=10.5)
                 fig.subplots_adjust(left=0.02, right=0.76, top=0.88, bottom=0.05)
                 fig.savefig(pie_path, transparent=False, bbox_inches="tight", pad_inches=0.15)
                 plt.close(fig)
@@ -3085,7 +3208,6 @@ def _gd_bolt_charts(rows, route, direction, chart_dir, prefix=""):
         for i, v in enumerate(category_vals):
             ax.text(i, v, str(v), ha="center", va="bottom", fontsize=9)
         ax.grid(True, axis="y", alpha=0.25)
-        ax.set_title(f"{seg_text}护栏螺栓缺失检测结果", fontfamily="SimHei", fontweight="normal", color="black", fontsize=10)
         fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.12)
         fig.savefig(bar_path, transparent=False, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
@@ -3126,7 +3248,6 @@ def _gd_marking_charts(rows, route, direction, chart_dir, prefix=""):
         ax.set_xticklabels([format_station(pos_rows[i]["station_m"]) for i in ticks], rotation=30, ha="right", fontsize=7)
         ax.set_ylabel("逆反射亮度系数")
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
-        ax.set_title(f"{segment}{_side_display(pos)}逆反射亮度系数检测结果", fontfamily="SimHei", fontweight="normal", color="black", fontsize=10)
         fig.subplots_adjust(left=0.10, right=0.98, top=0.92, bottom=0.30)
         fig.savefig(line_path, transparent=False, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
@@ -3193,14 +3314,6 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
     folder = Path(output_dir) / city; folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{city}交安设施统计图表.xlsx"
     thin = Side(style="thin", color="B7B7B7")
-
-    def font_title(chart, size=1000):
-        try:
-            chart.title.tx.rich.p[0].r[0].rPr = CharacterProperties(
-                latin=DrawingFont(typeface="Times New Roman"), ea=DrawingFont(typeface="黑体"), sz=size, b=False,
-            )
-        except Exception:
-            pass
 
     def font_axes(chart):
         for axis in (chart.x_axis, chart.y_axis):
@@ -3275,8 +3388,6 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         chart = LineChart(); chart.visible_cells_only = False
         chart.add_data(Reference(ws, min_col=2, max_col=4, min_row=header_row, max_row=last), titles_from_data=True)
         chart.set_categories(Reference(ws, min_col=1, min_row=header_row + 1, max_row=last))
-        chart.title = f"{seg_text(segment)}{kind}护栏中心高度检测结果"
-        font_title(chart); font_axes(chart)
         chart.height, chart.width = 8, 13
         chart.y_axis.scaling.min, chart.y_axis.scaling.max, chart.y_axis.majorUnit = 300, 850, 50
         chart.x_axis.delete = chart.y_axis.delete = False
@@ -3290,8 +3401,6 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         pie = PieChart()
         pie.add_data(Reference(ws, min_col=6, min_row=header_row, max_row=header_row + 5), titles_from_data=True)
         pie.set_categories(Reference(ws, min_col=5, min_row=header_row + 1, max_row=header_row + 5))
-        pie.title = f"{seg_text(segment)}{kind}护栏中心高度结果分布"
-        font_title(pie)
         pie.height, pie.width = 8.5, 14
         pie.legend.position = "r"
         pie.dataLabels = DataLabelList()
@@ -3329,8 +3438,6 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         chart = BarChart(); chart.type = "col"
         chart.add_data(Reference(ws, min_col=4, max_col=6, min_row=index, max_row=index), from_rows=True)
         chart.set_categories(Reference(ws, min_col=4, max_col=6, min_row=1))
-        chart.title = f"{seg_text(ws.cell(index, 3).value)}护栏螺栓缺失检测结果"
-        font_title(chart); font_axes(chart)
         chart.height, chart.width = 8, 13
         chart.legend = None
         chart.x_axis.delete = chart.y_axis.delete = False
@@ -3370,8 +3477,6 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         chart = LineChart(); chart.visible_cells_only = False
         chart.add_data(Reference(ws, min_col=2, max_col=4, min_row=header_row, max_row=last), titles_from_data=True)
         chart.set_categories(Reference(ws, min_col=1, min_row=header_row + 1, max_row=last))
-        chart.title = f"{segment}{_side_display(pos)}逆反射亮度系数检测结果"
-        font_title(chart); font_axes(chart)
         chart.height, chart.width = 8, 13
         chart.x_axis.delete = chart.y_axis.delete = False
         chart.y_axis.title = "逆反射亮度系数"
@@ -3432,13 +3537,13 @@ class GuangdongBatchRunner:
 
     @staticmethod
     def build_bundles(scanned,route_index,manual_records=None,thresholds=None):
-        cities=sorted({r["city"] for kind in ("height","bolt","marking") for r in scanned.get(kind,[])})
+        cities=sorted({r["city"] for kind in ("height","bolt","marking","notes") for r in scanned.get(kind,[])})
         bundles={}
         comparator=ManualAutoComparator(thresholds or {"marking":0,"height":0,"bolt":0})
         for city in cities:
             bundle={"city":city,"route_rows":route_index.rows(city),"issues":list(scanned.get("issues",[])),"weak_segments":[]}
             try:
-                for kind in ("height","bolt","marking"):
+                for kind in ("height","bolt","marking","notes"):
                     bundle[kind]=[dict(r) for r in scanned.get(kind,[]) if r["city"]==city]
                     for row in bundle[kind]: row["category"]=route_index.category(city,row["route"])
                 detail,summary=comparator.compare([r for r in (manual_records or []) if r.get("city")==city]); bundle["comparison_detail"]=detail; bundle["comparison_summary"]=summary
@@ -3446,7 +3551,7 @@ class GuangdongBatchRunner:
                 GuangdongBatchRunner.add_weak_segments(bundle)
             except Exception as exc:
                 bundle["_error"]=str(exc)
-                for kind in ("height","bolt","marking"):
+                for kind in ("height","bolt","marking","notes"):
                     bundle.setdefault(kind,[])
                 bundle.setdefault("comparison_detail",[]); bundle.setdefault("comparison_summary",{})
             bundles[city]=bundle
@@ -3466,7 +3571,7 @@ def run_guangdong_project(config, log=lambda _x: None):
         raise FileNotFoundError(f"护栏数据文件夹不存在：{config.guardrail_dir}")
     route_index=RouteCategoryIndex.from_file(config.route_xlsx); log("路线分类表读取完成")
 
-    scanned = {"height": [], "bolt": [], "marking": [], "issues": []}
+    scanned = {"height": [], "bolt": [], "marking": [], "notes": [], "issues": []}
     if config.marking_dir or config.guardrail_dir:
         marking_dir = config.marking_dir
         guardrail_dir = config.guardrail_dir
@@ -3476,6 +3581,7 @@ def run_guangdong_project(config, log=lambda _x: None):
             scanned["marking"].extend(partial["marking"])
             scanned["height"].extend(partial["height"])
             scanned["bolt"].extend(partial["bolt"])
+            scanned["notes"].extend(partial["notes"])
             scanned["issues"].extend(partial["issues"])
         else:
             if marking_dir:
@@ -3488,6 +3594,7 @@ def run_guangdong_project(config, log=lambda _x: None):
                 partial = GuangdongInputScanner(guardrail_dir, route_index, log=log).scan()
                 scanned["height"].extend(partial["height"])
                 scanned["bolt"].extend(partial["bolt"])
+                scanned["notes"].extend(partial["notes"])
                 scanned["issues"].extend(partial["issues"])
     else:
         scanned = GuangdongInputScanner(config.project_dir, route_index, log=log).scan()
@@ -3496,7 +3603,7 @@ def run_guangdong_project(config, log=lambda _x: None):
     if not any(scanned[k] for k in ("marking","height","bolt")): raise ValueError("未识别到任何有效数据")
     manual,manual_issues=ManualAutoComparator.read_file(config.manual_xlsx); scanned["issues"].extend(manual_issues)
     bundles=GuangdongBatchRunner.build_bundles(scanned,route_index,manual,config.thresholds)
-    template=resource_template_path("广东项目第五章模板.docx")
+    template=Path(__file__).resolve().parent/"templates"/"广东项目第五章模板.docx"
     return GuangdongBatchRunner.run_bundles(bundles,config.output_dir,template,config.thresholds,log)
 
 
