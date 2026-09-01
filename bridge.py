@@ -16,12 +16,12 @@ class DesktopBridge:
     """Native operations exposed to the HTML frontend through pywebview."""
 
     def __init__(self) -> None:
-        self.window: webview.Window | None = None
+        self._window: webview.Window | None = None
         self._running = False
         self._lock = threading.Lock()
 
     def attach_window(self, window: webview.Window) -> None:
-        self.window = window
+        self._window = window
 
     def get_environment(self) -> dict[str, Any]:
         templates = self._template_paths()
@@ -35,18 +35,18 @@ class DesktopBridge:
         }
 
     def choose_path(self, kind: str, key: str, template: str) -> dict[str, Any]:
-        if self.window is None:
+        if self._window is None:
             return {"ok": False, "error": "桌面窗口尚未初始化。"}
 
         try:
             if kind == "file":
-                selected = self.window.create_file_dialog(
+                selected = self._window.create_file_dialog(
                     webview.FileDialog.OPEN,
                     allow_multiple=False,
                     file_types=("Excel 工作簿 (*.xlsx)",),
                 )
             else:
-                selected = self.window.create_file_dialog(
+                selected = self._window.create_file_dialog(
                     webview.FileDialog.FOLDER,
                     allow_multiple=False,
                 )
@@ -238,10 +238,10 @@ class DesktopBridge:
         return 14, 0
 
     def _emit(self, event: str, **payload: Any) -> None:
-        if self.window is None:
+        if self._window is None:
             return
         data = json.dumps({"event": event, **payload}, ensure_ascii=False)
         try:
-            self.window.evaluate_js(f"window.desktopEvents && window.desktopEvents({data})")
+            self._window.evaluate_js(f"window.desktopEvents && window.desktopEvents({data})")
         except Exception:
             pass

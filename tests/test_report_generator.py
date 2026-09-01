@@ -66,6 +66,12 @@ class DesktopBridgeTests(unittest.TestCase):
             },
         }
 
+    def test_native_window_reference_is_private_from_js_api(self) -> None:
+        window = FakeWindow()
+        self.bridge.attach_window(window)
+        self.assertNotIn("window", vars(self.bridge))
+        self.assertIs(self.bridge._window, window)
+
     def test_validate_chongqing_payload_creates_output(self) -> None:
         with patch.object(self.bridge, "_template_paths", return_value=self.templates()):
             self.bridge._validate_payload(self.cq_payload())
