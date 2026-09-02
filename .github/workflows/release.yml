@@ -53,21 +53,27 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            dist/report-generator-Setup.exe
-            dist/报告生成工具-Setup.exe
+          files: dist/report-generator-Setup.exe
 
-      - name: Ensure legacy Chinese asset (fallback for old updater)
+      - name: Ensure legacy Chinese asset via API (correct UTF8 name)
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $names = gh release view $tag --json assets --jq '.assets[].name' 2>$null
-          if ($names -match "报告生成工具-Setup.exe") {
+          $headers = @{"Authorization"="Bearer $env:GH_TOKEN"; "Accept"="application/vnd.github+json"; "User-Agent"="release-legacy-fix"}
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $headers -TimeoutSec 20
+          $hasLegacy = $false
+          foreach ($a in $rel.assets) { if ($a.name -eq "报告生成工具-Setup.exe") { $hasLegacy = $true; break } }
+          if ($hasLegacy) {
             Write-Host "Legacy asset already present"
-          } else {
-            Write-Host "Legacy asset missing (softprops mangled), uploading via gh..."
-            gh release upload $tag "dist/报告生成工具-Setup.exe" --clobber
-            Write-Host "Legacy upload done"
+            exit 0
           }
+          Write-Host "Legacy asset missing, uploading via API with UTF8 name..."
+          $uploadUrl = ($rel.upload_url -replace "\{\?name,label\}", "")
+          $encodedName = [System.Uri]::EscapeDataString("报告生成工具-Setup.exe")
+          $uri = "${uploadUrl}?name=${encodedName}"
+          $filePath = "dist/报告生成工具-Setup.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($filePath)
+          $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers @{"Authorization"="Bearer $env:GH_TOKEN"; "Content-Type"="application/octet-stream"; "User-Agent"="release-legacy-fix"} -Body $bytes -TimeoutSec 120
+          Write-Host "Legacy upload done: $($resp.name) id $($resp.id)"
