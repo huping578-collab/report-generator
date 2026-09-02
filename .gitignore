@@ -22,3 +22,8 @@ templates/*.docx
 
 # Keep template instructions
 !templates/模板放置说明.txt
+
+# Handoff docs - local only, not tracked by GitHub
+HANDOFF.md
+HANDOFF-*.md
+docs/HANDOFF*.md
