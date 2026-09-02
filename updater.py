@@ -13,7 +13,9 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "报告生成工具"
+# ponytail: 双资产兼容，历史版本用中文名，新版用 ASCII 名，升级期两者并存
 ASSET_NAME = "report-generator-Setup.exe"
+ASSET_NAME_LEGACY = "报告生成工具-Setup.exe"
 RELEASE_API = "https://api.github.com/repos/huping578-collab/report-generator/releases/latest"
 DOWNLOAD_HOSTS = frozenset({"github.com", "objects.githubusercontent.com"})
 
@@ -45,11 +47,12 @@ def select_installer_asset(release: dict[str, Any]) -> dict[str, Any]:
     assets = release.get("assets") if isinstance(release, dict) else None
     if not isinstance(assets, list):
         raise ValueError("GitHub Release 响应缺少有效资产列表。")
-    for asset in assets:
-        if isinstance(asset, dict) and asset.get("name") == ASSET_NAME:
-            _validate_asset_url(asset)
-            return asset
-    raise ValueError(f"最新 GitHub Release 缺少资产：{ASSET_NAME}")
+    for name in (ASSET_NAME, ASSET_NAME_LEGACY):
+        for asset in assets:
+            if isinstance(asset, dict) and asset.get("name") == name:
+                _validate_asset_url(asset)
+                return asset
+    raise ValueError(f"最新 GitHub Release 缺少资产：{ASSET_NAME}（兼容 {ASSET_NAME_LEGACY}）")
 
 
 def validate_download(data: bytes, expected_size: int | None = None) -> None:

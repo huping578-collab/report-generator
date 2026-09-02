@@ -53,4 +53,21 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/report-generator-Setup.exe
+          files: |
+            dist/report-generator-Setup.exe
+            dist/报告生成工具-Setup.exe
+
+      - name: Ensure legacy Chinese asset (fallback for old updater)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $names = gh release view $tag --json assets --jq '.assets[].name' 2>$null
+          if ($names -match "报告生成工具-Setup.exe") {
+            Write-Host "Legacy asset already present"
+          } else {
+            Write-Host "Legacy asset missing (softprops mangled), uploading via gh..."
+            gh release upload $tag "dist/报告生成工具-Setup.exe" --clobber
+            Write-Host "Legacy upload done"
+          }
