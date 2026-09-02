@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-HorizontalRule = tuple[int, int, int, int]
-
 
 @dataclass
 class Block:

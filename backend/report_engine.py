@@ -1111,312 +1111,19 @@ def make_docx(
     log=lambda _: None,
     require_template=True,
 ):
-    if config.template_docx.suffix == ".md":
-        from backend import minimal_docx
-        log("使用 Markdown 报告模板。")
-        return minimal_docx.run(
-            config, segments,
-            height_stats=height_stats, height_records=height_records,
-            bolt_stats=bolt_stats, bolt_records=bolt_records,
-            disease_image_index=disease_image_index, log=log,
-            skeleton_md=config.template_docx,
-        )
-    if not config.template_docx.exists():
-        if not require_template:
-            from backend import minimal_docx
-            log("未检测到内置 Word 模板，切换到程序化报告生成模式。")
-            return minimal_docx.run(
-                config, segments,
-                height_stats=height_stats, height_records=height_records,
-                bolt_stats=bolt_stats, bolt_records=bolt_records,
-                disease_image_index=disease_image_index, log=log,
-            )
+    if config.template_docx.suffix.lower() != ".md":
+        raise ValueError(f"仅支持 Markdown 模板：{config.template_docx}，请使用 .md 模板。")
+    if not config.template_docx.is_file():
         raise FileNotFoundError(f"Word模板不存在：{config.template_docx}")
-    with tempfile.TemporaryDirectory(prefix="g210_report_") as temp_dir:
-        images = report_images(temp_dir, segments, height_stats, height_records or []) if height_stats is not None else {}
-        with ZipFile(config.template_docx) as source:
-            document = ET.fromstring(source.read("word/document.xml")); body = document.find(wt("body"))
-            section = deepcopy(body.find(wt("sectPr")))
-            numbering_xml, chapter_nums = add_multilevel_numbering(source.read("word/numbering.xml"))
-            relationships = ET.fromstring(source.read("word/_rels/document.xml.rels"))
-            rel_numbers = [int(m.group(1)) for rel in relationships if (m := re.match(r"rId(\d+)", rel.get("Id", "")))]
-            next_rel = max(rel_numbers, default=0) + 1
-            media = []
-
-            def register_image(source_data, extension=None):
-                nonlocal next_rel
-                rid = f"rId{next_rel}"; next_rel += 1
-                if isinstance(source_data, (bytes, bytearray)):
-                    data = bytes(source_data)
-                    extension = extension or ".png"
-                else:
-                    path = Path(source_data)
-                    data = path.read_bytes()
-                    extension = extension or path.suffix or ".png"
-                extension = extension.lower()
-                if not extension.startswith("."):
-                    extension = "." + extension
-                name = f"g210_image_{len(media) + 1}{extension}"
-                relation = ET.SubElement(relationships, q(PR, "Relationship"))
-                relation.set("Id", rid); relation.set("Target", f"media/{name}")
-                relation.set("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image")
-                media.append((name, data))
-                return rid
-
-            kept = []
-            for child in list(body):
-                if child.tag == wt("sectPr"): continue
-                kept.append(deepcopy(child))
-                text = "".join(node.text or "" for node in child.findall(f".//{wt('t')}"))
-                if "目 录" in text: break
-            for child in list(body): body.remove(child)
-            for child in kept: body.append(child)
-            replace_text(body, "G347", "G210"); replace_text(body, "两波", "二波"); replace_text(body, "双波", "二波")
-
-            body.append(heading_paragraph("概述", 1, chapter_nums[1]))
-            body.append(heading_paragraph("项目概况", 2, chapter_nums[1]))
-            selected_items = []
-            if height_stats is not None: selected_items.append("护栏横梁中心高度")
-            if bolt_stats is not None: selected_items.append("螺栓缺失")
-            body.append(body_paragraph(
-                f"本次对重庆市G210线波形梁护栏{'和'.join(selected_items)}进行自动化检测，按采集路段汇总表划分为{len(segments)}个统计分段。"
-                "G210上行K2264K2325文件按原始桩号统计，其他文件按电子修正桩号统计。"
-            ))
-            body.append(caption_paragraph("G210检测路段情况", "表", "1.1", 1))
-            body.append(word_table(
-                ["序号", "路线编号", "起点桩号", "终点桩号", "里程(km)", "公路等级", "管理单位"],
-                [[i, "G210", format_station(s["start"]), format_station(s["end"]), f"{s['mileage']:.3f}", s["grade"], s["manager"]] for i, s in enumerate(segments, 1)],
-            ))
-            body.append(heading_paragraph("评定方法", 2, chapter_nums[1]))
-            if height_stats is not None:
-                body.append(body_paragraph("二波按560、580、620、640mm分档，580≤h≤620mm为合格；三波按657、677、717、737mm分档，677≤h≤717mm为合格。"))
-            if bolt_stats is not None:
-                body.append(body_paragraph("螺栓缺失率按缺失数量÷（拼接螺栓数量+连接螺栓数量+缺失数量）×100%计算。"))
-
-            drawing_id = 1000
-            if height_stats is not None:
-                body.append(heading_paragraph("波形梁护栏横梁中心高度检测结果", 1, chapter_nums[3]))
-                body.append(heading_paragraph("G210线整体情况", 2, chapter_nums[3]))
-                for kind in ("二波", "三波"):
-                    total = sum(item["types"][kind]["count"] for item in height_stats)
-                    if not total: continue
-                    good = sum(item["types"][kind]["bins"][2] for item in height_stats); rate = good * 100 / total
-                    body.append(body_paragraph(f"G210线{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{rate:.2f}%。"))
-                for number, kind, endpoint_header, labels in (
-                    (1, "二波", "终点桩号", ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"]),
-                    (2, "三波", "止点桩号", ["657>h", "657≤h﹤677", "677≤h≤717", "717﹤h≤737", "737<h"]),
-                ):
-                    rows = []
-                    for item in height_stats:
-                        segment, data = item["segment"], item["types"][kind]
-                        if data["count"]:
-                            rows.append([kind, "G210", format_station(segment["start"]), format_station(segment["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
-                    if rows:
-                        body.append(caption_paragraph(
-                            f"G210线{kind}形梁护栏横梁中心高度检测结果",
-                            "表", "3.1", number,
-                        ))
-                        body.append(word_table(["类型", "路线编号", "起点桩号", endpoint_header, *labels], rows, header_shading=True))
-
-                figure_bookmark_sequence = 0; bookmark_id = 1000
-                for segment_index, item in enumerate(height_stats):
-                    segment = item["segment"]
-                    section_number = f"3.{segment_index + 2}"
-                    figure_sequence = 0
-                    body.append(heading_paragraph(f"G210线{format_station(segment['start'])}～{format_station(segment['end'])}段", 2, chapter_nums[3]))
-                    if not any(item["types"][kind]["count"] for kind in ("二波", "三波")):
-                        body.append(body_paragraph("本段无波形护栏"))
-                        continue
-                    for kind in ("二波", "三波"):
-                        data = item["types"][kind]
-                        if not data["count"]: continue
-                        level = "较高" if data["pass"] >= 80 else ("一般" if data["pass"] >= 60 else "偏低")
-                        detail = percentage_phrases(kind, data["pcts"])
-                        refs = []
-                        titles = [
-                            f"{kind}形梁护栏横梁中心高度检测结果",
-                            f"{kind}形梁护栏横梁中心高度分布情况",
-                            f"{kind}形梁护栏横梁中心高度自动计算示例",
-                        ]
-                        for title in titles:
-                            figure_sequence += 1; figure_bookmark_sequence += 1; bookmark_id += 1
-                            refs.append((
-                                figure_sequence, bookmark_id,
-                                f"_RefG210HeightFig{figure_bookmark_sequence}", title,
-                            ))
-                        analysis = ET.Element(wt("p")); analysis.append(paragraph_properties())
-                        append_run(analysis,
-                            f"G210线{format_station(segment['start'])}～{format_station(segment['end'])}段{kind}形梁护栏横梁中心高度有效检测点共{data['count']}个，"
-                            f"整体合格率{level}，合格率为{data['pass']:.2f}%。护栏横梁中心高度{detail}。{kind}形梁护栏横梁中心高度检测结果如"
-                        )
-                        append_reference(analysis, refs[0][2], f"图 {section_number}-{refs[0][0]}"); append_run(analysis, "所示，横梁中心高度分布情况如")
-                        append_reference(analysis, refs[1][2], f"图 {section_number}-{refs[1][0]}"); append_run(analysis, "所示，自动计算示例如")
-                        append_reference(analysis, refs[2][2], f"图 {section_number}-{refs[2][0]}"); append_run(analysis, "所示。")
-                        body.append(analysis)
-
-                        image_set = images[(segment_index, kind)]
-                        for image_key, ref in zip(("line", "pie"), refs[:2]):
-                            drawing_id += 1; body.append(picture_paragraph(register_image(image_set[image_key]), drawing_id))
-                            body.append(caption_paragraph(
-                                ref[3], "图", section_number, ref[0], ref[1], ref[2],
-                            ))
-                        example_rows = [
-                            record for record in (height_records or [])
-                            if record["segment"] == segment_index and record["kind"] == kind
-                        ]
-                        example_points = select_height_example_points(example_rows, segment_index, kind)
-                        body.append(height_example_table(example_points))
-                        ref = refs[2]
-                        body.append(caption_paragraph(
-                            ref[3], "图", section_number, ref[0], ref[1], ref[2],
-                        ))
-
-            if bolt_stats is not None:
-                body.append(heading_paragraph("波形梁护栏螺栓缺失", 1, chapter_nums[4]))
-                body.append(heading_paragraph("G210线整体情况", 2, chapter_nums[4]))
-                report_bolts = list(bolt_stats)
-                total_splice = sum(item["splice"] for item in report_bolts)
-                total_connection = sum(item["connection"] for item in report_bolts)
-                total_missing = sum(item["missing"] for item in report_bolts)
-                total_rate = bolt_missing_rate(total_splice, total_connection, total_missing)
-                body.append(body_paragraph(
-                    f"本次采用波形梁护栏螺栓缺失自动化检测方式，对重庆市G210线波形梁护栏螺栓缺失情况进行统计，"
-                    f"共检出拼接螺栓{total_splice}颗，连接螺栓{total_connection}颗，缺失螺栓{total_missing}颗，整体缺失率为{total_rate:.2f}%。"
-                    "G210线螺栓缺失检测结果如表4.1-1所示。"
-                ))
-                overall_rows = []
-                for item in report_bolts:
-                    segment = item["segment"]
-                    overall_rows.append([
-                        "G210", format_station(segment["start"]), format_station(segment["end"]), f"{segment['mileage']:.3f}",
-                        item["splice"], item["connection"], item["missing"], f"{item['rate']:.2f}",
-                    ])
-                overall_rows.append(["合计", "", "", "", total_splice, total_connection, total_missing, f"{total_rate:.2f}"])
-                body.append(caption_paragraph(
-                    "G210线波形梁护栏螺栓缺失检测结果", "表", "4.1", 1,
-                ))
-                body.append(word_table(
-                    ["路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"],
-                    overall_rows, header_shading=True,
-                ))
-
-                figure_bookmark_sequence = 0; bookmark_id = 3000
-                for section_number, item in enumerate(report_bolts, 2):
-                    segment = item["segment"]
-                    start = format_station(segment["start"]); end = format_station(segment["end"])
-                    body.append(heading_paragraph(f"G210线{start}～{end}段", 2, chapter_nums[4]))
-                    if not item["points"]:
-                        body.append(body_paragraph("本段无波形护栏"))
-                        continue
-                    segment_bolt_rows = [
-                        record for record in (bolt_records or [])
-                        if record["segment"] == section_number - 2
-                    ]
-                    bolt_examples = select_bolt_example_points(segment_bolt_rows, disease_image_index)
-                    if bolt_examples:
-                        figure_bookmark_sequence += 1; bookmark_id += 1
-                        bookmark_name = f"_RefG210BoltFig{figure_bookmark_sequence}"
-                    analysis = ET.Element(wt("p")); analysis.append(paragraph_properties())
-                    append_run(analysis,
-                        f"G210线{start}～{end}段共检出拼接螺栓{item['splice']}颗，连接螺栓{item['connection']}颗，"
-                        f"缺失螺栓{item['missing']}颗，缺失率为{item['rate']:.2f}%。"
-                        f"该段螺栓缺失检测结果如表4.{section_number}-1所示"
-                    )
-                    if bolt_examples:
-                        append_run(analysis, "，螺栓自动化识别示例如")
-                        append_reference(analysis, bookmark_name, f"图 4.{section_number}-1"); append_run(analysis, "所示。")
-                    else:
-                        append_run(analysis, "。")
-                    body.append(analysis)
-                    body.append(caption_paragraph(
-                        f"G210线{start}～{end}段波形梁护栏螺栓缺失检测结果",
-                        "表", f"4.{section_number}", 1,
-                    ))
-                    body.append(word_table(
-                        ["路线编号", "起点桩号", "止点桩号", "里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）"],
-                        [["G210", start, end, f"{segment['mileage']:.3f}", item["splice"], item["connection"], item["missing"]]],
-                        header_shading=True, keep_together=True,
-                    ))
-                    if bolt_examples:
-                        for example in bolt_examples:
-                            image_data, image_extension = read_disease_image(example["image"])
-                            drawing_id += 1
-                            body.append(picture_paragraph(
-                                register_image(image_data, image_extension), drawing_id,
-                                width_cm=16, height_cm=8.5,
-                            ))
-                            body.append(body_paragraph(bolt_example_text(example), True))
-                        body.append(caption_paragraph(
-                            f"G210线{start}～{end}段波形梁护栏螺栓缺失自动识别示例",
-                            "图", f"4.{section_number}", 1, bookmark_id, bookmark_name,
-                        ))
-
-            body.append(heading_paragraph("结论与建议", 1, chapter_nums[5]))
-            body.append(heading_paragraph("结论", 2, chapter_nums[5]))
-            if height_stats is not None:
-                for kind in ("二波", "三波"):
-                    total = sum(item["types"][kind]["count"] for item in height_stats)
-                    if not total: continue
-                    good = sum(item["types"][kind]["bins"][2] for item in height_stats); rate = good * 100 / total
-                    body.append(body_paragraph(f"G210检测路段{kind}形梁护栏有效检测点{total}个，合格点{good}个，整体合格率{rate:.2f}%。"))
-            if bolt_stats is not None:
-                report_bolts = list(bolt_stats)
-                total_splice = sum(item["splice"] for item in report_bolts)
-                total_connection = sum(item["connection"] for item in report_bolts)
-                total_missing = sum(item["missing"] for item in report_bolts)
-                total_rate = bolt_missing_rate(total_splice, total_connection, total_missing)
-                body.append(body_paragraph(
-                    f"G210检测路段共检出拼接螺栓{total_splice}颗、连接螺栓{total_connection}颗，"
-                    f"缺失螺栓{total_missing}颗，整体缺失率为{total_rate:.2f}%。"
-                ))
-            body.append(heading_paragraph("建议", 2, chapter_nums[5]))
-            suggestions = []
-            if height_stats is not None:
-                suggestions.append("优先对横梁中心高度合格率较低的分段开展现场复核，结合路缘石、路面加铺及护栏结构实际情况制定整治计划，并在养护后复测")
-            if bolt_stats is not None:
-                suggestions.append("加强护栏连接件养护巡查，对螺栓缺失位置及时补装同规格螺栓并复核紧固状态")
-            body.append(body_paragraph("建议管养单位" + "；".join(suggestions) + "。"))
-            body.append(section)
-
-            replace_text(document, "G347", "G210"); replace_text(document, "两波", "二波"); replace_text(document, "双波", "二波")
-            document_xml = ET.tostring(document, encoding="utf-8", xml_declaration=True)
-            relationships_xml = ET.tostring(relationships, encoding="utf-8", xml_declaration=True)
-            content_types = ET.fromstring(source.read("[Content_Types].xml"))
-            existing_extensions = {
-                str(node.get("Extension") or "").lower()
-                for node in content_types.findall(q(CT, "Default"))
-            }
-            mime_types = {"png": "image/png", "jpeg": "image/jpeg", "jpg": "image/jpeg"}
-            used_extensions = {Path(name).suffix.lower().lstrip(".") for name, _ in media}
-            for extension in sorted(used_extensions):
-                if extension not in mime_types or extension in existing_extensions:
-                    continue
-                node = ET.Element(q(CT, "Default")); node.set("Extension", extension); node.set("ContentType", mime_types[extension])
-                # [Content_Types].xml要求Default位于Override之前。
-                first_override = next((i for i, child in enumerate(list(content_types)) if child.tag == q(CT, "Override")), len(content_types))
-                content_types.insert(first_override, node)
-                existing_extensions.add(extension)
-            content_types_xml = ET.tostring(content_types, encoding="utf-8", xml_declaration=True)
-
-            with ZipFile(config.out_docx, "w", ZIP_DEFLATED) as target:
-                replacements = {
-                    "word/document.xml": document_xml,
-                    "word/numbering.xml": numbering_xml,
-                    "word/_rels/document.xml.rels": relationships_xml,
-                    "[Content_Types].xml": content_types_xml,
-                }
-                for item in source.infolist():
-                    data = replacements.get(item.filename, source.read(item.filename))
-                    if item.filename.startswith(("word/header", "word/footer")):
-                        try:
-                            part = ET.fromstring(data); replace_text(part, "G347", "G210"); replace_text(part, "两波", "二波"); replace_text(part, "双波", "二波")
-                            data = ET.tostring(part, encoding="utf-8", xml_declaration=True)
-                        except ET.ParseError: pass
-                    target.writestr(item, data)
-                for name, data in media:
-                    target.writestr(f"word/media/{name}", data)
-    log(f"检测报告已生成：{config.out_docx}")
-
+    from backend import minimal_docx
+    log("使用 Markdown 报告模板。")
+    return minimal_docx.run(
+        config, segments,
+        height_stats=height_stats, height_records=height_records,
+        bolt_stats=bolt_stats, bolt_records=bolt_records,
+        disease_image_index=disease_image_index, log=log,
+        skeleton_md=config.template_docx,
+    )
 
 def add_distribution_charts(wb, source_name, target_name):
     if target_name in wb.sheetnames:
@@ -2952,38 +2659,33 @@ class GuangdongChapterWriter:
         city=_safe_city_component(city)
         template=Path(template)
         if not template.is_file(): raise FileNotFoundError(f"Word模板不存在：{template}")
-        if template.suffix == ".md":
-            from backend import markdown_skeleton
-            doc = Document()
-            blocks = []
-            for block in markdown_skeleton.read_blocks(template):
-                if block.kind == "heading" and block.level == 1:
-                    blocks.append(block)
-                    continue
-                if block.kind == "heading":
-                    break
-                if block.kind != "picture":
-                    blocks.append(block)
-            markdown_skeleton.render_skeleton(
-                doc, blocks,
-                heading=lambda text, level: cls._heading(doc, text, min(level, 2)),
-                body=lambda text: cls._body(doc, text),
-                replace={"{{地市}}": city},
-            )
-            chapter_no = 1
-        else:
-            try: doc=Document(template)
-            except Exception as exc: raise ValueError(f"Word模板损坏：{template}") from exc
-            for paragraph in doc.paragraphs:
-                if "{{地市}}" in paragraph.text:
-                    for run in paragraph.runs: run.text=run.text.replace("{{地市}}",city)
-            for style_name in ("Normal","Body Text"):
-                if style_name in doc.styles:
-                    doc.styles[style_name].font.name="仿宋_GB2312"; doc.styles[style_name].font.size=Pt(10.5)
-            cls._configure_heading_styles(doc)
-            cls._format_existing_headings(doc)
-            cls._remove_template_placeholder(doc)
-            chapter_no=cls._chapter_number(doc)
+        if template.suffix.lower() != ".md":
+            raise ValueError(f"仅支持 Markdown 模板：{template}，请使用 .md 模板。")
+        from backend import markdown_skeleton
+        doc = Document()
+        blocks = markdown_skeleton.read_blocks(template)
+        # 渲染完整骨架：标题/正文/表格/图片，支持 {{地市}} 占位与显式锚点（见 minimal_docx 锚点文档）。
+        # 若模板包含 <!-- inject:* --> 标记，动态章节将在对应位置注入；否则追加末尾（兼容旧模板）。
+        def _skeleton_picture(caption: str):
+            try:
+                media_path = (template.parent / caption).resolve()
+                if media_path.is_file():
+                    try:
+                        doc.add_picture(str(media_path), width=Pt(380))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        markdown_skeleton.render_skeleton(
+            doc, blocks,
+            heading=lambda text, level: cls._heading(doc, text, min(level, 2)),
+            body=lambda text: cls._body(doc, text),
+            table=lambda headers, rows, shading: cls._add_table(doc, headers, rows),
+            picture=_skeleton_picture,
+            replace={"{{地市}}": city},
+        )
+        chapter_no = 1
         for style_name in ("Normal","Body Text"):
             if style_name in doc.styles:
                 doc.styles[style_name].font.name="仿宋_GB2312"; doc.styles[style_name].font.size=Pt(10.5)

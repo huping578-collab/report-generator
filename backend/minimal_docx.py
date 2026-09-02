@@ -4,7 +4,7 @@ A Markdown template (templates/重庆项目报告模板.md) declares the report
 skeleton (headings, static body texts, tables). Dynamic data sections
 (overview table, height/bolt statistics, charts, conclusions) are injected at
 anchor headings; when an anchor is absent the section is appended at the end.
-Without a skeleton the previous hard-coded structure is used.
+Requires a Markdown skeleton; explicit anchors <!-- inject:... --> are preferred over keyword fallback.
 """
 
 from __future__ import annotations
@@ -44,12 +44,10 @@ def _set_run_fonts(run, east_asia=BODY_FONT, latin=LATIN_FONT):
 
 
 def _clear_indent(paragraph):
-    from docx.shared import Pt as _Pt
-
     fmt = paragraph.paragraph_format
-    fmt.left_indent = _Pt(0)
-    fmt.right_indent = _Pt(0)
-    fmt.first_line_indent = _Pt(0)
+    fmt.left_indent = Pt(0)
+    fmt.right_indent = Pt(0)
+    fmt.first_line_indent = Pt(0)
     p_pr = paragraph._p.get_or_add_pPr()
     ind = p_pr.find(qn("w:ind"))
     if ind is None:
@@ -295,30 +293,73 @@ def _section_conclusion(doc, height_stats, bolt_stats):
     _body(doc, "建议管养单位优先对横梁中心高度合格率较低的分段开展现场复核，结合路缘石、路面加铺及护栏结构实际情况制定整治计划，并在养护后复测；加强护栏连接件养护巡查，对螺栓缺失位置及时补装同规格螺栓并复核紧固状态。")
 
 
-def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir):
-    sections = [
-        # (关键词, 是否渲染骨架标题, 数据写入器)
-        ("项目概况", True, lambda: _section_overview(doc, config, segments)),
-        ("整体情况", False, lambda: _section_height(doc, segments, height_stats, height_records, images, temp_dir) if height_stats is not None else lambda: None),
-        ("螺栓", False, lambda: _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir) if bolt_stats is not None else lambda: None),
-        ("结论", False, lambda: _section_conclusion(doc, height_stats, bolt_stats)),
-    ]
-    pending = list(sections)
+def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir, skeleton_md=None):
+    # 显式锚点优先，关键词回退。显式锚点语法（任一满足即注入）：
+    #   <!-- inject:overview -->  <!-- inject:height -->  <!-- inject:bolt -->  <!-- inject:conclusion -->
+    # 兼容旧模板的关键词匹配：项目概况/整体情况/螺栓/结论
+    import re as _re
+    anchor_re = _re.compile(r"<!--\s*inject:\s*(overview|height|bolt|conclusion)\s*-->")
+    keyword_map = {
+        "项目概况": "overview",
+        "整体情况": "height",
+        "螺栓": "bolt",
+        "结论": "conclusion",
+    }
+    def _writer_for(key: str):
+        if key == "overview":
+            return lambda: _section_overview(doc, config, segments)
+        if key == "height":
+            return (lambda: _section_height(doc, segments, height_stats, height_records, images, temp_dir)) if height_stats is not None else (lambda: None)
+        if key == "bolt":
+            return (lambda: _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir)) if bolt_stats is not None else (lambda: None)
+        if key == "conclusion":
+            return lambda: _section_conclusion(doc, height_stats, bolt_stats)
+        return lambda: None
+
+    # pending 按显式 key 索引，便于锚点直接命中
+    pending_by_key = {
+        "overview": ("项目概况", True, _writer_for("overview")),
+        "height": ("整体情况", False, _writer_for("height")),
+        "bolt": ("螺栓", False, _writer_for("bolt")),
+        "conclusion": ("结论", False, _writer_for("conclusion")),
+    }
+    pending_keys = set(pending_by_key.keys())
+
+    def _inject(key: str, render_heading: bool, block_text: str = "", level: int = 2):
+        if key not in pending_keys:
+            return
+        keyword, do_render, writer = pending_by_key[key]
+        pending_keys.remove(key)
+        if do_render and block_text:
+            _heading(doc, block_text, min(level, 2))
+        writer()
+
+    skeleton_dir = Path(skeleton_md).parent if skeleton_md else None
+
     for block in blocks:
+        # 1) 显式锚点：任意块（标题/段落）的文本中包含 <!-- inject:xxx -->
+        anchor_hit = None
+        if block.text:
+            m = anchor_re.search(block.text)
+            if m:
+                anchor_hit = m.group(1)
+        if anchor_hit:
+            # 显式锚点不渲染原块文本，直接注入
+            _inject(anchor_hit, False)
+            continue
+
         if block.kind == "heading":
-            hit = None
-            for index, (keyword, _render_heading, _writer) in enumerate(pending):
-                if keyword in block.text:
-                    hit = index
+            # 关键词回退
+            hit_key = None
+            for kw, key in keyword_map.items():
+                if kw in block.text and key in pending_keys:
+                    hit_key = key
                     break
-            if hit is not None:
-                keyword, render_heading, writer = pending.pop(hit)
-                if render_heading:
-                    _heading(doc, block.text, min(block.level, 2))
-                writer()
+            if hit_key:
+                _keyword, do_render, _ = pending_by_key[hit_key]
+                _inject(hit_key, do_render, block.text, block.level)
                 continue
             if "G210线K" in block.text and block.level >= 3:
-                # 骨架示例段标题（含示例桩号），由数据段按实际分段生成，跳过
                 continue
             _heading(doc, block.text, min(block.level, 2))
         elif block.kind == "paragraph":
@@ -328,8 +369,23 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
             if block.rows:
                 _table(doc, block.rows[0], block.rows[1:], False)
         elif block.kind == "picture":
+            if skeleton_dir is not None:
+                try:
+                    media_path = (skeleton_dir / block.caption).resolve()
+                    if media_path.is_file():
+                        # 按 13cm 宽度插入，高度自适应；失败则跳过
+                        try:
+                            _picture(doc, media_path, 13, 8)
+                            continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # 无有效图片时跳过（报告图片由引擎生成）
             continue
-    for _keyword, _render_heading, writer in pending:
+    # 未命中锚点追加末尾（不丢数据但位置错，模板编辑时保留关键词或显式锚点可避免）
+    for key in list(pending_keys):
+        _, _, writer = pending_by_key[key]
         writer()
 
 
@@ -353,31 +409,16 @@ def make_report(config, segments, height_stats, height_records, bolt_stats, bolt
     _set_run_fonts(run, HEADING_FONT)
     title.paragraph_format.space_after = Pt(18)
 
-    if skeleton_md is not None:
-        blocks = markdown_skeleton.read_blocks(skeleton_md)
-        _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir)
-        try:
-            doc.save(config.out_docx)
-        except PermissionError as exc:
-            raise PermissionError(f"Word文件被占用：{config.out_docx}") from exc
-        return config.out_docx
-
-    _heading(doc, "概述", 1)
-    _heading(doc, "项目概况", 2)
-    _section_overview(doc, config, segments)
-    _heading(doc, "评定方法", 2)
-    _section_method(doc, height_stats, bolt_stats)
-    if height_stats is not None:
-        _section_height(doc, segments, height_stats, height_records, images, temp_dir)
-    if bolt_stats is not None:
-        _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir)
-    _section_conclusion(doc, height_stats, bolt_stats)
-
+    if skeleton_md is None:
+        raise FileNotFoundError(f"Markdown 模板不存在：{skeleton_md}，仅支持 .md 模板。")
+    blocks = markdown_skeleton.read_blocks(skeleton_md)
+    _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir, skeleton_md=skeleton_md)
     try:
         doc.save(config.out_docx)
     except PermissionError as exc:
         raise PermissionError(f"Word文件被占用：{config.out_docx}") from exc
     return config.out_docx
+
 
 
 def run(config, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, log=lambda _x: None, skeleton_md=None):

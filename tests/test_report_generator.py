@@ -39,10 +39,10 @@ class DesktopBridgeTests(unittest.TestCase):
         self.disease = self.root / "disease"
         self.detail.mkdir()
         self.disease.mkdir()
-        self.cq_template = self.root / "重庆项目报告模板.docx"
-        self.gd_template = self.root / "广东项目第五章模板.docx"
-        self.cq_template.write_bytes(b"template")
-        self.gd_template.write_bytes(b"template")
+        self.cq_template = self.root / "重庆项目报告模板.md"
+        self.gd_template = self.root / "广东项目第五章模板.md"
+        self.cq_template.write_text("# 重庆模板\n", encoding="utf-8")
+        self.gd_template.write_text("# 广东模板\n", encoding="utf-8")
         self.bridge = DesktopBridge()
 
     def tearDown(self) -> None:
@@ -107,7 +107,7 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_missing_specialized_template_fails_guangdong_validation(self) -> None:
         templates = self.templates()
-        templates["广东项目第五章模板"] = self.root / "missing-gd.docx"
+        templates["广东项目第五章模板"] = self.root / "missing-gd.md"
         scalar = {
             "template": "gd",
             "values": {
@@ -145,8 +145,8 @@ class DesktopBridgeTests(unittest.TestCase):
 
     def test_resource_template_path_uses_application_root(self) -> None:
         self.assertEqual(
-            engine.resource_template_path("x.docx"),
-            engine.application_root() / "templates" / "x.docx",
+            engine.resource_template_path("x.md"),
+            engine.application_root() / "templates" / "x.md",
         )
 
     def test_guangdong_run_uses_resource_template_for_bundles(self) -> None:
@@ -350,11 +350,20 @@ class MinimalDocxTests(unittest.TestCase):
     def test_generates_report_without_template(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir)
+            skeleton = Path(temp_dir) / "重庆项目报告模板.md"
+            skeleton.write_text(
+                "# 2026年普通公路国省道交通安全设施自动化检测报告\n\n"
+                "## 1.1 项目概况\n\n"
+                "## 3.1 G210线整体情况\n\n"
+                "## 5.1 G210线整体情况\n\n"
+                "## 6 结论与建议\n",
+                encoding="utf-8",
+            )
             config = engine.Config(
                 project_dir=Path(temp_dir),
                 summary_xlsx=Path(temp_dir) / "summary.xlsx",
                 detail_dir=Path(temp_dir),
-                template_docx=Path(temp_dir) / "missing.docx",
+                template_docx=skeleton,
                 output_dir=output,
                 disease_dir=None,
             )
@@ -374,20 +383,30 @@ class MinimalDocxTests(unittest.TestCase):
                 bolt_records,
                 None,
                 log=messages.append,
+                skeleton_md=skeleton,
             )
             self.assertTrue(result.is_file())
             self.assertGreater(result.stat().st_size, 12000)
-            self.assertTrue(any("程序化" in message for message in messages))
+            self.assertTrue(any("Markdown" in message or "程序化" in message for message in messages))
 
     def test_engine_routes_to_minimal_without_template(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             output = root / "output"
+            skeleton = root / "重庆项目报告模板.md"
+            skeleton.write_text(
+                "# 2026年普通公路国省道交通安全设施自动化检测报告\n\n"
+                "## 1.1 项目概况\n\n"
+                "## 3.1 G210线整体情况\n\n"
+                "## 5.1 G210线整体情况\n\n"
+                "## 6 结论与建议\n",
+                encoding="utf-8",
+            )
             config = engine.Config(
                 project_dir=root,
                 summary_xlsx=root / "summary.xlsx",
                 detail_dir=root,
-                template_docx=root / "missing.docx",
+                template_docx=skeleton,
                 output_dir=output,
                 disease_dir=None,
             )
@@ -410,7 +429,7 @@ class MinimalDocxTests(unittest.TestCase):
             )
             self.assertTrue(config.out_docx.is_file())
             self.assertGreater(config.out_docx.stat().st_size, 12000)
-            self.assertTrue(any("程序化" in message for message in messages))
+            self.assertTrue(any("Markdown" in message or "程序化" in message for message in messages))
 
     def test_generates_report_from_markdown_skeleton(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -514,8 +533,12 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            template = root / "template.docx"
-            Document().save(template)
+            template = root / "template.md"
+            template.write_text(
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "本章为{{地市}}交通安全设施技术状况检测评价内容。\n",
+                encoding="utf-8",
+            )
             output = engine.GuangdongChapterWriter.write(
                 "佛山市",
                 bundle,
@@ -556,8 +579,12 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            template = root / "template.docx"
-            Document().save(template)
+            template = root / "template.md"
+            template.write_text(
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "本章为{{地市}}交通安全设施技术状况检测评价内容。\n",
+                encoding="utf-8",
+            )
             output = engine.GuangdongChapterWriter.write(
                 "佛山市",
                 bundle,
