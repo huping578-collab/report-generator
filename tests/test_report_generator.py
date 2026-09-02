@@ -303,12 +303,12 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse(is_newer((1, 2, 3), (1, 2, 3)))
         asset = select_installer_asset({
             "assets": [{
-                "name": "报告生成工具-Setup.exe",
+                "name": "report-generator-Setup.exe",
                 "browser_download_url": "https://github.com/a/b/releases/download/v1/报告生成工具-Setup.exe",
                 "size": 2,
             }],
         })
-        self.assertEqual(asset["name"], "报告生成工具-Setup.exe")
+        self.assertEqual(asset["name"], "report-generator-Setup.exe")
         with self.assertRaises(ValueError):
             validate_download(b"not-an-exe", 11)
 
@@ -319,7 +319,7 @@ class UpdaterTests(unittest.TestCase):
         release = {
             "tag_name": "v0.2.0",
             "assets": [{
-                "name": "报告生成工具-Setup.exe",
+                "name": "report-generator-Setup.exe",
                 "browser_download_url": "https://objects.githubusercontent.com/a/b.exe",
                 "size": 2,
             }],
@@ -330,7 +330,7 @@ class UpdaterTests(unittest.TestCase):
 
         malicious = dict(release)
         malicious["assets"] = [{
-            "name": "报告生成工具-Setup.exe",
+            "name": "report-generator-Setup.exe",
             "browser_download_url": "http://example.com/update.exe",
             "size": 2,
         }]

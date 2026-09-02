@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 APP_NAME = "报告生成工具"
-ASSET_NAME = "报告生成工具-Setup.exe"
+ASSET_NAME = "report-generator-Setup.exe"
 RELEASE_API = "https://api.github.com/repos/huping578-collab/report-generator/releases/latest"
 DOWNLOAD_HOSTS = frozenset({"github.com", "objects.githubusercontent.com"})
 
