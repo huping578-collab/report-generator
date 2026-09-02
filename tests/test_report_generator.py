@@ -294,6 +294,57 @@ def report_engine_bin(record):
     return 4
 
 
+class UpdaterTests(unittest.TestCase):
+    def test_updater_core_validation(self) -> None:
+        from updater import is_newer, parse_version, select_installer_asset, validate_download
+
+        self.assertEqual(parse_version("v1.2.3"), (1, 2, 3))
+        self.assertTrue(is_newer((1, 2, 4), (1, 2, 3)))
+        self.assertFalse(is_newer((1, 2, 3), (1, 2, 3)))
+        asset = select_installer_asset({
+            "assets": [{
+                "name": "报告生成工具-Setup.exe",
+                "browser_download_url": "https://github.com/a/b/releases/download/v1/报告生成工具-Setup.exe",
+                "size": 2,
+            }],
+        })
+        self.assertEqual(asset["name"], "报告生成工具-Setup.exe")
+        with self.assertRaises(ValueError):
+            validate_download(b"not-an-exe", 11)
+
+
+    def test_updater_rejects_untrusted_assets_and_checks_release(self) -> None:
+        from updater import check_for_update, select_installer_asset
+
+        release = {
+            "tag_name": "v0.2.0",
+            "assets": [{
+                "name": "报告生成工具-Setup.exe",
+                "browser_download_url": "https://objects.githubusercontent.com/a/b.exe",
+                "size": 2,
+            }],
+        }
+        result = check_for_update("0.1.0", lambda: release)
+        self.assertTrue(result["update_available"])
+        self.assertEqual(result["latest_version"], "0.2.0")
+
+        malicious = dict(release)
+        malicious["assets"] = [{
+            "name": "报告生成工具-Setup.exe",
+            "browser_download_url": "http://example.com/update.exe",
+            "size": 2,
+        }]
+        with self.assertRaises(ValueError):
+            select_installer_asset(malicious)
+
+    def test_updater_launcher_does_not_use_shell(self) -> None:
+        from updater import launch_installer
+
+        with patch("updater.subprocess.Popen") as popen:
+            launch_installer(Path("C:/Temp/update.exe"))
+        popen.assert_called_once_with([str(Path("C:/Temp/update.exe"))], close_fds=True)
+
+
 class MinimalDocxTests(unittest.TestCase):
     def test_generates_report_without_template(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

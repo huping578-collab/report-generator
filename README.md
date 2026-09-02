@@ -50,6 +50,37 @@ dist/报告生成工具/报告生成工具.exe
 
 分发时请保留整个 `dist/报告生成工具/` 文件夹结构。若模板暂未提供，可在构建后将模板补入该目录下的 `templates/` 文件夹。
 
+## 安装器与更新器
+
+本地构建完整发布包：
+
+```bat
+build-release.bat
+```
+
+构建前需要：
+
+- `.venv\\Scripts\\python.exe` 已安装 `requirements.txt`。
+- Windows 已安装 Inno Setup 6（`ISCC.exe`）。
+- Windows 10 已安装 Microsoft Edge WebView2 Runtime。
+
+构建输出：
+
+```text
+dist\\报告生成工具-Setup.exe
+```
+
+安装器默认安装到 `%LocalAppData%\\Programs\\报告生成工具`，同时创建主程序和更新程序的开始菜单入口。更新程序只检查 GitHub Releases，不从源码分支下载或在用户电脑编译。
+
+发布新版本时：
+
+1. 修改 `version.txt`，例如 `0.1.1`。
+2. 提交并推送代码。
+3. 创建同版本 tag，例如 `v0.1.1` 并推送：`git push origin v0.1.1`。
+4. GitHub Actions 自动构建并发布资产 `报告生成工具-Setup.exe`。
+
+更新程序依赖该精确资产名；如果 Release 没有该资产或网络不可用，会显示错误且不会修改现有安装。
+
 启动后程序会在 `logs/startup.log` 中记录启动过程中的错误；运行时若界面无响应，可检查该日志。
 
 ## 目录
