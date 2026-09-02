@@ -27,7 +27,7 @@ VersionInfoVersion={#AppVersion}
 
 [Files]
 Source: "dist\报告生成工具\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "templates\*;logs\*"
-Source: "templates\*"; DestDir: "{app}\templates"; Flags: ignoreversion recursesubdirs createallsubdirs uninsneveruninstall
+Source: "templates\*"; DestDir: "{app}\templates"; Flags: ignoreversion recursesubdirs createallsubdirs uninsneveruninstall; Excludes: "*.docx"
 Source: "dist\updater\updater.exe"; DestDir: "{app}"; DestName: "更新程序.exe"; Flags: ignoreversion
 
 [Dirs]

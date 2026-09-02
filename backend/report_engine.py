@@ -113,7 +113,7 @@ def resource_template_path(name):
 def builtin_template_paths():
     """返回内置报告模板配置；新增模板时只需在此处增加名称和路径。"""
     return {
-        "重庆模板": resource_template_path("重庆项目报告模板.docx"),
+        "重庆模板": resource_template_path("重庆项目报告模板.md"),
     }
 
 
@@ -1111,6 +1111,16 @@ def make_docx(
     log=lambda _: None,
     require_template=True,
 ):
+    if config.template_docx.suffix == ".md":
+        from backend import minimal_docx
+        log("使用 Markdown 报告模板。")
+        return minimal_docx.run(
+            config, segments,
+            height_stats=height_stats, height_records=height_records,
+            bolt_stats=bolt_stats, bolt_records=bolt_records,
+            disease_image_index=disease_image_index, log=log,
+            skeleton_md=config.template_docx,
+        )
     if not config.template_docx.exists():
         if not require_template:
             from backend import minimal_docx
@@ -2942,18 +2952,41 @@ class GuangdongChapterWriter:
         city=_safe_city_component(city)
         template=Path(template)
         if not template.is_file(): raise FileNotFoundError(f"Word模板不存在：{template}")
-        try: doc=Document(template)
-        except Exception as exc: raise ValueError(f"Word模板损坏：{template}") from exc
-        for paragraph in doc.paragraphs:
-            if "{{地市}}" in paragraph.text:
-                for run in paragraph.runs: run.text=run.text.replace("{{地市}}",city)
+        if template.suffix == ".md":
+            from backend import markdown_skeleton
+            doc = Document()
+            blocks = []
+            for block in markdown_skeleton.read_blocks(template):
+                if block.kind == "heading" and block.level == 1:
+                    blocks.append(block)
+                    continue
+                if block.kind == "heading":
+                    break
+                if block.kind != "picture":
+                    blocks.append(block)
+            markdown_skeleton.render_skeleton(
+                doc, blocks,
+                heading=lambda text, level: cls._heading(doc, text, min(level, 2)),
+                body=lambda text: cls._body(doc, text),
+                replace={"{{地市}}": city},
+            )
+            chapter_no = 1
+        else:
+            try: doc=Document(template)
+            except Exception as exc: raise ValueError(f"Word模板损坏：{template}") from exc
+            for paragraph in doc.paragraphs:
+                if "{{地市}}" in paragraph.text:
+                    for run in paragraph.runs: run.text=run.text.replace("{{地市}}",city)
+            for style_name in ("Normal","Body Text"):
+                if style_name in doc.styles:
+                    doc.styles[style_name].font.name="仿宋_GB2312"; doc.styles[style_name].font.size=Pt(10.5)
+            cls._configure_heading_styles(doc)
+            cls._format_existing_headings(doc)
+            cls._remove_template_placeholder(doc)
+            chapter_no=cls._chapter_number(doc)
         for style_name in ("Normal","Body Text"):
             if style_name in doc.styles:
                 doc.styles[style_name].font.name="仿宋_GB2312"; doc.styles[style_name].font.size=Pt(10.5)
-        cls._configure_heading_styles(doc)
-        cls._format_existing_headings(doc)
-        cls._remove_template_placeholder(doc)
-        chapter_no=cls._chapter_number(doc)
         caption_counts={"figure":0,"table":0}
 
         def _caption(kind,title):
@@ -3603,7 +3636,7 @@ def run_guangdong_project(config, log=lambda _x: None):
     if not any(scanned[k] for k in ("marking","height","bolt")): raise ValueError("未识别到任何有效数据")
     manual,manual_issues=ManualAutoComparator.read_file(config.manual_xlsx); scanned["issues"].extend(manual_issues)
     bundles=GuangdongBatchRunner.build_bundles(scanned,route_index,manual,config.thresholds)
-    template=resource_template_path("广东项目第五章模板.docx")
+    template=resource_template_path("广东项目第五章模板.md")
     return GuangdongBatchRunner.run_bundles(bundles,config.output_dir,template,config.thresholds,log)
 
 

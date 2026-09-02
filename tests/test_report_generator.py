@@ -168,7 +168,8 @@ class DesktopBridgeTests(unittest.TestCase):
             "notes": [],
             "issues": [],
         }
-        expected_template = self.root / "resource-template.docx"
+        expected_template = self.root / "resource-template.md"
+        expected_template.write_text("# 模板", encoding="utf-8")
         route_index = type("RouteIndex", (), {"mapping": {}})()
         with (
             patch.object(engine.RouteCategoryIndex, "from_file", return_value=route_index),
@@ -180,7 +181,7 @@ class DesktopBridgeTests(unittest.TestCase):
         ):
             self.bridge._run_guangdong(values)
 
-        resource_path.assert_called_once_with("广东项目第五章模板.docx")
+        resource_path.assert_called_once_with("广东项目第五章模板.md")
         self.assertEqual(run_bundles.call_args.args[2], expected_template)
 
 
@@ -411,6 +412,53 @@ class MinimalDocxTests(unittest.TestCase):
             self.assertGreater(config.out_docx.stat().st_size, 12000)
             self.assertTrue(any("程序化" in message for message in messages))
 
+    def test_generates_report_from_markdown_skeleton(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skeleton = root / "重庆项目报告模板.md"
+            skeleton.write_text(
+                "# 2026年普通公路国省道交通安全设施自动化检测报告\n\n"
+                "## 1.1 项目概况\n\n"
+                "本报告依据委托单位提供的数据生成。\n\n"
+                "## 3.1 G210线整体情况\n\n"
+                "### 3.2 G210线K2264+000~K2265+000段（样例）\n\n"
+                "## 5 结论与建议\n\n"
+                "## 6 建议\n\n"
+                "标志牌安装情况检查合格。\n",
+                encoding="utf-8",
+            )
+            config = engine.Config(
+                project_dir=root,
+                summary_xlsx=root / "summary.xlsx",
+                detail_dir=root,
+                template_docx=skeleton,
+                output_dir=root / "output",
+                disease_dir=None,
+            )
+            segments = build_demo_segments()
+            records = build_demo_height_records()
+            bolt_records = build_demo_bolt_records()
+            height_stats = build_demo_stats(segments, records)
+            bolt_stats = engine.make_bolt_stats(segments, bolt_records)
+            result = minimal_docx.run(
+                config,
+                segments,
+                height_stats,
+                records,
+                bolt_stats,
+                bolt_records,
+                None,
+                skeleton_md=skeleton,
+            )
+            self.assertTrue(result.is_file())
+            document = Document(result)
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            self.assertIn("自动化检测报告", text)
+            self.assertIn("本报告依据委托单位提供的数据生成。", text)
+            self.assertIn("波形梁护栏横梁中心高度检测结果", text)
+            self.assertIn("结论与建议", text)
+            self.assertNotIn("（样例）", text)
+
 
 class GuangdongBusinessRegressionTests(unittest.TestCase):
     def test_scanner_preserves_bridge_guardrail_note(self) -> None:
@@ -536,6 +584,48 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
 
         self.assertEqual(headings, ["a. K1+000～K2+000段"])
         self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", "\n".join(height_text))
+
+    def test_writer_accepts_markdown_template_with_city_placeholder(self) -> None:
+        bundle = {
+            "marking": [],
+            "height": [{
+                "category": "高速公路",
+                "route": "G1",
+                "direction": "上行",
+                "segment": "K1+000～K2+000",
+                "guardrail_type": "二波",
+                "height": 600,
+            }],
+            "bolt": [],
+            "notes": [],
+            "comparison_detail": [],
+            "weak_segments": [],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            template.write_text(
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "本章为{{地市}}交通安全设施技术状况检测评价内容。\n\n"
+                "## （一）高速公路交安设施技术状况\n\n"
+                "### 1.沿线设施技术状况TCI\n",
+                encoding="utf-8",
+            )
+            output = engine.GuangdongChapterWriter.write(
+                "佛山市",
+                bundle,
+                root / "output",
+                template,
+                {"marking": 7, "height": 5, "bolt": 5},
+            )
+            document = Document(output)
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+        self.assertIn("本章为佛山市交通安全设施技术状况检测评价内容。", text)
+        self.assertIn("五、交通安全设施技术状况检测评价情况", text)
+        self.assertIn("（2）护栏中心高度", text)
+        self.assertIn("其中二波护栏", text)
+        self.assertNotIn("{{地市}}", text)
 
     def test_comparison_table_emits_expected_two_level_bolt_header_xml(self) -> None:
         document = Document()

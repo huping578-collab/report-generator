@@ -217,9 +217,16 @@ class DesktopBridge:
         return result
 
     def _template_paths(self) -> dict[str, Path]:
+        def first(*names: str) -> Path:
+            for name in names:
+                path = engine.resource_template_path(name)
+                if path.is_file():
+                    return path
+            return engine.resource_template_path(names[0])
+
         return {
-            "重庆项目报告模板": engine.resource_template_path("重庆项目报告模板.docx"),
-            "广东项目第五章模板": engine.resource_template_path("广东项目第五章模板.docx"),
+            "重庆项目报告模板": first("重庆项目报告模板.md", "重庆项目报告模板.docx"),
+            "广东项目第五章模板": first("广东项目第五章模板.md", "广东项目第五章模板.docx"),
         }
 
     def _on_engine_log(self, message: Any) -> None:
