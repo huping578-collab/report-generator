@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+set PYTHONIOENCODING=utf-8
 cd /d "%~dp0"
 
 set "PY=.venv\Scripts\python.exe"
