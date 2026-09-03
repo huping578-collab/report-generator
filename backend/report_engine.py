@@ -169,7 +169,12 @@ def format_station_one_decimal(meters):
 
 def read_segments(summary_xlsx):
     wb = openpyxl.load_workbook(summary_xlsx, read_only=True, data_only=True)
-    ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb.worksheets[0]
+    if "各区县项目概况" in wb.sheetnames:
+        ws = wb["各区县项目概况"]
+    elif "Sheet1" in wb.sheetnames:
+        ws = wb["Sheet1"]
+    else:
+        ws = wb.worksheets[0]
     # 读取 header 行（第2行）映射列名到索引，兼容旧版无区县时默认 county="" route="G210"
     header = None
     header_row_idx = 2
@@ -205,6 +210,8 @@ def read_segments(summary_xlsx):
                 break
 
         result = []
+        last_county = ""
+        last_total = None
         for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
             if row is None or all(v is None for v in row):
                 continue
@@ -229,7 +236,12 @@ def read_segments(summary_xlsx):
                     total = float(row[total_idx])
                 except (TypeError, ValueError):
                     total = mileage
-            county = str(row[county_idx] or "").strip() if county_idx is not None and county_idx < len(row) else ""
+            raw_county = str(row[county_idx] or "").strip() if county_idx is not None and county_idx < len(row) else ""
+            if raw_county:
+                county = raw_county
+                last_county = county
+            else:
+                county = last_county
             route = str(row[route_idx] or "").strip() if route_idx is not None and route_idx < len(row) else "G210"
             if not route:
                 route = "G210"
