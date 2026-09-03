@@ -128,6 +128,7 @@ class Config:
     template_docx: Path
     output_dir: Path
     disease_dir: Path | None = None
+    tci_path: Path | None = None
 
     @property
     def out_xlsx(self):
@@ -195,7 +196,7 @@ def read_segments(summary_xlsx):
         grade_idx = _col(["公路等级"])
         manager_idx = _col(["管理单位", "管养单位"])
         start_idx = _col(["起点桩号", "起点"])
-        end_idx = _col(["止点桩号", "止点"])
+        end_idx = _col(["止点桩号", "终点桩号", "止点", "终点"])
         total_idx = _col(["总里程"])
         mileage_idx = None
         for i, h in enumerate(header):
@@ -659,6 +660,204 @@ def make_stats(segments, records):
                 "pcts": percentages, "pass": percentages[2] if heights else 0,
             }
         stats.append({"segment": segment, "types": types})
+
+    return stats
+
+
+# --- TCI 沿线设施技术状况 (JTG 5210-2018 3 项: 防护轻10/重30 w0.25, 标志20 w0.25, 标线0.1/m 每10m1分不足10m计10m w0.20, /0.7) ---
+TCI_WEIGHTS = (0.25, 0.25, 0.20)
+TCI_DIVISOR = 0.7
+TCI_DEDUCT_LIGHT = 10
+TCI_DEDUCT_HEAVY = 30
+TCI_DEDUCT_SIGN = 20
+TCI_DEDUCT_MARKING_PER_M = 0.1
+
+def tci_gd(light: int, heavy: int, sign: int, marking_m: float):
+    gd1 = min(100, light * TCI_DEDUCT_LIGHT + heavy * TCI_DEDUCT_HEAVY)
+    gd2 = min(100, sign * TCI_DEDUCT_SIGN)
+    gd3 = 0
+    if marking_m:
+        gd3 = min(100, __import__('math').ceil(float(marking_m) / 10.0) * 1)
+    return gd1, gd2, gd3
+
+def compute_tci(light: int, heavy: int, sign: int, marking_m: float) -> float:
+    gd1, gd2, gd3 = tci_gd(light, heavy, sign, marking_m)
+    return round((TCI_WEIGHTS[0] * (100 - gd1) + TCI_WEIGHTS[1] * (100 - gd2) + TCI_WEIGHTS[2] * (100 - gd3)) / TCI_DIVISOR, 4)
+
+def tci_grade(tci: float) -> str:
+    if tci >= 90:
+        return "优"
+    if tci >= 80:
+        return "良"
+    if tci >= 70:
+        return "中"
+    if tci >= 60:
+        return "次"
+    return "差"
+
+def _tci_station_value(row: dict):
+    for key in ("电子修正桩号", "标注修正桩号", "原始桩号"):
+        v = row.get(key)
+        if v not in (None, ""):
+            m = station_to_m(v)
+            if m is not None:
+                return m
+    for key in ("电子修正桩号", "标注修正桩号"):
+        v = row.get(key)
+        try:
+            if v is not None and str(v).strip():
+                return float(str(v).strip()) * 1000
+        except:
+            pass
+    return None
+
+def collect_tci_records(segments, tci_path, log=lambda _: None):
+    records = []
+    if tci_path is None:
+        return records
+    pth = Path(tci_path)
+    files = []
+    if pth.is_file():
+        files = [pth]
+    elif pth.is_dir():
+        files = sorted(pth.glob("*.xlsx"))
+        files = [f for f in files if not f.name.startswith("~$")]
+    else:
+        log(f"TCI 路径不存在：{pth}")
+        return records
+    for fpath in files:
+        try:
+            wb = openpyxl.load_workbook(fpath, data_only=True, read_only=True)
+        except Exception as e:
+            log(f"TCI 读取失败 {fpath.name}: {e}")
+            continue
+        sheet_name = "病害明细表" if "病害明细表" in wb.sheetnames else wb.sheetnames[0]
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            continue
+        header_row_idx = None
+        col_map = {}
+        for i, row in enumerate(rows[:6], 1):
+            vals = [str(v).strip() if v is not None else "" for v in row]
+            if "区域" in vals and "路线编号" in vals:
+                header_row_idx = i
+                if i < len(rows):
+                    sub = [str(v).strip() if v is not None else "" for v in rows[i]]
+                    for idx, (h, s) in enumerate(zip(vals, sub)):
+                        if s == "轻":
+                            col_map[idx] = "light"
+                        elif s == "重":
+                            col_map[idx] = "heavy"
+                    for idx, h in enumerate(vals):
+                        if "标志缺损" in h:
+                            col_map[idx] = "sign"
+                        elif "标线缺损" in h:
+                            col_map[idx] = "marking"
+                        elif "电子修正桩号" in h:
+                            col_map[idx] = "electron"
+                        elif "标注修正桩号" in h:
+                            col_map[idx] = "annotation"
+                        elif "原始桩号" in h:
+                            col_map[idx] = "original"
+                break
+        if header_row_idx is None:
+            for i, row in enumerate(rows[:5], 1):
+                vals = [str(v).strip() if v is not None else "" for v in row]
+                if any("防护设施缺损" in v for v in vals):
+                    header_row_idx = i
+                    for idx, h in enumerate(vals):
+                        if "防护" in h and "轻" in h:
+                            col_map[idx] = "light"
+                        elif "防护" in h and "重" in h:
+                            col_map[idx] = "heavy"
+                        elif "标志缺损" in h:
+                            col_map[idx] = "sign"
+                        elif "标线缺损" in h:
+                            col_map[idx] = "marking"
+                        elif "电子修正桩号" in h:
+                            col_map[idx] = "electron"
+                        elif "标注修正桩号" in h:
+                            col_map[idx] = "annotation"
+                        elif "原始桩号" in h:
+                            col_map[idx] = "original"
+                    break
+        if header_row_idx is None:
+            header_row_idx = 1
+        start = header_row_idx + 1
+        if header_row_idx < len(rows) and "轻" in "".join(str(x) for x in rows[header_row_idx] if x is not None):
+            start = header_row_idx + 2
+        for row in rows[start-1:]:
+            vals = list(row)
+            if not any(v not in (None, "") for v in vals):
+                continue
+            station = None
+            for k in ("electron", "annotation", "original"):
+                idxs = [i for i,c in col_map.items() if c==k]
+                for idx in idxs:
+                    if idx < len(vals) and vals[idx] not in (None, ""):
+                        station = station_to_m(vals[idx])
+                        if station is None:
+                            try:
+                                station = float(str(vals[idx]).strip())*1000
+                            except:
+                                station=None
+                        if station is not None:
+                            break
+                if station is not None:
+                    break
+            if station is None:
+                continue
+            def num_at(typ):
+                idxs = [i for i,c in col_map.items() if c==typ]
+                for idx in idxs:
+                    if idx < len(vals) and vals[idx] not in (None, ""):
+                        try:
+                            return float(str(vals[idx]).strip())
+                        except:
+                            return 0
+                return 0
+            if not any(c in col_map.values() for c in ("light","heavy","sign","marking")):
+                try:
+                    light = float(str(vals[8]).strip()) if len(vals)>8 and vals[8] not in (None,"") else 0
+                except:
+                    light=0
+                try:
+                    heavy = float(str(vals[9]).strip()) if len(vals)>9 and vals[9] not in (None,"") else 0
+                except:
+                    heavy=0
+                try:
+                    sign = float(str(vals[10]).strip()) if len(vals)>10 and vals[10] not in (None,"") else 0
+                except:
+                    sign=0
+                try:
+                    marking = float(str(vals[11]).strip()) if len(vals)>11 and vals[11] not in (None,"") else 0
+                except:
+                    marking=0
+            else:
+                light = num_at("light")
+                heavy = num_at("heavy")
+                sign = num_at("sign")
+                marking = num_at("marking")
+            seg_idx = next((i for i,s in enumerate(segments) if s["start"] <= station <= s["end"]), None)
+            if seg_idx is None:
+                continue
+            records.append({"segment": seg_idx, "station": station, "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
+        log(f"TCI 病害 {fpath.name}: 落段 {len([r for r in records if True])} 条")
+    return records
+
+def make_tci_stats(segments, tci_records):
+    stats = []
+    for idx, seg in enumerate(segments):
+        rows = [r for r in tci_records if r["segment"]==idx]
+        light = sum(r["light"] for r in rows)
+        heavy = sum(r["heavy"] for r in rows)
+        sign = sum(r["sign"] for r in rows)
+        marking = sum(r["marking"] for r in rows)
+        gd1, gd2, gd3 = tci_gd(light, heavy, sign, marking)
+        tci = compute_tci(light, heavy, sign, marking)
+        grade = tci_grade(tci)
+        stats.append({"segment": seg, "light": light, "heavy": heavy, "sign": sign, "marking": marking, "gd1": gd1, "gd2": gd2, "gd3": gd3, "tci": tci, "grade": grade, "count": len(rows)})
     return stats
 
 
@@ -729,10 +928,12 @@ def make_excel(
     config, segments,
     height_stats=None, height_records=None, height_duplicates=0, excluded=None,
     bolt_stats=None, bolt_records=None, bolt_duplicates=0,
+    tci_stats=None, tci_records=None,
     log=lambda _: None,
 ):
     height_records = height_records or []
     bolt_records = bolt_records or []
+    tci_records = tci_records or []
     excluded = excluded or Counter()
     has_county = bool(segments and any(s.get("county") for s in segments))
     wb = Workbook()
@@ -867,6 +1068,40 @@ def make_excel(
         else:
             style_sheet(ws, [8, 62, 10, 16, 14, 18, 22, 18, 22, 16, 16])
 
+    if tci_stats is not None:
+        ws = wb.create_sheet("沿线设施统计")
+        if has_county:
+            ws.append(["序号", "区县", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "防护-轻（处）", "防护-重（处）", "标志缺损（处）", "标线缺损（m）", "TCI", "等级"])
+        else:
+            ws.append(["序号", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "防护-轻（处）", "防护-重（处）", "标志缺损（处）", "标线缺损（m）", "TCI", "等级"])
+        for idx, item in enumerate(tci_stats, 1):
+            seg = item["segment"]
+            if has_county:
+                ws.append([idx, seg.get("county",""), seg.get("route","G210"), format_station(seg["start"]), format_station(seg["end"]), f"{seg['mileage']:.3f}", item["light"], item["heavy"], item["sign"], item["marking"], item["tci"], item["grade"]])
+            else:
+                ws.append([idx, seg.get("route","G210"), format_station(seg["start"]), format_station(seg["end"]), f"{seg['mileage']:.3f}", item["light"], item["heavy"], item["sign"], item["marking"], item["tci"], item["grade"]])
+        if has_county:
+            style_sheet(ws, [8, 12, 11, 16, 16, 16, 14, 14, 14, 14, 10, 8])
+        else:
+            style_sheet(ws, [8, 11, 16, 16, 16, 14, 14, 14, 14, 10, 8])
+
+        ws = wb.create_sheet("沿线设施明细")
+        if has_county:
+            ws.append(["序号", "区县", "路线编号", "桩号", "轻", "重", "标志", "标线(m)", "所属分段起点", "所属分段终点"])
+        else:
+            ws.append(["序号", "路线编号", "桩号", "轻", "重", "标志", "标线(m)", "所属分段起点", "所属分段终点"])
+        ordered = sorted(tci_records, key=lambda x: (x["segment"], x["station"]))
+        for seq, rec in enumerate(ordered, 1):
+            seg = segments[rec["segment"]]
+            if has_county:
+                ws.append([seq, seg.get("county",""), seg.get("route","G210"), format_station(rec["station"]), rec["light"], rec["heavy"], rec["sign"], rec["marking"], format_station(seg["start"]), format_station(seg["end"])])
+            else:
+                ws.append([seq, seg.get("route","G210"), format_station(rec["station"]), rec["light"], rec["heavy"], rec["sign"], rec["marking"], format_station(seg["start"]), format_station(seg["end"])])
+        if has_county:
+            style_sheet(ws, [8, 12, 11, 16, 8, 8, 8, 10, 16, 16])
+        else:
+            style_sheet(ws, [8, 11, 16, 8, 8, 8, 10, 16, 16])
+
     ws = wb.create_sheet("统计说明")
     notes = [
         ("项目", "说明"),
@@ -879,6 +1114,11 @@ def make_excel(
             ("中心高度备注过滤", f"仅保留异常标记为空或无备注的数据；排除{sum(excluded.values())}条：{dict(excluded)}。"),
             ("中心高度去重", f"完全一致的重叠记录去重，剔除{height_duplicates}条。"),
             ("区间明细标准值", "标准值列为580mm、620mm、677mm和717mm；二波折线图使用580mm、620mm，三波折线图使用677mm、717mm。"),
+        ])
+    if tci_stats is not None:
+        notes.extend([
+            ("TCI 统计", "TCI=Σwᵢ(100-GDᵢ)/0.7，w=[0.25,0.25,0.20]，防护轻10/重30、标志20/处、标线每10m1分不足10m计10m，GD封顶100，等级 优≥90 良≥80 中≥70 次≥60 差<60。"),
+            ("TCI 数据来源", f"TCI 病害明细共{len(tci_records)}条，分段{len(tci_stats)}。"),
         ])
     if bolt_stats is not None:
         notes.extend([
@@ -1260,6 +1500,7 @@ def make_docx(
     config, segments,
     height_stats=None, height_records=None,
     bolt_stats=None, bolt_records=None,
+    tci_stats=None, tci_records=None,
     disease_image_index=None,
     log=lambda _: None,
     require_template=True,
@@ -1274,6 +1515,7 @@ def make_docx(
         config, segments,
         height_stats=height_stats, height_records=height_records,
         bolt_stats=bolt_stats, bolt_records=bolt_records,
+        tci_stats=tci_stats, tci_records=tci_records,
         disease_image_index=disease_image_index, log=log,
         skeleton_md=config.template_docx,
     )
@@ -1412,15 +1654,23 @@ def add_charts(workbook_path, log=lambda _: None):
 
 def generate_statistics_and_report(
     config, log=lambda _: None, generate_charts_first=False,
-    process_height=True, process_bolts=False, process_alongline=False,
+    process_height=True, process_bolts=False, process_alongline=False, process_tci=False,
     require_template=True,
 ):
     segments = read_segments(config.summary_xlsx)
     height_records = []; height_stats = None; height_duplicates = 0; excluded = Counter()
     bolt_records = []; bolt_stats = None; bolt_duplicates = 0
     disease_image_index = None
-    if process_alongline:
-        log("沿线设施选项已勾选；该细分项暂未开发，本次不会生成沿线设施统计或报告内容。")
+    tci_records = []; tci_stats = None
+    if process_alongline or process_tci:
+        # TCI 沿线设施：读取 tci_path 指定的病害明细（支持单文件或目录）
+        tci_src = getattr(config, "tci_path", None) or getattr(config, "tci_xlsx", None)
+        if tci_src is None or not Path(tci_src).exists():
+            log(f"TCI 未提供有效路径（{tci_src}），跳过沿线设施统计。")
+        else:
+            tci_records = collect_tci_records(segments, tci_src, log)
+            tci_stats = make_tci_stats(segments, tci_records)
+            log(f"TCI 有效记录{len(tci_records)}条；分段{len(tci_stats)}段。")
     if process_height:
         height_records, height_duplicates, excluded = collect_records(segments, config.detail_dir, log)
         height_stats = make_stats(segments, height_records)
@@ -1435,6 +1685,7 @@ def generate_statistics_and_report(
         height_stats=height_stats, height_records=height_records,
         height_duplicates=height_duplicates, excluded=excluded,
         bolt_stats=bolt_stats, bolt_records=bolt_records, bolt_duplicates=bolt_duplicates,
+        tci_stats=tci_stats, tci_records=tci_records,
         log=log,
     )
     if generate_charts_first and process_height:
@@ -1443,14 +1694,63 @@ def generate_statistics_and_report(
         config, segments,
         height_stats=height_stats, height_records=height_records,
         bolt_stats=bolt_stats, bolt_records=bolt_records,
+        tci_stats=tci_stats, tci_records=tci_records,
         disease_image_index=disease_image_index, log=log,
         require_template=require_template,
     )
+    # 按区县分报告：若含区县则为每个区县单独生成一份（文件名前缀区县）
+    has_county = bool(segments and any(s.get("county") for s in segments))
+    if has_county and segments:
+        from collections import defaultdict
+        by_county = defaultdict(list)
+        for idx, seg in enumerate(segments):
+            by_county[seg.get("county","")].append(idx)
+        for county, idxs in by_county.items():
+            if not county:
+                continue
+            sub_segments = [segments[i] for i in idxs]
+            # 重映射记录的 segment 索引到子集 0..n-1
+            def _remap(records):
+                out=[]
+                mp={orig:new for new,orig in enumerate(idxs)}
+                for r in records:
+                    if r["segment"] in mp:
+                        nr=dict(r)
+                        nr["segment"]=mp[r["segment"]]
+                        out.append(nr)
+                return out
+            sub_height_stats = [height_stats[i] for i in idxs] if height_stats else None
+            # 调整 stats 内 segment 引用到 sub_segments
+            if sub_height_stats:
+                for ns, st in zip(sub_segments, sub_height_stats):
+                    st["segment"]=ns
+            sub_bolt_stats = [bolt_stats[i] for i in idxs] if bolt_stats else None
+            if sub_bolt_stats:
+                for ns, st in zip(sub_segments, sub_bolt_stats):
+                    st["segment"]=ns
+            sub_tci_stats = [tci_stats[i] for i in idxs] if tci_stats else None
+            if sub_tci_stats:
+                for ns, st in zip(sub_segments, sub_tci_stats):
+                    st["segment"]=ns
+            sub_height_records = _remap(height_records)
+            sub_bolt_records = _remap(bolt_records)
+            sub_tci_records = _remap(tci_records)
+            sub_out = config.output_dir / county
+            sub_out.mkdir(parents=True, exist_ok=True)
+            sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None))
+            # 复用 make_excel/make_docx 生成子报告
+            try:
+                make_excel(sub_cfg, sub_segments, height_stats=sub_height_stats, height_records=sub_height_records, height_duplicates=height_duplicates, excluded=excluded, bolt_stats=sub_bolt_stats, bolt_records=sub_bolt_records, bolt_duplicates=bolt_duplicates, tci_stats=sub_tci_stats, tci_records=sub_tci_records, log=log)
+                make_docx(sub_cfg, sub_segments, height_stats=sub_height_stats, height_records=sub_height_records, bolt_stats=sub_bolt_stats, bolt_records=sub_bolt_records, tci_stats=sub_tci_stats, tci_records=sub_tci_records, disease_image_index=disease_image_index, log=log, require_template=False)
+                log(f"区县分报告已生成：{county} -> {sub_out}")
+            except Exception as e:
+                log(f"区县 {county} 分报告生成失败：{e}")
+
     if process_height:
         log(f"中心高度有效记录{len(height_records)}条；备注排除{sum(excluded.values())}条；重复排除{height_duplicates}条。")
     if process_bolts:
         log(f"螺栓有效记录{len(bolt_records)}条；重复排除{bolt_duplicates}条。")
-    return {"height": height_stats, "bolts": bolt_stats}
+    return {"height": height_stats, "bolts": bolt_stats, "tci": tci_stats}
 
 
 def discover_paths(folder):
@@ -3500,7 +3800,7 @@ class ReportGeneratorApp(tk.Tk):
     def __init__(self):
         super().__init__(); self.title(PROGRAM_NAME); self.geometry("980x860"); self.minsize(880,720)
         self.project_template=tk.StringVar(value=PROJECT_TEMPLATES[0]); self.queue=Queue(); self.running=False
-        keys=("cq_project","cq_summary","cq_detail","cq_disease","cq_output","gd_project","gd_marking_dir","gd_guardrail_dir","gd_manual","gd_route","gd_output","gd_marking","gd_height","gd_bolt")
+        keys=("cq_project","cq_summary","cq_detail","cq_disease","cq_tci","cq_output","gd_project","gd_marking_dir","gd_guardrail_dir","gd_manual","gd_route","gd_output","gd_marking","gd_height","gd_bolt")
         self.vars={k:tk.StringVar() for k in keys}
         self.vars["gd_marking"].set("7"); self.vars["gd_height"].set("5"); self.vars["gd_bolt"].set("5")
         self._build(); self.after(100,self._poll)
@@ -3538,7 +3838,7 @@ class ReportGeneratorApp(tk.Tk):
         for name in PROJECT_TEMPLATES: ttk.Radiobutton(select,text=name,value=name,variable=self.project_template,command=self._switch).pack(side="left",padx=12)
         self.forms=ttk.Frame(root); self.forms.pack(fill="x")
         self.cq=ttk.LabelFrame(self.forms,text="重庆项目输入",padding=10); self.gd=ttk.LabelFrame(self.forms,text="广东项目输入",padding=10)
-        for i,(label,key,file) in enumerate((("项目资料文件夹","cq_project",False),("分段汇总表","cq_summary",True),("检测明细文件夹","cq_detail",False),("病害清单文件夹","cq_disease",False),("输出文件夹","cq_output",False))): self._row(self.cq,i,label,key,file)
+        for i,(label,key,file) in enumerate((("项目资料文件夹","cq_project",False),("分段汇总表","cq_summary",True),("检测明细文件夹","cq_detail",False),("病害清单文件夹","cq_disease",False),("TCI病害清单","cq_tci",True),("输出文件夹","cq_output",False))): self._row(self.cq,i,label,key,file)
         for i,(label,key,file) in enumerate((("项目资料文件夹","gd_project",False),("标线数据文件夹","gd_marking_dir",False),("护栏数据文件夹","gd_guardrail_dir",False),("人工自动化对比表","gd_manual",True),("路线分类表","gd_route",True),("输出文件夹","gd_output",False),("标线一致性阈值（%）","gd_marking",False),("护栏高度一致性阈值（mm）","gd_height",False),("螺栓缺失一致性阈值（%）","gd_bolt",False))): self._row(self.gd,i,label,key,file)
         self.cq.columnconfigure(1,weight=1); self.gd.columnconfigure(1,weight=1); self._switch()
         actions=ttk.Frame(root); actions.pack(fill="x",pady=10); self.run_button=ttk.Button(actions,text="开始运行",command=self.start); self.run_button.pack(side="left"); ttk.Button(actions,text="打开输出文件夹",command=self.open_output).pack(side="left",padx=8)
@@ -3555,8 +3855,10 @@ class ReportGeneratorApp(tk.Tk):
                 cfg=GuangdongConfig(Path(self.vars['gd_project'].get()),Path(self.vars['gd_manual'].get()),Path(self.vars['gd_route'].get()),Path(self.vars['gd_output'].get()),self.vars['gd_marking'].get(),self.vars['gd_height'].get(),self.vars['gd_bolt'].get(),marking_dir=Path(self.vars['gd_marking_dir'].get()) if self.vars['gd_marking_dir'].get() else None,guardrail_dir=Path(self.vars['gd_guardrail_dir'].get()) if self.vars['gd_guardrail_dir'].get() else None)
                 worker=lambda:run_guangdong_project(cfg,lambda x:self.queue.put(("log",x)))
             else:
-                base=Path(self.vars['cq_project'].get() or "."); cfg=Config(base,Path(self.vars['cq_summary'].get()),Path(self.vars['cq_detail'].get()),BUILTIN_REPORT_TEMPLATES[next(iter(BUILTIN_REPORT_TEMPLATES))],Path(self.vars['cq_output'].get() or base),Path(self.vars['cq_disease'].get()) if self.vars['cq_disease'].get() else None)
-                worker=lambda:generate_statistics_and_report(cfg,lambda x:self.queue.put(("log",x)),process_height=True,process_bolts=True)
+                base=Path(self.vars['cq_project'].get() or "."); cfg=Config(base,Path(self.vars['cq_summary'].get()),Path(self.vars['cq_detail'].get()),BUILTIN_REPORT_TEMPLATES[next(iter(BUILTIN_REPORT_TEMPLATES))],Path(self.vars['cq_output'].get() or base),Path(self.vars['cq_disease'].get()) if self.vars['cq_disease'].get() else None, Path(self.vars['cq_tci'].get()) if self.vars.get('cq_tci') and self.vars['cq_tci'].get() else None)
+                # TCI 触发：若填写了 TCI 路径则处理沿线设施
+                tci_on = bool(self.vars.get('cq_tci') and self.vars['cq_tci'].get() and Path(self.vars['cq_tci'].get()).exists())
+                worker=lambda tci_on=tci_on:generate_statistics_and_report(cfg,lambda x:self.queue.put(("log",x)),process_height=True,process_bolts=True, process_alongline=tci_on, process_tci=tci_on)
         except Exception as exc:messagebox.showerror("参数错误",str(exc));return
         self.running=True;self.run_button.configure(state="disabled");self.progress.start(10)
         def run():

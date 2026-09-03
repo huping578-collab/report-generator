@@ -350,6 +350,48 @@ def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, 
                 _caption(doc, "图", f"4.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失自动识别示例")
 
 
+def _section_tci(doc, segments, tci_stats):
+    _heading(doc, "沿线设施技术状况评价", 1)
+    if tci_stats is None:
+        _body(doc, "未提供 TCI 病害清单，沿线设施技术状况未评定。")
+        return
+    from collections import defaultdict
+    has_county = bool(segments and any(s.get("county") for s in segments))
+    by_county = defaultdict(list)
+    for idx, seg in enumerate(segments):
+        st = tci_stats[idx] if idx < len(tci_stats) else None
+        by_county[seg.get("county", "")].append((idx, seg, st))
+    for county_idx, (county, items) in enumerate(by_county.items()):
+        _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
+        # 县内汇总：平均 TCI 或按总扣分重新计算？ 此处取算术平均并按等级分布
+        vals = [it[2]["tci"] for it in items if it[2] is not None]
+        if vals:
+            avg = sum(vals)/len(vals)
+            # 等级分布
+            grades = [it[2]["grade"] for it in items if it[2] is not None]
+            cnt = {g: grades.count(g) for g in ["优","良","中","次","差"]}
+            _body(doc, f"{county or 'G210线'}沿线设施技术状况共评定{len(vals)}段，平均 TCI{avg:.2f}，等级分布：优{cnt['优']}段、良{cnt['良']}段、中{cnt['中']}段、次{cnt['次']}段、差{cnt['差']}段。")
+        rows = []
+        for idx, seg, st in items:
+            if st is None:
+                continue
+            if has_county:
+                rows.append([seg.get("county",""), seg.get("route","G210"), engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]])
+            else:
+                rows.append([seg.get("route","G210"), engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]])
+        if rows:
+            _caption(doc, "表", f"2.{county_idx+1}.1", f"{county}沿线设施技术状况评价结果" if county else "沿线设施技术状况评价结果")
+            if has_county:
+                _table(doc, ["区县","路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], rows, True)
+            else:
+                _table(doc, ["路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], rows, True)
+        # 逐段明细文字
+        for idx, seg, st in items:
+            if st is None:
+                continue
+            _body(doc, f"{seg.get('route','G210')}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段：轻{st['light']}处、重{st['heavy']}处、标志{st['sign']}处、标线{st['marking']}m，TCI{st['tci']:.2f}（{st['grade']}）。")
+
+
 def _section_conclusion(doc, segments, height_stats, bolt_stats):
     _heading(doc, "结论与建议", 1)
     _heading(doc, "结论", 2)
@@ -392,14 +434,16 @@ def _section_conclusion(doc, segments, height_stats, bolt_stats):
     _body(doc, "建议管养单位优先对横梁中心高度合格率较低的分段开展现场复核，结合路缘石、路面加铺及护栏结构实际情况制定整治计划，并在养护后复测；加强护栏连接件养护巡查，对螺栓缺失位置及时补装同规格螺栓并复核紧固状态。")
 
 
-def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir, skeleton_md=None):
+def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=None):
     # 显式锚点优先，关键词回退。显式锚点语法（任一满足即注入）：
     #   <!-- inject:overview -->  <!-- inject:height -->  <!-- inject:bolt -->  <!-- inject:conclusion -->
     # 兼容旧模板的关键词匹配：项目概况/整体情况/螺栓/结论
     import re as _re
-    anchor_re = _re.compile(r"<!--\s*inject:\s*(overview|height|bolt|conclusion)\s*-->")
+    anchor_re = _re.compile(r"<!--\s*inject:\s*(overview|tci|height|bolt|conclusion)\s*-->")
     keyword_map = {
         "项目概况": "overview",
+        "沿线设施技术状况评价": "tci",
+        "沿线设施": "tci",
         "整体情况": "height",
         "螺栓": "bolt",
         "结论": "conclusion",
@@ -407,6 +451,8 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
     def _writer_for(key: str):
         if key == "overview":
             return lambda: _section_overview(doc, config, segments)
+        if key == "tci":
+            return (lambda: _section_tci(doc, segments, tci_stats)) if tci_stats is not None else (lambda: None)
         if key == "height":
             return (lambda: _section_height(doc, segments, height_stats, height_records, images, temp_dir)) if height_stats is not None else (lambda: None)
         if key == "bolt":
@@ -418,6 +464,7 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
     # pending 按显式 key 索引，便于锚点直接命中
     pending_by_key = {
         "overview": ("项目概况", True, _writer_for("overview")),
+        "tci": ("沿线设施技术状况评价", False, _writer_for("tci")),
         "height": ("整体情况", False, _writer_for("height")),
         "bolt": ("螺栓", False, _writer_for("bolt")),
         "conclusion": ("结论", False, _writer_for("conclusion")),
@@ -488,7 +535,7 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
         writer()
 
 
-def make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, temp_dir, log=lambda _x: None, skeleton_md=None):
+def make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, temp_dir, log=lambda _x: None, skeleton_md=None):
     """Build the full report document from computed statistics."""
     images = _distribution_images(segments, height_stats, height_records, temp_dir) if height_stats is not None else {}
     doc = Document()
@@ -511,7 +558,7 @@ def make_report(config, segments, height_stats, height_records, bolt_stats, bolt
     if skeleton_md is None:
         raise FileNotFoundError(f"Markdown 模板不存在：{skeleton_md}，仅支持 .md 模板。")
     blocks = markdown_skeleton.read_blocks(skeleton_md)
-    _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, images, temp_dir, skeleton_md=skeleton_md)
+    _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=skeleton_md)
     try:
         doc.save(config.out_docx)
     except PermissionError as exc:
@@ -520,10 +567,10 @@ def make_report(config, segments, height_stats, height_records, bolt_stats, bolt
 
 
 
-def run(config, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, log=lambda _x: None, skeleton_md=None):
+def run(config, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, log=lambda _x: None, skeleton_md=None, tci_stats=None, tci_records=None):
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="g210_report_builtin_") as temp_dir:
         config.output_dir.mkdir(parents=True, exist_ok=True)
         log("未检测到内置 Word 模板，切换到程序化报告生成模式。")
-        return make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, disease_image_index, temp_dir, log, skeleton_md=skeleton_md)
+        return make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, temp_dir, log, skeleton_md=skeleton_md)
