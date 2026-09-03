@@ -734,6 +734,7 @@ def make_excel(
     height_records = height_records or []
     bolt_records = bolt_records or []
     excluded = excluded or Counter()
+    has_county = bool(segments and any(s.get("county") for s in segments))
     wb = Workbook()
     wb.remove(wb.active)
     if height_stats is not None:
@@ -742,7 +743,10 @@ def make_excel(
             ("三波统计", "三波", ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"]),
         ):
             ws = wb.create_sheet(title)
-            ws.append(["序号", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数", *labels, "合格率"])
+            if has_county:
+                ws.append(["序号", "区县", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数", *labels, "合格率"])
+            else:
+                ws.append(["序号", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数", *labels, "合格率"])
             sequence = 0
             for segment_index, item in enumerate(height_stats):
                 data = item["types"][kind]
@@ -752,57 +756,116 @@ def make_excel(
                 segment = item["segment"]
                 bases = {r["basis"] for r in height_records if r["segment"] == segment_index and r["kind"] == kind}
                 basis = next(iter(bases)) if len(bases) == 1 else "原始桩号+电子修正桩号（按来源文件分别采用）"
-                ws.append([
-                    sequence, "G210", segment["grade"], segment["manager"],
-                    format_station(segment["start"]), format_station(segment["end"]),
-                    basis, data["count"], *[value / 100 for value in data["pcts"]], data["pass"] / 100,
-                ])
-            for row in ws.iter_rows(min_row=2, min_col=9, max_col=14):
-                for cell in row:
-                    cell.number_format = "0.00%"
-            style_sheet(ws, [7, 10, 14, 24, 14, 14, 42, 11, 13, 14, 14, 14, 13, 12])
+                if has_county:
+                    ws.append([
+                        sequence, segment.get("county", ""), segment.get("route", "G210"), segment["grade"], segment["manager"],
+                        format_station(segment["start"]), format_station(segment["end"]),
+                        basis, data["count"], *[value / 100 for value in data["pcts"]], data["pass"] / 100,
+                    ])
+                else:
+                    ws.append([
+                        sequence, "G210", segment["grade"], segment["manager"],
+                        format_station(segment["start"]), format_station(segment["end"]),
+                        basis, data["count"], *[value / 100 for value in data["pcts"]], data["pass"] / 100,
+                    ])
+            if has_county:
+                for row in ws.iter_rows(min_row=2, min_col=10, max_col=15):
+                    for cell in row:
+                        cell.number_format = "0.00%"
+                style_sheet(ws, [7, 12, 10, 14, 24, 14, 14, 42, 11, 13, 14, 14, 14, 13, 12])
+            else:
+                for row in ws.iter_rows(min_row=2, min_col=9, max_col=14):
+                    for cell in row:
+                        cell.number_format = "0.00%"
+                style_sheet(ws, [7, 10, 14, 24, 14, 14, 42, 11, 13, 14, 14, 14, 13, 12])
         ws = wb.create_sheet("检测明细")
-        ws.append(["序号", "来源文件", "方向", "统计桩号", "桩号口径", "护栏类型", "梁板中心高度(mm)", "所属分段起点", "所属分段终点"])
+        if has_county:
+            ws.append(["序号", "来源文件", "方向", "统计桩号", "桩号口径", "护栏类型", "梁板中心高度(mm)", "区县", "路线编号", "所属分段起点", "所属分段终点"])
+        else:
+            ws.append(["序号", "来源文件", "方向", "统计桩号", "桩号口径", "护栏类型", "梁板中心高度(mm)", "所属分段起点", "所属分段终点"])
         ordered = sorted(height_records, key=lambda item: (item["segment"], item["direction"], item["station"]))
         for sequence, record in enumerate(ordered, 1):
             segment = segments[record["segment"]]
-            ws.append([
-                sequence, record["file"], record["direction"], format_station(record["station"]),
-                record["basis"], record["kind"], record["height"],
-                format_station(segment["start"]), format_station(segment["end"]),
-            ])
-        style_sheet(ws, [8, 62, 10, 16, 14, 12, 20, 16, 16])
+            if has_county:
+                ws.append([
+                    sequence, record["file"], record["direction"], format_station(record["station"]),
+                    record["basis"], record["kind"], record["height"],
+                    segment.get("county", ""), segment.get("route", "G210"),
+                    format_station(segment["start"]), format_station(segment["end"]),
+                ])
+            else:
+                ws.append([
+                    sequence, record["file"], record["direction"], format_station(record["station"]),
+                    record["basis"], record["kind"], record["height"],
+                    format_station(segment["start"]), format_station(segment["end"]),
+                ])
+        if has_county:
+            style_sheet(ws, [8, 62, 10, 16, 14, 12, 20, 12, 10, 16, 16])
+        else:
+            style_sheet(ws, [8, 62, 10, 16, 14, 12, 20, 16, 16])
 
     if bolt_stats is not None:
         ws = wb.create_sheet("螺栓缺失统计")
-        ws.append(["序号", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"])
+        if has_county:
+            ws.append(["序号", "区县", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"])
+        else:
+            ws.append(["序号", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"])
         sequence = 0
         for item in bolt_stats:
             sequence += 1
             segment = item["segment"]
-            ws.append([
-                sequence, "G210", format_station(segment["start"]), format_station(segment["end"]),
-                segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100,
-            ])
-        for cell in ws["I"][1:]:
-            cell.number_format = "0.00%"
-        style_sheet(ws, [8, 11, 16, 16, 16, 18, 18, 18, 14])
+            if has_county:
+                ws.append([
+                    sequence, segment.get("county", ""), segment.get("route", "G210"), format_station(segment["start"]), format_station(segment["end"]),
+                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100,
+                ])
+            else:
+                ws.append([
+                    sequence, "G210", format_station(segment["start"]), format_station(segment["end"]),
+                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100,
+                ])
+        if has_county:
+            for cell in ws["J"][1:]:
+                cell.number_format = "0.00%"
+            style_sheet(ws, [8, 12, 11, 16, 16, 16, 18, 18, 18, 14])
+        else:
+            for cell in ws["I"][1:]:
+                cell.number_format = "0.00%"
+            style_sheet(ws, [8, 11, 16, 16, 16, 18, 18, 18, 14])
 
         ws = wb.create_sheet("螺栓缺失明细")
-        ws.append([
-            "序号", "来源文件", "方向", "统计桩号", "桩号口径",
-            "拼接螺栓（颗）", "拼接螺栓缺失（颗）", "连接螺栓（颗）", "连接螺栓缺失（颗）",
-            "所属分段起点", "所属分段终点",
-        ])
+        if has_county:
+            ws.append([
+                "序号", "来源文件", "方向", "统计桩号", "桩号口径",
+                "拼接螺栓（颗）", "拼接螺栓缺失（颗）", "连接螺栓（颗）", "连接螺栓缺失（颗）",
+                "区县", "路线编号", "所属分段起点", "所属分段终点",
+            ])
+        else:
+            ws.append([
+                "序号", "来源文件", "方向", "统计桩号", "桩号口径",
+                "拼接螺栓（颗）", "拼接螺栓缺失（颗）", "连接螺栓（颗）", "连接螺栓缺失（颗）",
+                "所属分段起点", "所属分段终点",
+            ])
         ordered = sorted(bolt_records, key=lambda item: (item["segment"], item["direction"], item["station"]))
         for sequence, record in enumerate(ordered, 1):
             segment = segments[record["segment"]]
-            ws.append([
-                sequence, record["file"], record["direction"], format_station(record["station"]), record["basis"],
-                record["splice"], record["splice_missing"], record["connection"], record["connection_missing"],
-                format_station(segment["start"]), format_station(segment["end"]),
-            ])
-        style_sheet(ws, [8, 62, 10, 16, 14, 18, 22, 18, 22, 16, 16])
+            if has_county:
+                ws.append([
+                    sequence, record["file"], record["direction"], format_station(record["station"]), record["basis"],
+                    record["splice"], record["splice_missing"], record["connection"], record["connection_missing"],
+                    segment.get("county", ""), segment.get("route", "G210"),
+                    format_station(segment["start"]), format_station(segment["end"]),
+                ])
+            else:
+                ws.append([
+                    sequence, record["file"], record["direction"], format_station(record["station"]), record["basis"],
+                    record["splice"], record["splice_missing"], record["connection"], record["connection_missing"],
+                    format_station(segment["start"]), format_station(segment["end"]),
+                ])
+        if has_county:
+            style_sheet(ws, [8, 62, 10, 16, 14, 18, 22, 18, 22, 12, 10, 16, 16])
+        else:
+            style_sheet(ws, [8, 62, 10, 16, 14, 18, 22, 18, 22, 16, 16])
 
     ws = wb.create_sheet("统计说明")
     notes = [
