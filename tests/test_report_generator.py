@@ -498,6 +498,20 @@ class MinimalDocxTests(unittest.TestCase):
             self.assertIn("结论与建议", text)
             self.assertNotIn("（样例）", text)
 
+    def test_overview_table_has_county_column(self) -> None:
+        segs = [{"county": "两江新区", "route": "G210", "route_name": "满都拉－防城港", "grade": "一级公路", "start": 2157392, "end": 2159964, "mileage": 2.572, "total_mileage": 37.476, "manager": ""}]
+        doc = Document()
+        minimal_docx._section_overview(doc, None, segs)
+        table = doc.tables[0]
+        headers = [c.text for c in table.rows[0].cells]
+        self.assertEqual(headers[1], "区县")
+        self.assertEqual(headers[3], "路线名")
+        self.assertEqual(len(headers), 9)
+        self.assertEqual(headers[0], "序号")
+        row = [c.text for c in table.rows[1].cells]
+        self.assertEqual(row[1], "两江新区")
+        self.assertEqual(row[3], "满都拉－防城港")
+
 
 class GuangdongBusinessRegressionTests(unittest.TestCase):
     def test_scanner_preserves_bridge_guardrail_note(self) -> None:

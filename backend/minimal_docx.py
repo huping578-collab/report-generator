@@ -175,7 +175,9 @@ def generate_guangdong_stub(city, bundle, output_dir, log=lambda _x: None):
 def _section_overview(doc, config, segments):
     _body(doc, f"本次对重庆市G210线波形梁护栏{'和'.join(['护栏横梁中心高度', '螺栓缺失'])}进行自动化检测，按采集路段汇总表划分为{len(segments)}个统计分段。G210上行K2264K2325文件按原始桩号统计，其他文件按电子修正桩号统计。")
     _caption(doc, "表", "1.1", "G210检测路段情况")
-    _table(doc, ["序号", "路线编号", "起点桩号", "终点桩号", "里程(km)", "公路等级", "管理单位"], [[i, "G210", engine.format_station(s["start"]), engine.format_station(s["end"]), f"{s['mileage']:.3f}", s["grade"], s["manager"]] for i, s in enumerate(segments, 1)], True)
+    headers = ["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程(km)", "总里程(km)"]
+    rows = [[i, s.get("county", ""), s.get("route", "G210"), s.get("route_name", ""), s.get("grade", ""), engine.format_station(s["start"]), engine.format_station(s["end"]), f"{s['mileage']:.3f}", f"{s.get('total_mileage', s['mileage']):.3f}"] for i, s in enumerate(segments, 1)]
+    _table(doc, headers, rows, True)
 
 
 def _section_method(doc, height_stats, bolt_stats):
