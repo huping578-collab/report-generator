@@ -189,90 +189,127 @@ def _section_method(doc, height_stats, bolt_stats):
 
 def _section_height(doc, segments, height_stats, height_records, images, temp_dir, drawing_id=1000):
     _heading(doc, "波形梁护栏横梁中心高度检测结果", 1)
-    _heading(doc, "G210线整体情况", 2)
-    for kind in ("二波", "三波"):
-        total = sum(item["types"][kind]["count"] for item in height_stats)
-        if not total:
-            continue
-        good = sum(item["types"][kind]["bins"][2] for item in height_stats)
-        _body(doc, f"G210线{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{good * 100 / total:.2f}%。")
-    labels = ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"]
-    rows = []
-    for item in height_stats:
-        data = item["types"]["二波"] if item["types"]["二波"]["count"] else None
-        if data:
-            rows.append(["二波", "G210", engine.format_station(item["segment"]["start"]), engine.format_station(item["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
-    if rows:
-        _caption(doc, "表", "3.1.1", "G210线二波形梁护栏横梁中心高度检测结果")
-        _table(doc, ["类型", "路线编号", "起点桩号", "终点桩号", *labels], rows, True)
-    labels = ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"]
-    rows = []
-    for item in height_stats:
-        data = item["types"]["三波"] if item["types"]["三波"]["count"] else None
-        if data:
-            rows.append(["三波", "G210", engine.format_station(item["segment"]["start"]), engine.format_station(item["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
-    if rows:
-        _caption(doc, "表", "3.1.2", "G210线三波形梁护栏横梁中心高度检测结果")
-        _table(doc, ["类型", "路线编号", "起点桩号", "止点桩号", *labels], rows, True)
-
-    for segment_index, item in enumerate(height_stats):
-        segment = item["segment"]
-        if not any(item["types"][kind]["count"] for kind in ("二波", "三波")):
-            continue
-        _heading(doc, f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段", 2)
+    from collections import defaultdict
+    by_county = defaultdict(list)
+    for idx, seg in enumerate(segments):
+        stat = height_stats[idx] if idx < len(height_stats) else None
+        by_county[seg.get("county", "")].append((idx, seg, stat))
+    for county, items in by_county.items():
+        _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
         for kind in ("二波", "三波"):
-            data = item["types"][kind]
-            if not data["count"]:
+            total = sum(it[2]["types"][kind]["count"] for it in items if it[2] is not None)
+            if not total:
                 continue
-            level = "较高" if data["pass"] >= 80 else ("一般" if data["pass"] >= 60 else "偏低")
-            detail = engine.percentage_phrases(kind, data["pcts"])
-            _body(doc, f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段{kind}形梁护栏横梁中心高度有效检测点共{data['count']}个，整体合格率{level}，合格率为{data['pass']:.2f}%。护栏横梁中心高度{detail}。")
-            image_set = images[(segment_index, kind)]
-            drawing_id += 1
-            _picture(doc, image_set["line"], 13, 8)
-            _caption(doc, "图", f"3.{segment_index + 2}-{1}", f"{kind}形梁护栏横梁中心高度检测结果")
-            _picture(doc, image_set["pie"], 14, 8.5)
-            _caption(doc, "图", f"3.{segment_index + 2}-{2}", f"{kind}形梁护栏横梁中心高度分布情况")
-            example_rows = [record for record in (height_records or []) if record["segment"] == segment_index and record["kind"] == kind]
-            example_points = engine.select_height_example_points(example_rows, segment_index, kind)
-            if example_points:
-                _example_table(doc, example_points)
-                _caption(doc, "图", f"3.{segment_index + 2}-{3}", f"{kind}形梁护栏横梁中心高度自动计算示例")
+            good = sum(it[2]["types"][kind]["bins"][2] for it in items if it[2] is not None)
+            if county:
+                _body(doc, f"{county}{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{good * 100 / total:.2f}%。")
+            else:
+                _body(doc, f"G210线{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{good * 100 / total:.2f}%。")
+        labels = ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"]
+        rows = []
+        for idx, seg, stat in items:
+            if stat is None:
+                continue
+            data = stat["types"]["二波"] if stat["types"]["二波"]["count"] else None
+            if data:
+                county_val = seg.get("county", "")
+                route_val = seg.get("route", "G210")
+                rows.append([county_val, route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
+        if rows:
+            _caption(doc, "表", "3.1.1", f"{county}二波形梁护栏横梁中心高度检测结果" if county else "G210线二波形梁护栏横梁中心高度检测结果")
+            _table(doc, ["区县", "路线编号", "起点桩号", "终点桩号", *labels], rows, True)
+        labels = ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"]
+        rows = []
+        for idx, seg, stat in items:
+            if stat is None:
+                continue
+            data = stat["types"]["三波"] if stat["types"]["三波"]["count"] else None
+            if data:
+                county_val = seg.get("county", "")
+                route_val = seg.get("route", "G210")
+                rows.append([county_val, route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
+        if rows:
+            _caption(doc, "表", "3.1.2", f"{county}三波形梁护栏横梁中心高度检测结果" if county else "G210线三波形梁护栏横梁中心高度检测结果")
+            _table(doc, ["区县", "路线编号", "起点桩号", "止点桩号", *labels], rows, True)
+        for idx, seg, stat in items:
+            if stat is None or not any(stat["types"][kind]["count"] for kind in ("二波", "三波")):
+                continue
+            route_val = seg.get("route", "G210")
+            _heading(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段", 2)
+            for kind in ("二波", "三波"):
+                data = stat["types"][kind]
+                if not data["count"]:
+                    continue
+                level = "较高" if data["pass"] >= 80 else ("一般" if data["pass"] >= 60 else "偏低")
+                detail = engine.percentage_phrases(kind, data["pcts"])
+                _body(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段{kind}形梁护栏横梁中心高度有效检测点共{data['count']}个，整体合格率{level}，合格率为{data['pass']:.2f}%。护栏横梁中心高度{detail}。")
+                image_set = images.get((idx, kind)) if isinstance(images, dict) else None
+                if image_set is None:
+                    continue
+                drawing_id += 1
+                _picture(doc, image_set["line"], 13, 8)
+                _caption(doc, "图", f"3.{idx + 2}-{1}", f"{kind}形梁护栏横梁中心高度检测结果")
+                _picture(doc, image_set["pie"], 14, 8.5)
+                _caption(doc, "图", f"3.{idx + 2}-{2}", f"{kind}形梁护栏横梁中心高度分布情况")
+                example_rows = [record for record in (height_records or []) if record["segment"] == idx and record["kind"] == kind]
+                example_points = engine.select_height_example_points(example_rows, idx, kind)
+                if example_points:
+                    _example_table(doc, example_points)
+                    _caption(doc, "图", f"3.{idx + 2}-{3}", f"{kind}形梁护栏横梁中心高度自动计算示例")
     return drawing_id
 
 
 def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir):
     _heading(doc, "波形梁护栏螺栓缺失", 1)
-    _heading(doc, "G210线整体情况", 2)
-    total_splice = sum(item["splice"] for item in bolt_stats)
-    total_connection = sum(item["connection"] for item in bolt_stats)
-    total_missing = sum(item["missing"] for item in bolt_stats)
-    total_rate = engine.bolt_missing_rate(total_splice, total_connection, total_missing)
-    _body(doc, f"本次采用波形梁护栏螺栓缺失自动化检测方式，对重庆市G210线波形梁护栏螺栓缺失情况进行统计，共检出拼接螺栓{total_splice}颗，连接螺栓{total_connection}颗，缺失螺栓{total_missing}颗，整体缺失率为{total_rate:.2f}%。")
-    overall = [["G210", engine.format_station(item["segment"]["start"]), engine.format_station(item["segment"]["end"]), f"{item['segment']['mileage']:.3f}", item["splice"], item["connection"], item["missing"], f"{item['rate']:.2f}"] for item in bolt_stats]
-    overall.append(["合计", "", "", "", total_splice, total_connection, total_missing, f"{total_rate:.2f}"])
-    _caption(doc, "表", "4.1.1", "G210线波形梁护栏螺栓缺失检测结果")
-    _table(doc, ["路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"], overall, True)
-    for section_number, item in enumerate(bolt_stats, 2):
-        segment = item["segment"]
-        _heading(doc, f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段", 2)
-        if not item["points"]:
-            _body(doc, "本段无波形护栏")
-            continue
-        _body(doc, f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段共检出拼接螺栓{item['splice']}颗，连接螺栓{item['connection']}颗，缺失螺栓{item['missing']}颗，缺失率为{item['rate']:.2f}%。")
-        _caption(doc, "表", f"4.{section_number}-1", f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段波形梁护栏螺栓缺失检测结果")
-        _table(doc, ["路线编号", "起点桩号", "止点桩号", "里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）"], [["G210", engine.format_station(segment["start"]), engine.format_station(segment["end"]), f"{segment['mileage']:.3f}", item["splice"], item["connection"], item["missing"]]], True)
-        segment_bolt_rows = [record for record in (bolt_records or []) if record["segment"] == section_number - 2]
-        bolt_examples = engine.select_bolt_example_points(segment_bolt_rows, disease_image_index)
-        bolt_examples = [example for example in bolt_examples if example.get("image") is not None]
-        if bolt_examples:
-            for example in bolt_examples:
-                image_data, image_extension = engine.read_disease_image(example["image"])
-                path = Path(temp_dir) / f"bolt_{section_number}.{image_extension.lstrip('.')}"
-                path.write_bytes(image_data)
-                _picture(doc, path, 16, 8.5)
-                _body(doc, engine.bolt_example_text(example))
-            _caption(doc, "图", f"4.{section_number}-1", f"G210线{engine.format_station(segment['start'])}～{engine.format_station(segment['end'])}段波形梁护栏螺栓缺失自动识别示例")
+    from collections import defaultdict
+    by_county = defaultdict(list)
+    for idx, seg in enumerate(segments):
+        stat = bolt_stats[idx] if idx < len(bolt_stats) else None
+        by_county[seg.get("county", "")].append((idx, seg, stat))
+    for county, items in by_county.items():
+        _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
+        total_splice = sum(it[2]["splice"] for it in items if it[2] is not None)
+        total_connection = sum(it[2]["connection"] for it in items if it[2] is not None)
+        total_missing = sum(it[2]["missing"] for it in items if it[2] is not None)
+        total_rate = engine.bolt_missing_rate(total_splice, total_connection, total_missing)
+        if county:
+            _body(doc, f"本次采用波形梁护栏螺栓缺失自动化检测方式，对{county}波形梁护栏螺栓缺失情况进行统计，共检出拼接螺栓{total_splice}颗，连接螺栓{total_connection}颗，缺失螺栓{total_missing}颗，整体缺失率为{total_rate:.2f}%。")
+        else:
+            _body(doc, f"本次采用波形梁护栏螺栓缺失自动化检测方式，对重庆市G210线波形梁护栏螺栓缺失情况进行统计，共检出拼接螺栓{total_splice}颗，连接螺栓{total_connection}颗，缺失螺栓{total_missing}颗，整体缺失率为{total_rate:.2f}%。")
+        overall = []
+        for idx, seg, stat in items:
+            if stat is None:
+                continue
+            county_val = seg.get("county", "")
+            route_val = seg.get("route", "G210")
+            overall.append([county_val, route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), f"{stat['segment']['mileage']:.3f}", stat["splice"], stat["connection"], stat["missing"], f"{stat['rate']:.2f}"])
+        overall.append(["合计", "", "", "", "", total_splice, total_connection, total_missing, f"{total_rate:.2f}"])
+        _caption(doc, "表", "4.1.1", f"{county}波形梁护栏螺栓缺失检测结果" if county else "G210线波形梁护栏螺栓缺失检测结果")
+        _table(doc, ["区县", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"], overall, True)
+        for idx, seg, stat in items:
+            if stat is None:
+                continue
+            route_val = seg.get("route", "G210")
+            section_number = idx + 2
+            _heading(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段", 2)
+            if not stat["points"]:
+                _body(doc, "本段无波形护栏")
+                continue
+            _body(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段共检出拼接螺栓{stat['splice']}颗，连接螺栓{stat['connection']}颗，缺失螺栓{stat['missing']}颗，缺失率为{stat['rate']:.2f}%。")
+            _caption(doc, "表", f"4.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失检测结果")
+            county_val = seg.get("county", "")
+            _table(doc, ["区县", "路线编号", "起点桩号", "止点桩号", "里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）"], [[county_val, route_val, engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", stat["splice"], stat["connection"], stat["missing"]]], True)
+            segment_bolt_rows = [record for record in (bolt_records or []) if record["segment"] == idx]
+            bolt_examples = engine.select_bolt_example_points(segment_bolt_rows, disease_image_index)
+            bolt_examples = [example for example in bolt_examples if example.get("image") is not None]
+            if bolt_examples:
+                for example in bolt_examples:
+                    image_data, image_extension = engine.read_disease_image(example["image"])
+                    path = Path(temp_dir) / f"bolt_{section_number}.{image_extension.lstrip('.')}"
+                    path.write_bytes(image_data)
+                    _picture(doc, path, 16, 8.5)
+                    _body(doc, engine.bolt_example_text(example))
+                _caption(doc, "图", f"4.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失自动识别示例")
 
 
 def _section_conclusion(doc, height_stats, bolt_stats):

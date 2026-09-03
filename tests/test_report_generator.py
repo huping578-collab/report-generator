@@ -512,6 +512,54 @@ class MinimalDocxTests(unittest.TestCase):
         self.assertEqual(row[1], "两江新区")
         self.assertEqual(row[3], "满都拉－防城港")
 
+    def test_height_grouped_by_county(self) -> None:
+        segments = [
+            {"county": "两江新区", "route": "G210", "route_name": "", "grade": "一级", "manager": "", "start": 2264000.0, "end": 2265000.0, "mileage": 1.0, "total_mileage": 1.0},
+            {"county": "北碚区", "route": "G210", "route_name": "", "grade": "一级", "manager": "", "start": 2265000.0, "end": 2266000.0, "mileage": 1.0, "total_mileage": 1.0},
+        ]
+        records = build_demo_height_records()
+        height_stats = build_demo_stats(segments, records)
+        bolt_records = [
+            {"file": "交安设施现场检测明细.xlsx", "direction": "下行", "station": 2264010.0, "raw_station": 2264010.0, "electronic_station": 2264010.0, "basis": "原始桩号", "segment": 0, "splice": 80, "splice_missing": 3, "connection": 120, "connection_missing": 1},
+            {"file": "交安设施现场检测明细.xlsx", "direction": "下行", "station": 2265010.0, "raw_station": 2265010.0, "electronic_station": 2265010.0, "basis": "原始桩号", "segment": 1, "splice": 80, "splice_missing": 3, "connection": 120, "connection_missing": 1},
+        ]
+        bolt_stats = engine.make_bolt_stats(segments, bolt_records)
+        with tempfile.TemporaryDirectory() as tmp:
+            import matplotlib.pyplot as plt
+
+            images = {}
+            for idx in range(len(segments)):
+                for kind in ("二波", "三波"):
+                    if height_stats[idx]["types"][kind]["count"] == 0:
+                        continue
+                    fig, ax = plt.subplots(figsize=(1, 1))
+                    ax.plot([0, 1], [0, 1])
+                    line_path = Path(tmp) / f"line_{idx}_{kind}.png"
+                    fig.savefig(line_path)
+                    plt.close(fig)
+                    fig2, ax2 = plt.subplots(figsize=(1, 1))
+                    ax2.pie([1, 1])
+                    pie_path = Path(tmp) / f"pie_{idx}_{kind}.png"
+                    fig2.savefig(pie_path)
+                    plt.close(fig2)
+                    images[(idx, kind)] = {"line": line_path, "pie": pie_path}
+            doc = Document()
+            minimal_docx._section_height(doc, segments, height_stats, records, images, tmp)
+            headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+            self.assertTrue(any("两江新区整体情况" in h for h in headings), f"missing 两江新区整体情况 in {headings}")
+            self.assertTrue(any("北碚区整体情况" in h for h in headings), f"missing 北碚区整体情况 in {headings}")
+            doc2 = Document()
+            minimal_docx._section_bolt(doc2, segments, bolt_stats, bolt_records, None, tmp)
+            headings2 = [p.text for p in doc2.paragraphs if p.style.name.startswith("Heading")]
+            self.assertTrue(any("两江新区整体情况" in h for h in headings2), f"bolt missing 两江新区整体情况 in {headings2}")
+            self.assertTrue(any("北碚区整体情况" in h for h in headings2), f"bolt missing 北碚区整体情况 in {headings2}")
+            tables = doc.tables
+            has_county_col = any(any("区县" in c.text for c in t.rows[0].cells) for t in tables) if tables else False
+            tables2 = doc2.tables
+            has_county_col2 = any(any("区县" in c.text for c in t.rows[0].cells) for t in tables2) if tables2 else False
+            self.assertTrue(has_county_col, f"height tables missing 区县 column, headers: {[[c.text for c in t.rows[0].cells] for t in tables]}")
+            self.assertTrue(has_county_col2, f"bolt tables missing 区县 column, headers: {[[c.text for c in t.rows[0].cells] for t in tables2]}")
+
 
 class GuangdongBusinessRegressionTests(unittest.TestCase):
     def test_scanner_preserves_bridge_guardrail_note(self) -> None:
