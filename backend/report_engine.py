@@ -169,16 +169,106 @@ def format_station_one_decimal(meters):
 def read_segments(summary_xlsx):
     wb = openpyxl.load_workbook(summary_xlsx, read_only=True, data_only=True)
     ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb.worksheets[0]
+    # 读取 header 行（第2行）映射列名到索引，兼容旧版无区县时默认 county="" route="G210"
+    header = None
+    header_row_idx = 2
+    for idx in (2, 1):
+        if ws.max_row >= idx:
+            values = [str(c.value).strip() if c.value is not None else "" for c in ws[idx]]
+            if any(v for v in values):
+                if any("区县" in v or "公路等级" in v or "路线编号" in v for v in values):
+                    header = values
+                    header_row_idx = idx
+                    break
+    # 若 header 含 "区县" 则按新列读，否则按旧固定索引
+    if header is not None and any("区县" in h for h in header):
+        def _col(keywords):
+            for i, h in enumerate(header):
+                for kw in keywords:
+                    if kw and kw in h:
+                        return i
+            return None
+
+        county_idx = _col(["区县"])
+        route_idx = _col(["路线编号"])
+        route_name_idx = _col(["路线名"])
+        grade_idx = _col(["公路等级"])
+        manager_idx = _col(["管理单位", "管养单位"])
+        start_idx = _col(["起点桩号", "起点"])
+        end_idx = _col(["止点桩号", "止点"])
+        total_idx = _col(["总里程"])
+        mileage_idx = None
+        for i, h in enumerate(header):
+            if "里程" in h and "总里程" not in h:
+                mileage_idx = i
+                break
+
+        result = []
+        for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+            if row is None or all(v is None for v in row):
+                continue
+            s_val = row[start_idx] if start_idx is not None and start_idx < len(row) else None
+            e_val = row[end_idx] if end_idx is not None and end_idx < len(row) else None
+            if s_val is None or e_val is None or str(s_val).strip() == "":
+                continue
+            try:
+                start = float(s_val) * 1000
+                end = float(e_val) * 1000
+            except (TypeError, ValueError):
+                continue
+            mileage = 0.0
+            if mileage_idx is not None and mileage_idx < len(row) and row[mileage_idx] not in (None, ""):
+                try:
+                    mileage = float(row[mileage_idx])
+                except (TypeError, ValueError):
+                    mileage = 0.0
+            total = mileage
+            if total_idx is not None and total_idx < len(row) and row[total_idx] not in (None, ""):
+                try:
+                    total = float(row[total_idx])
+                except (TypeError, ValueError):
+                    total = mileage
+            county = str(row[county_idx] or "").strip() if county_idx is not None and county_idx < len(row) else ""
+            route = str(row[route_idx] or "").strip() if route_idx is not None and route_idx < len(row) else "G210"
+            if not route:
+                route = "G210"
+            route_name = str(row[route_name_idx] or "").strip() if route_name_idx is not None and route_name_idx < len(row) else ""
+            grade = str(row[grade_idx] or "").strip() if grade_idx is not None and grade_idx < len(row) else ""
+            manager = str(row[manager_idx] or "").strip() if manager_idx is not None and manager_idx < len(row) else ""
+            result.append({
+                "county": county,
+                "route": route,
+                "route_name": route_name,
+                "grade": grade,
+                "manager": manager,
+                "start": start,
+                "end": end,
+                "mileage": mileage,
+                "total_mileage": total,
+            })
+        wb.close()
+        if not result:
+            raise ValueError("分段汇总表中未读取到起点桩号和终点桩号。")
+        return result
     result = []
-    for row in ws.iter_rows(min_row=3, values_only=True):
+    for row in ws.iter_rows(min_row=header_row_idx + 1 if header is not None else 3, values_only=True):
         if len(row) < 9 or row[6] is None or row[7] is None:
             continue
+        try:
+            start = float(row[6]) * 1000
+            end = float(row[7]) * 1000
+        except (TypeError, ValueError):
+            continue
         result.append({
+            "county": "",
+            "route": "G210",
+            "route_name": "",
             "grade": str(row[3] or ""),
             "manager": str(row[4] or ""),
-            "start": float(row[6]) * 1000,
-            "end": float(row[7]) * 1000,
+            "start": start,
+            "end": end,
             "mileage": float(row[8] or 0),
+            "total_mileage": float(row[8] or 0),
         })
     wb.close()
     if not result:

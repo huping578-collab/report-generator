@@ -185,6 +185,26 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(run_bundles.call_args.args[2], expected_template)
 
 
+class UpstreamCountyTests(unittest.TestCase):
+    def test_read_segments_reads_county_column(self) -> None:
+        import openpyxl
+
+        from backend.report_engine import read_segments
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+            ws.append([1, "两江新区", "G210", "满都拉－防城港", "一级公路", 2157.392, 2159.964, 2.572, 37.476])
+            ws.append([1, "两江新区", "G210", "满都拉－防城港", "一级公路", 2159.964, 2184.977, 25.013, 37.476])
+            wb.save(tmp_path / "summary.xlsx")
+            segs = read_segments(tmp_path / "summary.xlsx")
+            self.assertEqual(segs[0]["county"], "两江新区")
+            self.assertEqual(segs[0]["route"], "G210")
+            self.assertEqual(segs[0]["route_name"], "满都拉－防城港")
+
+
 def build_demo_segments():
     return [
         {
