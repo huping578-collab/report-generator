@@ -57,6 +57,8 @@ class DesktopBridge:
             detected: dict[str, str] = {}
             if key == "projectPath":
                 detected = self._detect_project_paths(Path(path), template)
+            elif key == "summaryPath" and template != "gd":
+                detected = {"countyOptions": self._summary_counties(Path(path))}
             return {"ok": True, "cancelled": False, "path": path, "detected": detected}
         except Exception as exc:
             return {"ok": False, "error": f"无法打开路径选择器：{exc}"}
@@ -123,6 +125,7 @@ class DesktopBridge:
             template_docx=template_path,
             output_dir=Path(values["outputPath"]),
             disease_dir=Path(values["diseasePath"]) if values.get("diseasePath") else None,
+            tci_path=Path(values["tciPath"]) if values.get("tciPath") else None,
         )
         engine.generate_statistics_and_report(
             config,
@@ -130,7 +133,9 @@ class DesktopBridge:
             generate_charts_first=True,
             process_height=True,
             process_bolts=True,
+            process_tci=bool(values.get("tciPath")),
             require_template=False,
+            county_override=(str(values.get("countySelect") or "").strip() or None),
         )
 
     def _run_guangdong(self, values: dict[str, Any]) -> None:
@@ -155,7 +160,7 @@ class DesktopBridge:
             raise ValueError("项目配置无效。")
 
         required = {
-            "cq": ("projectPath", "summaryPath", "detailPath", "diseasePath", "outputPath"),
+            "cq": ("projectPath", "summaryPath", "detailPath", "diseasePath", "tciPath", "outputPath"),
             "gd": ("projectPath", "manualPath", "routePath", "outputPath"),
         }[payload["template"]]
         labels = {
@@ -163,6 +168,7 @@ class DesktopBridge:
             "summaryPath": "分段汇总表",
             "detailPath": "检测明细文件夹",
             "diseasePath": "病害清单文件夹",
+            "tciPath": "TCI数据文件夹",
             "markingPath": "标线数据文件夹",
             "guardrailPath": "护栏数据文件夹",
             "manualPath": "人工自动化对比表",
@@ -196,6 +202,18 @@ class DesktopBridge:
                 values.get("boltThreshold"),
             )
 
+    @staticmethod
+    def _summary_counties(summary: Path) -> list[str]:
+        try:
+            counties = []
+            for segment in engine.read_segments(Path(summary)):
+                county = str(segment.get("county") or "").strip()
+                if county and county not in counties:
+                    counties.append(county)
+            return counties
+        except Exception:
+            return []
+
     def _detect_project_paths(self, folder: Path, template: str) -> dict[str, str]:
         if template == "gd":
             marking, guardrail = engine.detect_guangdong_data_folders(folder)
@@ -206,14 +224,17 @@ class DesktopBridge:
                 result["guardrailPath"] = str(guardrail)
             return result
 
-        summary, detail, disease = engine.discover_paths(folder)
+        summary, detail, disease, tci = engine.discover_paths(folder)
         result = {"outputPath": str(summary.parent if summary else folder)}
         if summary:
             result["summaryPath"] = str(summary)
+            result["countyOptions"] = self._summary_counties(summary)
         if detail:
             result["detailPath"] = str(detail)
         if disease:
             result["diseasePath"] = str(disease)
+        if tci:
+            result["tciPath"] = str(tci)
         return result
 
     def _template_paths(self) -> dict[str, Path]:
@@ -229,6 +250,19 @@ class DesktopBridge:
 
     @staticmethod
     def _progress_from_log(message: str) -> tuple[int, int]:
+        structured = engine.parse_progress(message)
+        if structured:
+            stage_text = structured["stage"]
+            if any(word in stage_text for word in ("扫描", "识别", "索引", "解析", "读取")):
+                stage, start, end = 1, 20, 60
+            elif any(word in stage_text for word in ("图表", "工作簿", "报告", "生成", "统计")):
+                stage, start, end = 2, 60, 90
+            elif any(word in stage_text for word in ("保存", "完成", "清理")):
+                stage, start, end = 3, 90, 99
+            else:
+                stage, start, end = 0, 5, 20
+            ratio = structured["current"] / structured["total"]
+            return round(start + (end - start) * ratio), stage
         if any(word in message for word in ("扫描", "识别", "索引", "解析", "读取")):
             return 34, 1
         if any(word in message for word in ("图表", "工作簿", "报告", "生成", "统计")):

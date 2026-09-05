@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import openpyxl
 import tempfile
 import unittest
 import zipfile
@@ -12,7 +13,7 @@ from docx import Document
 from docx.oxml.ns import qn
 
 from bridge import DesktopBridge
-from backend import minimal_docx, report_engine as engine
+from backend import markdown_skeleton, minimal_docx, report_engine as engine
 
 
 class FakeWindow:
@@ -21,6 +22,518 @@ class FakeWindow:
 
     def evaluate_js(self, script: str) -> None:
         self.scripts.append(script)
+
+
+class MarkdownSkeletonTests(unittest.TestCase):
+    def test_template_reads_toml_front_matter_and_body_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "template.md"
+            path.write_text(
+                "+++\n"
+                "[page]\n"
+                "orientation = \"landscape\"\n"
+                "[body]\n"
+                "size_pt = 11\n"
+                "+++\n\n"
+                "# 标题\n\n"
+                "<!-- toc -->\n\n"
+                "正文。\n",
+                encoding="utf-8",
+            )
+
+            template = markdown_skeleton.read_template(path)
+            self.assertEqual(markdown_skeleton.read_blocks(path), template.blocks)
+
+        self.assertEqual(template.config["page"]["orientation"], "landscape")
+        self.assertEqual(template.config["body"]["size_pt"], 11)
+        self.assertEqual([block.kind for block in template.blocks], ["heading", "toc", "paragraph"])
+        self.assertEqual(template.blocks[-1].text, "正文。")
+
+    def test_template_without_front_matter_uses_legacy_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "legacy.md"
+            path.write_text("# 旧模板\n\n正文。\n", encoding="utf-8")
+
+            template = markdown_skeleton.read_template(path)
+            self.assertEqual(
+                markdown_skeleton.read_blocks(path),
+                [
+                    markdown_skeleton.Block("heading", level=1, text="旧模板"),
+                    markdown_skeleton.Block("paragraph", text="正文。"),
+                ],
+            )
+
+        self.assertEqual(template.config["page"]["paper"], "A4")
+        self.assertEqual(template.config["page"]["orientation"], "portrait")
+        self.assertEqual(template.config["body"]["east_asia"], "仿宋_GB2312")
+        self.assertEqual(template.config["body"]["latin"], "Times New Roman")
+        self.assertEqual(template.config["body"]["size_pt"], 10.5)
+        self.assertEqual(template.config["body"]["first_line_chars"], 2)
+        self.assertFalse(template.config["toc"]["enabled"])
+
+    def test_default_config_isolated_between_template_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "legacy.md"
+            path.write_text("# 旧模板\n", encoding="utf-8")
+
+            first = markdown_skeleton.read_template(path)
+            first.config["body"]["size_pt"] = 99
+            second = markdown_skeleton.read_template(path)
+
+        self.assertEqual(second.config["body"]["size_pt"], 10.5)
+        self.assertEqual(markdown_skeleton.DEFAULT_CONFIG["body"]["size_pt"], 10.5)
+
+    def test_toml_multiline_string_can_contain_separator_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "multiline.md"
+            path.write_text(
+                '''+++
+[toc]
+enabled = false
+title = """目录
++++
+说明"""
++++
+# 标题
+''',
+                encoding="utf-8",
+            )
+
+            template = markdown_skeleton.read_template(path)
+
+        self.assertEqual(template.config["toc"]["title"], "目录\n+++\n说明")
+        self.assertEqual([block.text for block in template.blocks], ["标题"])
+
+    def test_repository_templates_declare_format_and_toc_policy(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        chongqing = markdown_skeleton.read_template(root / "templates" / "重庆项目报告模板.md")
+        guangdong = markdown_skeleton.read_template(root / "templates" / "广东项目第五章模板.md")
+
+        self.assertTrue(chongqing.config["toc"]["enabled"])
+        self.assertTrue(any(block.kind == "toc" for block in chongqing.blocks))
+        self.assertFalse(guangdong.config["toc"]["enabled"])
+        self.assertFalse(any(block.kind == "toc" for block in guangdong.blocks))
+        for config in (chongqing.config, guangdong.config):
+            self.assertEqual(set(config), {"page", "body", "heading", "table", "caption", "toc"})
+
+    def test_invalid_template_config_reports_path_and_field(self) -> None:
+        cases = (
+            ("[body]\nsize_pt = 73\n", "size_pt"),
+            ("[page]\nleft_margin_cm = 11\n", "left_margin_cm"),
+            ("[page]\norientation = \"diagonal\"\n", "orientation"),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "invalid.md"
+            for front_matter, field in cases:
+                path.write_text(f"+++\n{front_matter}+++\n# 标题\n", encoding="utf-8")
+                with self.subTest(field=field):
+                    with self.assertRaises(ValueError) as raised:
+                        markdown_skeleton.read_template(path)
+                    self.assertIn(str(path), str(raised.exception))
+                    self.assertIn(field, str(raised.exception))
+
+    def test_toc_enabled_requires_toc_marker_but_disabled_allows_legacy_body(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "重庆模板.md"
+            path.write_text("+++\n[toc]\nenabled = true\n+++\n# 标题\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as raised:
+                markdown_skeleton.read_template(path)
+            self.assertIn(str(path), str(raised.exception))
+            self.assertIn("toc", str(raised.exception))
+
+            path.write_text("+++\n[toc]\nenabled = false\n+++\n# 广东模板\n", encoding="utf-8")
+            template = markdown_skeleton.read_template(path)
+
+        self.assertEqual([block.kind for block in template.blocks], ["heading"])
+        self.assertFalse(template.config["toc"]["enabled"])
+
+
+class MarkdownDocxFormattingTests(unittest.TestCase):
+    def _write_report(self, template_text: str) -> Path:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        template = root / "template.md"
+        template.write_text(template_text, encoding="utf-8")
+        output = root / "output"
+        output.mkdir()
+        report_config = engine.Config(
+            project_dir=root,
+            summary_xlsx=root / "summary.xlsx",
+            detail_dir=root,
+            template_docx=template,
+            output_dir=output,
+        )
+        minimal_docx.make_report(
+            report_config, [], None, [], None, [], None, [], {}, root,
+            skeleton_md=template,
+        )
+        return output / engine.OUT_DOCX_NAME
+
+    def test_markdown_config_controls_docx_runs_and_outline(self) -> None:
+        template_text = (
+            "+++\n"
+            "[body]\n"
+            "east_asia = \"楷体\"\n"
+            "latin = \"Arial\"\n"
+            "size_pt = 11\n"
+            "first_line_chars = 0\n"
+            "[heading.1]\n"
+            "east_asia = \"黑体\"\n"
+            "latin = \"Arial\"\n"
+            "size_pt = 18\n"
+            "outline_level = 0\n"
+            "[table]\n"
+            "east_asia = \"宋体\"\n"
+            "latin = \"Arial\"\n"
+            "size_pt = 9\n"
+            "[caption]\n"
+            "east_asia = \"黑体\"\n"
+            "latin = \"Arial\"\n"
+            "size_pt = 12\n"
+            "[toc]\n"
+            "enabled = true\n"
+            "update_on_open = true\n"
+            "+++\n"
+            "# 自定义标题\n\n"
+            "<!-- toc -->\n\n"
+            "<!-- inject:overview -->\n"
+        )
+        report_path = self._write_report(template_text)
+        with zipfile.ZipFile(report_path) as archive:
+            document = archive.read("word/document.xml").decode("utf-8")
+            settings = archive.read("word/settings.xml").decode("utf-8")
+        self.assertIn('w:eastAsia="黑体"', document)
+        self.assertIn('w:eastAsia="楷体"', document)
+        self.assertIn('w:eastAsia="宋体"', document)
+        self.assertIn('w:ascii="Arial"', document)
+        self.assertIn('w:hAnsi="Arial"', document)
+        self.assertIn('w:val="0"', document)
+        self.assertIn('w:instrText xml:space="preserve"> TOC \\o "1-5" \\h \\z \\u </w:instrText>', document)
+        self.assertIn('w:updateFields w:val="true"', settings)
+
+    def test_disabled_toc_does_not_write_toc_field(self) -> None:
+        report_path = self._write_report("+++\n[toc]\nenabled = false\n+++\n# 无目录\n")
+        with zipfile.ZipFile(report_path) as archive:
+            document = archive.read("word/document.xml").decode("utf-8")
+        self.assertNotIn(" TOC ", document)
+
+
+class GuangdongTemplateConfigTests(unittest.TestCase):
+    @staticmethod
+    def _bundle() -> dict:
+        return {
+            "marking": [],
+            "height": [],
+            "bolt": [],
+            "notes": [],
+            "comparison_detail": [],
+            "weak_segments": [],
+        }
+
+    @staticmethod
+    def _write_report(root: Path, template: Path, output_dir: Path | None = None) -> Path:
+        return engine.GuangdongChapterWriter.write(
+            "佛山市",
+            GuangdongTemplateConfigTests._bundle(),
+            output_dir or root / "output",
+            template,
+            {"marking": 7, "height": 5, "bolt": 5},
+        )
+
+    @staticmethod
+    def _xml_paragraphs(document_xml: bytes):
+        from xml.etree import ElementTree as ET
+
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        root = ET.fromstring(document_xml)
+        return root.findall(".//w:body/w:p", ns), ns
+
+    def test_guangdong_writer_disables_toc_and_update_fields_from_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "disabled-toc.md"
+            template.write_text(
+                "+++\n"
+                "[toc]\n"
+                "enabled = false\n"
+                "+++\n"
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "<!-- toc -->\n",
+                encoding="utf-8",
+            )
+            output = self._write_report(root, template)
+            with zipfile.ZipFile(output) as archive:
+                document = archive.read("word/document.xml").decode("utf-8")
+                settings = archive.read("word/settings.xml").decode("utf-8")
+
+        self.assertNotIn(" TOC ", document)
+        self.assertNotIn("w:updateFields", settings)
+
+    def test_guangdong_writer_uses_custom_toc_range_title_and_update_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "custom-toc.md"
+            template.write_text(
+                "+++\n"
+                "[heading.1]\n"
+                "east_asia = \"目录标题字体\"\n"
+                "size_pt = 18\n"
+                "[toc]\n"
+                "enabled = true\n"
+                "title = \"自定义目录\"\n"
+                "min_level = 2\n"
+                "max_level = 4\n"
+                "update_on_open = false\n"
+                "+++\n"
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "<!-- toc -->\n",
+                encoding="utf-8",
+            )
+            output = self._write_report(root, template)
+            with zipfile.ZipFile(output) as archive:
+                document_xml = archive.read("word/document.xml")
+                document = document_xml.decode("utf-8")
+                settings = archive.read("word/settings.xml").decode("utf-8")
+
+        paragraphs, ns = self._xml_paragraphs(document_xml)
+        toc_titles = [
+            paragraph for paragraph in paragraphs if "自定义目录" in "".join(
+                node.text or "" for node in paragraph.findall(".//w:t", ns)
+            )
+        ]
+        self.assertEqual(len(toc_titles), 1)
+        if len(toc_titles) != 1:
+            return
+        toc_title = toc_titles[0]
+        title_fonts = toc_title.find(".//w:rPr/w:rFonts", ns)
+        title_size = toc_title.find(".//w:rPr/w:sz", ns)
+        self.assertEqual(title_fonts.get(qn("w:eastAsia")), "目录标题字体")
+        self.assertEqual(title_size.get(qn("w:val")), "36")
+        self.assertIn('w:instrText xml:space="preserve"> TOC \\o "2-4" \\h \\z \\u </w:instrText>', document)
+        self.assertIn(">自定义目录</w:t>", document)
+        self.assertNotIn("w:updateFields", settings)
+
+    def test_guangdong_writer_does_not_keep_template_config_after_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "custom-body.md"
+            template.write_text(
+                "+++\n"
+                "[body]\n"
+                "size_pt = 17\n"
+                "+++\n"
+                "# 五、交通安全设施技术状况检测评价情况\n",
+                encoding="utf-8",
+            )
+            blocked_output = root / "blocked-output"
+            blocked_output.write_text("not a directory", encoding="utf-8")
+            with self.assertRaises(OSError):
+                self._write_report(root, template, blocked_output)
+
+        self.assertNotIn("_template_format_config", vars(engine.GuangdongChapterWriter))
+        self.assertEqual(
+            engine.GuangdongChapterWriter._format_config()["body"]["size_pt"],
+            markdown_skeleton.DEFAULT_CONFIG["body"]["size_pt"],
+        )
+
+    def test_guangdong_two_level_header_cells_have_center_v_align(self) -> None:
+        document = Document()
+        detail = [{
+            "indicator": "bolt",
+            "route": "G1",
+            "gtype": "二波",
+            "position": "左侧",
+            "direction": "上行",
+            "segment": "K1+000～K2+000",
+            "msplice": 1,
+            "mconn": 2,
+            "asplice": 1,
+            "aconn": 2,
+            "remark": "",
+        }]
+        with minimal_docx.format_context(markdown_skeleton.DEFAULT_CONFIG):
+            engine.GuangdongChapterWriter._comparison_table(
+                document,
+                detail,
+                {"marking": 7, "height": 5, "bolt": 5},
+            )
+
+        table = document.tables[1]
+        xml_rows = table._tbl.findall("./w:tr", table._tbl.nsmap)
+        header_cells = [cell for row in xml_rows[:2] for cell in row.findall("./w:tc", table._tbl.nsmap)]
+        self.assertEqual([len(row.findall("./w:tc", table._tbl.nsmap)) for row in xml_rows[:2]], [8, 10])
+        for cell in header_cells:
+            vertical_alignment = cell.find("./w:tcPr/w:vAlign", cell.nsmap)
+            self.assertIsNotNone(vertical_alignment)
+            self.assertEqual(vertical_alignment.get(qn("w:val")), "center")
+        self.assertEqual(
+            sum(cell.find("./w:tcPr/w:gridSpan", cell.nsmap) is not None for cell in xml_rows[0].findall("./w:tc", table._tbl.nsmap)),
+            2,
+        )
+        self.assertEqual(
+            sum(cell.find("./w:tcPr/w:vMerge", cell.nsmap) is not None for cell in header_cells),
+            12,
+        )
+
+    def test_guangdong_toc_field_paragraph_has_no_body_first_line_indent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "toc.md"
+            template.write_text(
+                "+++\n"
+                "[toc]\n"
+                "enabled = true\n"
+                "title = \"目录标题\"\n"
+                "+++\n"
+                "# 五、交通安全设施技术状况检测评价情况\n\n"
+                "<!-- toc -->\n",
+                encoding="utf-8",
+            )
+            output = self._write_report(root, template)
+            with zipfile.ZipFile(output) as archive:
+                document_xml = archive.read("word/document.xml")
+
+        paragraphs, ns = self._xml_paragraphs(document_xml)
+        field_paragraph = next(
+            paragraph for paragraph in paragraphs if paragraph.find(".//w:instrText", ns) is not None
+        )
+        style = field_paragraph.find("./w:pPr/w:pStyle", ns)
+        indent = field_paragraph.find("./w:pPr/w:ind", ns)
+        self.assertIsNotNone(style)
+        self.assertTrue(style.get(qn("w:val")).startswith("TOC"))
+        self.assertNotEqual(None if indent is None else indent.get(qn("w:firstLine")), "420")
+
+
+class SharedRulesTests(unittest.TestCase):
+    def test_guardrail_height_and_bolt_rules_are_shared(self) -> None:
+        self.assertEqual(engine.guardrail_type("两波护栏"), "二波")
+        self.assertEqual(engine.guardrail_type("三波护栏"), "三波")
+        self.assertTrue(engine.height_deviation_over_10cm("二波", 701))
+        self.assertFalse(engine.height_deviation_over_10cm("三波", 797))
+        self.assertAlmostEqual(engine.bolt_missing_ratio(10, 20, 3), 3 / 33)
+        self.assertIsNone(engine.bolt_missing_ratio(0, 0, 0))
+
+    def test_progress_message_round_trips_with_optional_item(self) -> None:
+        message = engine.format_progress("扫描资料", 2, 5, "a.xlsx")
+        self.assertEqual(message, "[progress] 扫描资料 2/5 a.xlsx")
+        self.assertEqual(
+            engine.parse_progress(message),
+            {"stage": "扫描资料", "current": 2, "total": 5, "item": "a.xlsx"},
+        )
+        self.assertIsNone(engine.parse_progress("普通日志"))
+
+    def test_make_excel_keeps_zero_denominator_bolt_rate_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = engine.Config(root, root / "summary.xlsx", root, root / "template.md", root / "output")
+            segment = {
+                "county": "测试区",
+                "route": "G1",
+                "start": 1000.0,
+                "end": 2000.0,
+                "mileage": 1.0,
+            }
+            engine.make_excel(
+                config,
+                [segment],
+                bolt_stats=[{
+                    "segment": segment,
+                    "splice": 0,
+                    "connection": 0,
+                    "missing": 0,
+                    "rate": None,
+                }],
+            )
+            workbook = openpyxl.load_workbook(config.out_xlsx, data_only=True)
+            self.assertIsNone(workbook["螺栓缺失统计"]["J2"].value)
+            workbook.close()
+
+    def test_docx_bolt_sentence_keeps_zero_denominator_rate_blank(self) -> None:
+        segment = {
+            "county": "测试区",
+            "route": "G1",
+            "start": 1000.0,
+            "end": 2000.0,
+            "mileage": 1.0,
+        }
+        stat = {
+            "segment": segment,
+            "splice": 0,
+            "connection": 0,
+            "missing": 0,
+            "rate": None,
+            "points": 1,
+        }
+        document = Document()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            minimal_docx._section_bolt(document, [segment], [stat], [], {}, temp_dir)
+        self.assertIn("缺失率为%。", "\n".join(p.text for p in document.paragraphs))
+
+
+    def test_iter_height_rows_resolves_shared_string_headers(self) -> None:
+        parts = {
+            "[Content_Types].xml": """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>""",
+            "_rels/.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+            "xl/workbook.xml": """<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>""",
+            "xl/_rels/workbook.xml.rels": """<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+</Relationships>""",
+            "xl/sharedStrings.xml": """<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="4" uniqueCount="4">
+<si><t>护栏类型</t></si><si><t>梁板中心高度(mm)</t></si><si><t>原始桩号</t></si><si><t>三波护栏</t></si>
+</sst>""",
+            "xl/worksheets/sheet1.xml": """<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>
+<row r="2"><c r="A2" t="s"><v>3</v></c><c r="B2"><v>697</v></c><c r="C2"><v>2101.167</v></c></row>
+</sheetData></worksheet>""",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "shared-strings.xlsx"
+            with zipfile.ZipFile(path, "w") as archive:
+                for name, content in parts.items():
+                    archive.writestr(name, content)
+            rows = list(engine.iter_height_rows(path))
+        self.assertEqual(rows[0]["护栏类型"], "三波护栏")
+        self.assertEqual(rows[0]["梁板中心高度(mm)"], 697.0)
+
+    def test_segment_lookup_requires_source_route_when_routes_overlap(self) -> None:
+        segments = [
+            {"route": "G319", "start": 2100000.0, "end": 2200000.0},
+            {"route": "G210", "start": 2100000.0, "end": 2200000.0},
+        ]
+        self.assertEqual(engine._segment_index(segments, 2150000.0, "G210"), 1)
+        self.assertIsNone(engine._segment_index(segments, 2150000.0, "G351"))
+
+    def test_tci_rows_use_data_route_column_not_header_label(self) -> None:
+        segments = [
+            {"route": "G319", "start": 2100000.0, "end": 2200000.0},
+            {"route": "G210", "start": 2100000.0, "end": 2200000.0},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tci.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.append(["区域", "路线编号", "原始桩号", "电子修正桩号", "防护设施缺损", "标志缺损", "标线缺损"])
+            sheet.append(["", "", "", "", "轻", "", ""])
+            sheet.append(["测试区", "G210", "K2150+000", "", 1, 0, 0])
+            workbook.save(path)
+            records = engine.collect_tci_records(segments, path)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["segment"], 1)
 
 
 class DesktopBridgeTests(unittest.TestCase):
@@ -37,8 +550,10 @@ class DesktopBridgeTests(unittest.TestCase):
             path.write_bytes(b"test")
         self.detail = self.root / "detail"
         self.disease = self.root / "disease"
+        self.tci = self.root / "tci"
         self.detail.mkdir()
         self.disease.mkdir()
+        self.tci.mkdir()
         self.cq_template = self.root / "重庆项目报告模板.md"
         self.gd_template = self.root / "广东项目第五章模板.md"
         self.cq_template.write_text("# 重庆模板\n", encoding="utf-8")
@@ -62,6 +577,7 @@ class DesktopBridgeTests(unittest.TestCase):
                 "summaryPath": str(self.summary),
                 "detailPath": str(self.detail),
                 "diseasePath": str(self.disease),
+                "tciPath": str(self.tci),
                 "outputPath": str(self.output),
             },
         }
@@ -85,6 +601,36 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("分段汇总表", result["error"])
         self.assertFalse(self.bridge._running)
+
+    def test_chongqing_payload_requires_tci_folder(self) -> None:
+        payload = self.cq_payload()
+        payload["values"]["tciPath"] = ""
+        with patch.object(self.bridge, "_template_paths", return_value=self.templates()):
+            result = self.bridge.start_run(payload)
+        self.assertFalse(result["ok"])
+        self.assertIn("TCI数据文件夹", result["error"])
+        self.assertFalse(self.bridge._running)
+
+    def test_chongqing_run_wires_tci_path_and_process_tci(self) -> None:
+        configs = []
+        calls = []
+
+        def fake_run(config, **kwargs):
+            configs.append(config)
+            calls.append(kwargs)
+
+        with patch.object(self.bridge, "_template_paths", return_value=self.templates()), \
+                patch.object(engine, "generate_statistics_and_report", side_effect=fake_run):
+            self.bridge._run_chongqing(self.cq_payload()["values"])
+        self.assertEqual(str(configs[0].tci_path), str(self.tci))
+        self.assertTrue(calls[0]["process_tci"])
+
+    def test_discover_paths_detects_tci_folder(self) -> None:
+        tci_dir = self.project / "TCI数据"
+        tci_dir.mkdir()
+        (tci_dir / "万州区-G348.xlsx").write_bytes(b"x")
+        summary, detail, disease, tci = engine.discover_paths(self.project)
+        self.assertEqual(tci, tci_dir)
 
     def test_guangdong_specialized_folders_are_optional(self) -> None:
         payload = {
@@ -142,6 +688,13 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(self.bridge._progress_from_log("正在扫描资料"), (34, 1))
         self.assertEqual(self.bridge._progress_from_log("图表已生成"), (72, 2))
         self.assertEqual(self.bridge._progress_from_log("已保存文件"), (92, 3))
+
+    def test_structured_progress_mapping_is_incremental(self) -> None:
+        first = self.bridge._progress_from_log(engine.format_progress("扫描资料", 1, 4))
+        last = self.bridge._progress_from_log(engine.format_progress("扫描资料", 4, 4))
+        self.assertEqual(first[1], 1)
+        self.assertEqual(last[1], 1)
+        self.assertLess(first[0], last[0])
 
     def test_resource_template_path_uses_application_root(self) -> None:
         self.assertEqual(
@@ -1041,6 +1594,246 @@ class RealDataE2ETests(unittest.TestCase):
             spans.append(int(span.get(f"{{{ns['w']}}}val")) if span is not None else 1)
         self.assertEqual(spans.count(2), 2, f"{label} 父表头 gridSpan=2 应有2个：{spans}")
         self.assertEqual(len(spans), 8, f"{label} 父表头数量不符：{spans}")
+
+
+class ChongqingCountyNamingTests(unittest.TestCase):
+    def _config(self, root: Path, county=None) -> object:
+        return engine.Config(
+            root, root / "summary.xlsx", root, root / "template.md", root / "output",
+            county=county,
+        )
+
+    def test_default_names_keep_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir))
+            self.assertEqual(config.out_docx.name, engine.OUT_DOCX_NAME)
+            self.assertEqual(config.out_xlsx.name, engine.OUT_XLSX_NAME)
+
+    def test_county_names_follow_chongqing_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir), county="万州区")
+            self.assertEqual(config.out_docx.name, "重庆市万州区交安设施检测报告.docx")
+            self.assertEqual(config.out_xlsx.name, "重庆市万州区交安设施检测报告.xlsx")
+
+    def test_county_stem_does_not_duplicate_prefix(self) -> None:
+        self.assertEqual(engine.county_report_stem("重庆市万州区"), "重庆市万州区交安设施检测报告")
+        self.assertEqual(engine.county_report_stem("城口县"), "重庆市城口县交安设施检测报告")
+
+
+class CountyRoutingTests(unittest.TestCase):
+    def _segments(self) -> list:
+        return [
+            {"county": "万州区", "route": "G210", "start": 2264000.0, "end": 2265000.0},
+            {"county": "渝北区", "route": "G210", "start": 2265000.0, "end": 2266000.0},
+        ]
+
+    def test_extract_full_short_and_multi(self) -> None:
+        known = ["万州区", "渝北区", "城口县"]
+        self.assertEqual(
+            engine.extract_counties_from_filenames(["重庆市-万州区-交安设施现场检测-明细.xlsx"], known),
+            ["万州区"],
+        )
+        self.assertEqual(engine.extract_counties_from_filenames(["渝北-G210-明细.xlsx"], known), ["渝北区"])
+        self.assertEqual(
+            engine.extract_counties_from_filenames(["万州区-明细.xlsx", "城口-病害清单.xlsx"], known),
+            ["万州区", "城口县"],
+        )
+        self.assertEqual(engine.extract_counties_from_filenames(["G210-明细.xlsx"], known), [])
+
+    def test_resolve_without_files_or_dimension_returns_all_or_empty(self) -> None:
+        self.assertEqual(
+            engine.resolve_report_counties(self._segments(), []),
+            ["万州区", "渝北区"],
+        )
+        self.assertEqual(engine.resolve_report_counties([{"route": "G210"}], ["万州区-明细.xlsx"]), [])
+
+    def test_resolve_without_match_raises_with_candidates(self) -> None:
+        with self.assertRaises(ValueError) as raised:
+            engine.resolve_report_counties(self._segments(), ["G210-明细.xlsx"])
+        self.assertIn("手动选择", str(raised.exception))
+        self.assertIn("万州区", str(raised.exception))
+
+    def test_resolve_override_short_ok_and_missing_raises(self) -> None:
+        self.assertEqual(engine.resolve_report_counties(self._segments(), [], override="渝北"), ["渝北区"])
+        with self.assertRaises(ValueError) as raised:
+            engine.resolve_report_counties(self._segments(), [], override="江北区")
+        self.assertIn("无对应路线分段", str(raised.exception))
+
+
+class ChongqingHeadingNumberingTests(unittest.TestCase):
+    def _document_xml(self, template_text: str) -> tuple:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            template.write_text(template_text, encoding="utf-8")
+            output = root / "output"
+            output.mkdir()
+            config = engine.Config(root, root / "summary.xlsx", root, template, output)
+            minimal_docx.make_report(
+                config, [], None, [], None, [], None, [], {}, root,
+                skeleton_md=template,
+            )
+            with zipfile.ZipFile(output / engine.OUT_DOCX_NAME) as archive:
+                return (
+                    archive.read("word/document.xml").decode("utf-8"),
+                    archive.read("word/numbering.xml").decode("utf-8"),
+                )
+
+    def _paragraphs_by_style(self, document_xml: str) -> dict:
+        from xml.etree import ElementTree as ET
+
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        root = ET.fromstring(document_xml)
+        result: dict = {}
+        for paragraph in root.findall(".//w:body/w:p", ns):
+            style = paragraph.find("w:pPr/w:pStyle", ns)
+            if style is None:
+                continue
+            name = style.get(f"{{{ns['w']}}}val")
+            text = "".join(t.text or "" for t in paragraph.findall("w:r/w:t", ns))
+            numbered = paragraph.find("w:pPr/w:numPr", ns) is not None
+            result.setdefault(name, []).append((text, numbered))
+        return result
+
+    def test_multilevel_numbering_and_stripped_text(self) -> None:
+        document, numbering = self._document_xml(
+            "# 1 概况\n\n## 1.1 项目概况\n\n### 2.3.1 评价\n\n#### 四级标题\n\n##### 五级标题\n"
+        )
+        self.assertIn('w:val="%1."', numbering)
+        self.assertIn('w:val="%1.%2"', numbering)
+        self.assertIn('w:val="%1.%2.%3"', numbering)
+        by_style = self._paragraphs_by_style(document)
+        self.assertEqual(by_style["Heading1"][0][0], "概况")
+        self.assertTrue(all(numbered for _, numbered in by_style["Heading1"]))
+        self.assertTrue(all(numbered for _, numbered in by_style["Heading2"]))
+        self.assertTrue(all(numbered for _, numbered in by_style["Heading3"]))
+        self.assertEqual(by_style["Heading3"][0][0], "评价")
+        self.assertTrue(all(not numbered for _, numbered in by_style.get("Heading4", [])))
+        self.assertTrue(all(not numbered for _, numbered in by_style.get("Heading5", [])))
+
+    def test_year_prefix_not_stripped(self) -> None:
+        document, _ = self._document_xml("# 2026年普通公路检测报告\n")
+        by_style = self._paragraphs_by_style(document)
+        self.assertEqual(by_style["Heading1"][0][0], "2026年普通公路检测报告")
+
+
+class ChongqingTableHeaderTests(unittest.TestCase):
+    def test_template_fonts_bold_and_gray_shading(self) -> None:
+        template = markdown_skeleton.read_template(engine.resource_template_path("重庆项目报告模板.md"))
+        self.assertEqual(template.config["body"]["east_asia"], "宋体")
+        self.assertEqual(template.config["table"]["east_asia"], "宋体")
+        self.assertTrue(template.config["table"]["header_bold"])
+        self.assertEqual(template.config["table"]["header_shading"], "D9D9D9")
+        for level in ("1", "2", "3"):
+            self.assertEqual(template.config["heading"][level]["east_asia"], "黑体")
+            self.assertTrue(template.config["heading"][level]["bold"])
+        for level in ("4", "5"):
+            self.assertEqual(template.config["heading"][level]["east_asia"], "黑体")
+            self.assertFalse(template.config["heading"][level]["bold"])
+
+    def test_docx_header_gray_bold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output"
+            output.mkdir()
+            template = engine.resource_template_path("重庆项目报告模板.md")
+            config = engine.Config(root, root / "summary.xlsx", root, template, output)
+            segment = {
+                "county": "万州区", "route": "G210", "route_name": "", "grade": "一级",
+                "start": 2264000.0, "end": 2265000.0, "mileage": 1.0, "total_mileage": 1.0,
+            }
+            minimal_docx.make_report(
+                config, [segment], None, [], None, [], None, [], {}, root,
+                skeleton_md=template,
+            )
+            with zipfile.ZipFile(output / engine.OUT_DOCX_NAME) as archive:
+                document = archive.read("word/document.xml").decode("utf-8")
+        self.assertIn('w:fill="D9D9D9"', document)
+        self.assertIn("w:eastAsia=\"宋体\"", document)
+
+    def test_excel_header_gray_bold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = engine.Config(root, root / "summary.xlsx", root, root / "template.md", root / "output")
+            segment = {
+                "county": "测试区", "route": "G1", "start": 1000.0, "end": 2000.0, "mileage": 1.0,
+            }
+            engine.make_excel(
+                config,
+                [segment],
+                bolt_stats=[{
+                    "segment": segment, "splice": 0, "connection": 0,
+                    "missing": 0, "rate": None,
+                }],
+            )
+            workbook = openpyxl.load_workbook(config.out_xlsx, data_only=True)
+            header = workbook["螺栓缺失统计"]["A1"]
+            self.assertTrue(header.font.bold)
+            self.assertTrue(str(header.fill.start_color.rgb).upper().endswith("D9D9D9"))
+            self.assertTrue(str(header.font.color.rgb).upper().endswith("000000"))
+            workbook.close()
+
+
+class ChongqingCountyEndToEndTests(unittest.TestCase):
+    def _write_summary(self, path: Path) -> None:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "各区县项目概况"
+        sheet.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+        sheet.append([1, "万州区", "G210", "", "一级", 2264.0, 2265.0, 1.0, 1.0])
+        sheet.append([2, "渝北区", "G210", "", "一级", 2265.0, 2266.0, 1.0, 1.0])
+        workbook.save(path)
+
+    def _write_detail(self, path: Path, station: str) -> None:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.append(["护栏类型", "梁板中心高度(mm)", "原始桩号", "电子修正桩号", "方向", "路线编号", "异常标记"])
+        sheet.append(["两波护栏", 600, station, station, "上行", "G210", ""])
+        workbook.save(path)
+
+    def _skeleton(self, path: Path) -> None:
+        path.write_text("# 报告\n\n## 1.1 项目概况\n", encoding="utf-8")
+
+    def _run(self, root: Path, detail_names: list) -> object:
+        summary = root / "summary.xlsx"
+        self._write_summary(summary)
+        detail = root / "detail"
+        detail.mkdir()
+        stations = {"wanzhou": "K2264+100", "yubei": "K2265+100"}
+        for name in detail_names:
+            key = "yubei" if "渝北" in name or "yubei" in name else "wanzhou"
+            self._write_detail(detail / name, stations[key])
+        skeleton = root / "template.md"
+        self._skeleton(skeleton)
+        output = root / "output"
+        config = engine.Config(root, summary, detail, skeleton, output)
+        engine.generate_statistics_and_report(
+            config, log=lambda _: None, process_height=True,
+            process_bolts=False, process_tci=False, require_template=False,
+        )
+        return config
+
+    def test_multi_county_files_generate_each_county_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._run(root, ["重庆市-万州区-交安设施现场检测-明细.xlsx", "渝北-G210-明细.xlsx"])
+            for county in ("万州区", "渝北区"):
+                stem = engine.county_report_stem(county)
+                self.assertTrue((root / "output" / county / f"{stem}.docx").is_file(), county)
+                self.assertTrue((root / "output" / county / f"{stem}.xlsx").is_file(), county)
+
+    def test_single_county_file_filters_segments_and_names_top_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self._run(root, ["重庆市-万州区-交安设施现场检测-明细.xlsx"])
+            self.assertEqual(config.out_docx.name, "重庆市万州区交安设施检测报告.docx")
+            self.assertEqual(config.out_xlsx.name, "重庆市万州区交安设施检测报告.xlsx")
+            self.assertTrue(config.out_docx.is_file())
+            workbook = openpyxl.load_workbook(config.out_xlsx, data_only=True)
+            detail = workbook["检测明细"]
+            counties = {row[7] for row in detail.iter_rows(min_row=2, values_only=True)}
+            workbook.close()
+            self.assertEqual(counties, {"万州区"})
 
 
 if __name__ == "__main__":

@@ -36,6 +36,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+from backend import markdown_skeleton
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -62,6 +64,15 @@ LINE_COLORS = ["4472C4", "ED7D31", "A5A5A5"]
 PROGRAM_NAME = "报告生成工具V0.1"
 OUT_XLSX_NAME = "重庆G210护栏统计.xlsx"
 OUT_DOCX_NAME = "重庆G210交安设施检测报告.docx"
+GRAY_HEADER_FILL = "D9D9D9"
+
+
+def county_report_stem(county):
+    """区县报告主名：重庆市XX区/县交安设施检测报告（已带重庆市前缀的不重复）。"""
+    name = str(county or "").strip()
+    if name.startswith("重庆市"):
+        name = name[len("重庆市"):]
+    return f"重庆市{name}交安设施检测报告"
 
 
 @dataclass
@@ -129,13 +140,18 @@ class Config:
     output_dir: Path
     disease_dir: Path | None = None
     tci_path: Path | None = None
+    county: str | None = None
 
     @property
     def out_xlsx(self):
+        if self.county:
+            return self.output_dir / f"{county_report_stem(self.county)}.xlsx"
         return self.output_dir / OUT_XLSX_NAME
 
     @property
     def out_docx(self):
+        if self.county:
+            return self.output_dir / f"{county_report_stem(self.county)}.docx"
         return self.output_dir / OUT_DOCX_NAME
 
 
@@ -289,6 +305,57 @@ def read_segments(summary_xlsx):
     return result
 
 
+def county_short_names(county):
+    """区县全称+简称候选（兼容“渝北=渝北区”口径）。"""
+    # ponytail: 只剥一层区/县/自治县后缀；民族自治县前缀缩写需别名表时再加
+    full = str(county or "").strip()
+    names = {full} if full else set()
+    for suffix in ("自治县", "区", "县"):
+        if full.endswith(suffix) and len(full) > len(suffix):
+            names.add(full[: -len(suffix)])
+            break
+    return names
+
+
+def extract_counties_from_filenames(filenames, known_counties):
+    """按已知区县在文件名中命中（全称优先、简称其次），保已知顺序去重。"""
+    names = [str(item or "") for item in filenames]
+    matched = []
+    for county in known_counties:
+        full = str(county)
+        if any(full and full in item for item in names):
+            matched.append(county)
+            continue
+        shorts = county_short_names(county) - {full}
+        if any(short and short in item for short in shorts for item in names):
+            matched.append(county)
+    return matched
+
+
+def resolve_report_counties(segments, filenames=(), override=None):
+    """文件名→区县→划分表分段的路由口径（Q1~Q4 用户已书面确认：无区县手动选、多区县逐个生成、缺行报错、兼容简称）。"""
+    known = []
+    for segment in segments or []:
+        county = str(segment.get("county") or "").strip()
+        if county and county not in known:
+            known.append(county)
+    if not known:
+        return []
+    if override is not None:
+        want = str(override).strip()
+        for county in known:
+            if want and want in county_short_names(county):
+                return [county]
+        raise ValueError(f"区县“{want}”在区县划分情况表中无对应路线分段（候选：{'、'.join(known)}），已中断。")
+    files = [str(item or "") for item in (filenames or []) if str(item or "").strip()]
+    if not files:
+        return list(known)
+    matched = extract_counties_from_filenames(files, known)
+    if not matched:
+        raise ValueError(f"文件名中未识别到区县名称，请在“区县”下拉框中手动选择（候选：{'、'.join(known)}），已中断。")
+    return matched
+
+
 def cell_value(cell, shared_strings=None):
     if cell.get("t") == "inlineStr":
         return "".join(t.text or "" for t in cell.findall(f".//{q(X, 't')}"))
@@ -309,6 +376,7 @@ def cell_value(cell, shared_strings=None):
 def iter_height_rows(path):
     # 源文件工作表范围可能错误标记为A1，直接流式读取sheet1.xml。
     with ZipFile(path) as archive, archive.open("xl/worksheets/sheet1.xml") as stream:
+        shared_strings = _xlsx_shared_strings(archive)
         headers = None
         for _, element in ET.iterparse(stream, events=("end",)):
             if element.tag != q(X, "row"):
@@ -317,7 +385,7 @@ def iter_height_rows(path):
             for cell in element.findall(q(X, "c")):
                 match = re.match(r"[A-Z]+", cell.get("r", ""))
                 if match:
-                    values[match.group(0)] = cell_value(cell)
+                    values[match.group(0)] = cell_value(cell, shared_strings)
             if headers is None:
                 headers = {column: str(value) for column, value in values.items()}
             else:
@@ -329,6 +397,7 @@ def iter_bolt_rows(path):
     """定位含“拼接螺栓数量”表头的工作表并流式读取。"""
     marker = "拼接螺栓数量".encode("utf-8")
     with ZipFile(path) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
         sheet_name = None
         for name in archive.namelist():
             if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
@@ -347,7 +416,7 @@ def iter_bolt_rows(path):
                 for cell in element.findall(q(X, "c")):
                     match = re.match(r"[A-Z]+", cell.get("r", ""))
                     if match:
-                        values[match.group(0)] = cell_value(cell)
+                        values[match.group(0)] = cell_value(cell, shared_strings)
                 if headers is None:
                     headers = {column: str(value) for column, value in values.items()}
                 else:
@@ -362,6 +431,50 @@ def guardrail_type(value):
     if any(word in text for word in ("双", "两", "二")):
         return "二波"
     return None
+
+
+HEIGHT_DESIGN = {"二波": 600.0, "三波": 697.0}
+HEIGHT_LIMITS = {"二波": (580.0, 620.0), "三波": (677.0, 717.0)}
+
+
+def height_deviation_over_10cm(kind, height):
+    design = HEIGHT_DESIGN.get(kind)
+    return design is not None and abs(float(height) - design) > 100
+
+
+def bolt_missing_ratio(splice, connection, missing):
+    denominator = splice + connection + missing
+    return missing / denominator if denominator else None
+
+
+def format_progress(stage, current, total, item=""):
+    stage = str(stage or "").strip()
+    current, total = int(current), int(total)
+    if not stage or total <= 0 or current < 0 or current > total:
+        raise ValueError("进度消息参数无效")
+    suffix = f" {str(item).strip()}" if str(item or "").strip() else ""
+    return f"[progress] {stage} {current}/{total}{suffix}"
+
+
+_PROGRESS_RE = re.compile(
+    r"^\[progress\]\s+(?P<stage>.+?)\s+(?P<current>\d+)/(?P<total>\d+)"
+    r"(?:\s+(?P<item>.*))?$"
+)
+
+
+def parse_progress(message):
+    match = _PROGRESS_RE.match(str(message or "").strip())
+    if not match:
+        return None
+    current, total = int(match.group("current")), int(match.group("total"))
+    if total <= 0 or current > total:
+        return None
+    return {
+        "stage": match.group("stage"),
+        "current": current,
+        "total": total,
+        "item": match.group("item") or "",
+    }
 
 
 def bin_index(kind, height):
@@ -380,13 +493,13 @@ def bin_index(kind, height):
 def collect_records(segments, detail_dir, log=lambda _: None):
     records, excluded = [], Counter()
     files = sorted(Path(detail_dir).glob("*.xlsx"))
-    files = [p for p in files if not p.name.startswith("~$") and "交安设施现场检测" in p.name]
+    files = [p for p in files if not p.name.startswith("~$")]
     if not files:
         raise FileNotFoundError("明细文件夹中未找到交安设施现场检测Excel。")
     for index, path in enumerate(files, 1):
         if path.name.startswith("G210-G210-"):
             continue
-        log(f"解析明细 {index}/{len(files)}：{path.name}")
+        log(format_progress("解析明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
         for row in iter_height_rows(path):
             kind = guardrail_type(row.get("护栏类型"))
@@ -403,10 +516,8 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             station = raw_station if use_raw else electronic_station
             if station is None:
                 continue
-            segment = next(
-                (i for i, item in enumerate(segments) if item["start"] <= station <= item["end"]),
-                None,
-            )
+            route = row.get("路线编号") or row.get("路线") or ""
+            segment = _segment_index(segments, station, route)
             if segment is None:
                 continue
             records.append({
@@ -433,7 +544,7 @@ def collect_records(segments, detail_dir, log=lambda _: None):
 def collect_bolt_records(segments, detail_dir, log=lambda _: None):
     records = []
     files = sorted(Path(detail_dir).glob("*.xlsx"))
-    files = [p for p in files if not p.name.startswith("~$") and "交安设施现场检测" in p.name]
+    files = [p for p in files if not p.name.startswith("~$")]
     if not files:
         raise FileNotFoundError("明细文件夹中未找到交安设施现场检测Excel。")
 
@@ -444,7 +555,7 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
             return 0.0
 
     for index, path in enumerate(files, 1):
-        log(f"解析螺栓明细 {index}/{len(files)}：{path.name}")
+        log(format_progress("解析螺栓明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
         for row in iter_bolt_rows(path):
             basis = "原始桩号" if use_raw else "电子修正桩号"
@@ -453,10 +564,8 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
             station = raw_station if use_raw else electronic_station
             if station is None:
                 continue
-            segment = next(
-                (i for i, item in enumerate(segments) if item["start"] <= station <= item["end"]),
-                None,
-            )
+            route = row.get("路线编号") or row.get("路线") or ""
+            segment = _segment_index(segments, station, route)
             if segment is None:
                 continue
             splice = number(row.get("拼接螺栓数量（颗）"))
@@ -498,6 +607,17 @@ def normalize_direction(value):
     return text.strip()
 
 
+def _segment_index(segments, station, route=""):
+    route = _route(route) if route else ""
+    for index, segment in enumerate(segments):
+        if not segment["start"] <= station <= segment["end"]:
+            continue
+        if route and _route(segment.get("route", "")) != route:
+            continue
+        return index
+    return None
+
+
 def _xlsx_shared_strings(archive):
     if "xl/sharedStrings.xml" not in archive.namelist():
         return []
@@ -529,13 +649,13 @@ def _xlsx_sheet_rows(archive, sheet_name, shared_strings):
 def collect_disease_image_index(disease_dir, log=lambda _: None):
     """只读取病害清单XML关系，建立原始桩号到嵌入图片的轻量索引。"""
     disease_dir = Path(disease_dir)
-    files = sorted(path for path in disease_dir.glob("*.xlsx") if not path.name.startswith("~$") and "病害清单" in path.name)
+    files = sorted(path for path in disease_dir.glob("*.xlsx") if not path.name.startswith("~$"))
     if not files:
         raise FileNotFoundError("病害清单文件夹中未找到病害清单Excel。")
     image_index = {}
     indexed = 0
     for file_number, path in enumerate(files, 1):
-        log(f"索引病害图片 {file_number}/{len(files)}：{path.name}")
+        log(format_progress("索引病害图片", file_number, len(files), path.name))
         with ZipFile(path) as archive:
             shared_strings = _xlsx_shared_strings(archive)
             sheet_names = sorted(
@@ -632,8 +752,8 @@ def read_disease_image(descriptor):
 
 def bolt_missing_rate(splice, connection, missing):
     """螺栓缺失率：缺失数÷（现有拼接数+现有连接数+缺失数）×100%。"""
-    denominator = splice + connection + missing
-    return missing * 100 / denominator if denominator else 0
+    ratio = bolt_missing_ratio(splice, connection, missing)
+    return ratio * 100 if ratio is not None else None
 
 
 def make_bolt_stats(segments, records):
@@ -737,7 +857,8 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
     else:
         log(f"TCI 路径不存在：{pth}")
         return records
-    for fpath in files:
+    for file_number, fpath in enumerate(files, 1):
+        log(format_progress("解析TCI", file_number, len(files), fpath.name))
         try:
             wb = openpyxl.load_workbook(fpath, data_only=True, read_only=True)
         except Exception as e:
@@ -746,14 +867,20 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
         sheet_name = "病害明细表" if "病害明细表" in wb.sheetnames else wb.sheetnames[0]
         ws = wb[sheet_name]
         rows = list(ws.iter_rows(values_only=True))
+        wb.close()
         if not rows:
             continue
         header_row_idx = None
         col_map = {}
+        route_idx = None
         for i, row in enumerate(rows[:6], 1):
             vals = [str(v).strip() if v is not None else "" for v in row]
             if "区域" in vals and "路线编号" in vals:
                 header_row_idx = i
+                route_idx = next(
+                    (idx for idx, value in enumerate(vals) if "路线编号" in value or value == "路线"),
+                    None,
+                )
                 if i < len(rows):
                     sub = [str(v).strip() if v is not None else "" for v in rows[i]]
                     for idx, (h, s) in enumerate(zip(vals, sub)):
@@ -778,6 +905,10 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                 vals = [str(v).strip() if v is not None else "" for v in row]
                 if any("防护设施缺损" in v for v in vals):
                     header_row_idx = i
+                    route_idx = next(
+                        (idx for idx, value in enumerate(vals) if "路线编号" in value or value == "路线"),
+                        None,
+                    )
                     for idx, h in enumerate(vals):
                         if "防护" in h and "轻" in h:
                             col_map[idx] = "light"
@@ -796,6 +927,10 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                     break
         if header_row_idx is None:
             header_row_idx = 1
+        route_value = ""
+        if route_idx is None:
+            route_match = re.search(r"([GSHXY]\d+)", fpath.name, re.IGNORECASE)
+            route_value = route_match.group(1) if route_match else ""
         start = header_row_idx + 1
         if header_row_idx < len(rows) and "轻" in "".join(str(x) for x in rows[header_row_idx] if x is not None):
             start = header_row_idx + 2
@@ -851,7 +986,8 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                 heavy = num_at("heavy")
                 sign = num_at("sign")
                 marking = num_at("marking")
-            seg_idx = next((i for i,s in enumerate(segments) if s["start"] <= station <= s["end"]), None)
+            row_route = vals[route_idx] if route_idx is not None and route_idx < len(vals) else route_value
+            seg_idx = _segment_index(segments, station, row_route)
             if seg_idx is None:
                 continue
             records.append({"segment": seg_idx, "station": station, "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
@@ -880,8 +1016,8 @@ def style_sheet(ws, widths):
             cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.font = Font(bold=True, color="000000")
+        cell.fill = PatternFill("solid", fgColor=GRAY_HEADER_FILL)
     for index, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(index)].width = width
     ws.freeze_panes = "A2"
@@ -921,8 +1057,8 @@ def add_interval_sheets(out_path, summary_path, log=lambda _: None):
                 cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for cell in ws[1]:
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.font = Font(bold=True, color="000000")
+            cell.fill = PatternFill("solid", fgColor=GRAY_HEADER_FILL)
         for col, width in enumerate([9, 18, 14, 23, 19, 19, 19, 19], 1):
             ws.column_dimensions[get_column_letter(col)].width = width
         ws.freeze_panes, ws.sheet_view.showGridLines = "A2", False
@@ -1030,12 +1166,12 @@ def make_excel(
             if has_county:
                 ws.append([
                     sequence, segment.get("county", ""), segment.get("route", "G210"), format_station(segment["start"]), format_station(segment["end"]),
-                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100,
+                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100 if item["rate"] is not None else None,
                 ])
             else:
                 ws.append([
                     sequence, "G210", format_station(segment["start"]), format_station(segment["end"]),
-                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100,
+                    segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100 if item["rate"] is not None else None,
                 ])
         if has_county:
             for cell in ws["J"][1:]:
@@ -1664,12 +1800,56 @@ def add_charts(workbook_path, log=lambda _: None):
     log(f"图表已生成：二波饼图{double_pies}个，三波饼图{triple_pies}个，分类型折线图{line_charts}个。")
 
 
+def _iter_input_filenames(config):
+    """明细/病害/TCI 输入文件名（去临时文件），供区县路由识别。"""
+    names = []
+    for directory in (config.detail_dir, config.disease_dir):
+        try:
+            if directory is not None and Path(directory).is_dir():
+                names.extend(path.name for path in Path(directory).glob("*.xlsx") if not path.name.startswith("~$"))
+        except OSError:
+            continue
+    tci = getattr(config, "tci_path", None) or getattr(config, "tci_xlsx", None)
+    try:
+        if tci is not None:
+            tci = Path(tci)
+            if tci.is_file():
+                names.append(tci.name)
+            elif tci.is_dir():
+                names.extend(path.name for path in tci.glob("*.xlsx") if not path.name.startswith("~$"))
+    except OSError:
+        pass
+    return names
+
+
+def _apply_county_routing(config, segments, county_override, log):
+    """先文件名识区县、再按区县划分情况表过滤对应路线分段；单区县时顶层文件直接用区县命名。"""
+    matched = resolve_report_counties(segments, _iter_input_filenames(config), override=county_override)
+    if not matched:
+        return segments
+    known = []
+    for segment in segments:
+        county = str(segment.get("county") or "").strip()
+        if county and county not in known:
+            known.append(county)
+    if set(matched) < set(known):
+        segments = [s for s in segments if str(s.get("county") or "").strip() in set(matched)]
+        log(f"按文件名识别到区县：{'、'.join(matched)}，仅生成对应区县分段报告。")
+    if not segments:
+        raise ValueError("区县划分情况表中无对应路线分段，已中断。")
+    final = {str(s.get("county") or "").strip() for s in segments} - {""}
+    if len(final) == 1 and not getattr(config, "county", None):
+        config.county = next(iter(final))
+    return segments
+
+
 def generate_statistics_and_report(
     config, log=lambda _: None, generate_charts_first=False,
     process_height=True, process_bolts=False, process_alongline=False, process_tci=False,
-    require_template=True,
+    require_template=True, county_override=None,
 ):
     segments = read_segments(config.summary_xlsx)
+    segments = _apply_county_routing(config, segments, county_override, log)
     height_records = []; height_stats = None; height_duplicates = 0; excluded = Counter()
     bolt_records = []; bolt_stats = None; bolt_duplicates = 0
     disease_image_index = None
@@ -1749,7 +1929,7 @@ def generate_statistics_and_report(
             sub_tci_records = _remap(tci_records)
             sub_out = config.output_dir / county
             sub_out.mkdir(parents=True, exist_ok=True)
-            sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None))
+            sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None), county=county)
             # 复用 make_excel/make_docx 生成子报告
             try:
                 make_excel(sub_cfg, sub_segments, height_stats=sub_height_stats, height_records=sub_height_records, height_duplicates=height_duplicates, excluded=excluded, bolt_stats=sub_bolt_stats, bolt_records=sub_bolt_records, bolt_duplicates=bolt_duplicates, tci_stats=sub_tci_stats, tci_records=sub_tci_records, log=log)
@@ -1770,6 +1950,7 @@ def discover_paths(folder):
     summary = next(iter(folder.rglob("G210采集路段信息汇总.xlsx")), None)
     detail_candidates = []
     disease_candidates = []
+    tci_candidates = []
     for directory in [folder, *[p for p in folder.rglob("*") if p.is_dir()]]:
         detail_count = sum(1 for path in directory.glob("*.xlsx") if "交安设施现场检测" in path.name and "明细" in path.name)
         disease_count = sum(1 for path in directory.glob("*.xlsx") if "交安设施现场检测" in path.name and "病害清单" in path.name)
@@ -1777,9 +1958,12 @@ def discover_paths(folder):
             detail_candidates.append((detail_count, directory))
         if disease_count:
             disease_candidates.append((disease_count, directory))
+        if directory.name and "TCI" in directory.name:
+            tci_candidates.append((sum(1 for path in directory.glob("*.xlsx")), directory))
     detail = max(detail_candidates, default=(0, None))[1]
     disease = max(disease_candidates, default=(0, None))[1]
-    return summary, detail, disease
+    tci = max(tci_candidates, default=(0, None))[1]
+    return summary, detail, disease, tci
 
 
 class GuardrailApp(tk.Tk):
@@ -1797,7 +1981,7 @@ class GuardrailApp(tk.Tk):
         self.minsize(860, 620)
         self.queue = Queue()
         self.running = False
-        self.vars = {name: tk.StringVar() for name in ("project", "summary", "detail", "disease", "output")}
+        self.vars = {name: tk.StringVar() for name in ("project", "summary", "detail", "disease", "tci", "output")}
         self.template_name = tk.StringVar(value=next(iter(BUILTIN_REPORT_TEMPLATES)))
         self.item_vars = {
             "沿线设施": tk.BooleanVar(value=False),
@@ -1865,10 +2049,11 @@ class GuardrailApp(tk.Tk):
         if not folder:
             return
         self.vars["project"].set(folder)
-        summary, detail, disease = discover_paths(folder)
+        summary, detail, disease, tci = discover_paths(folder)
         if summary: self.vars["summary"].set(str(summary))
         if detail: self.vars["detail"].set(str(detail))
         if disease: self.vars["disease"].set(str(disease))
+        if tci: self.vars["tci"].set(str(tci))
         self.vars["output"].set(str(summary.parent if summary else Path(folder)))
         self._append_log("已导入项目文件夹并自动识别相关文件。")
 
@@ -2021,11 +2206,7 @@ def _safe_excel_value(value):
 
 def _guardrail_type(value):
     text = str(value or "")
-    if any(word in text for word in ("二波", "两波", "双波")):
-        return "二波"
-    if "三波" in text:
-        return "三波"
-    return text.strip()
+    return guardrail_type(value) or text.strip()
 
 
 def _station_first(value):
@@ -2348,7 +2529,7 @@ class GuangdongInputScanner:
                     result[kind].extend(partial[kind])
                 result["issues"].extend(partial["issues"])
                 if done % 10 == 0 or done == len(files):
-                    self.log(f"已识别文件 {done}/{len(files)}")
+                    self.log(format_progress("扫描资料", done, len(files), futures[future].name))
         return result
 
 
@@ -2419,7 +2600,7 @@ def detect_guangdong_data_folders(project_dir):
 
 
 class GuangdongStatistics:
-    HEIGHT_LIMITS = {"二波": (580, 620), "三波": (677, 717)}
+    HEIGHT_LIMITS = HEIGHT_LIMITS
 
     @classmethod
     def height_summary(cls, rows):
@@ -2429,7 +2610,7 @@ class GuangdongStatistics:
             low, high = cls.HEIGHT_LIMITS[kind]
             values = [float(r["height"]) for r in selected]
             qualified = sum(low <= v <= high for v in values)
-            over = sum(v < low - 100 or v > high + 100 for v in values)
+            over = sum(height_deviation_over_10cm(kind, v) for v in values)
             result[kind] = {"valid_count": len(values), "average": sum(values)/len(values) if values else None,
                             "qualified_count": qualified, "qualified_rate": qualified/len(values) if values else None,
                             "over_10cm_count": over}
@@ -2439,8 +2620,8 @@ class GuangdongStatistics:
     def bolt_summary(rows):
         totals = {k: sum(float(r.get(k, 0) or 0) for r in rows) for k in ("splice","splice_missing","connection","connection_missing")}
         missing = totals["splice_missing"] + totals["connection_missing"]
-        denominator = totals["splice"] + totals["connection"] + missing
-        totals.update(missing_total=missing, missing_rate=missing/denominator if denominator else None)
+        totals.update(missing_total=missing,
+                      missing_rate=bolt_missing_ratio(totals["splice"], totals["connection"], missing))
         return totals
 
     @staticmethod
@@ -2618,6 +2799,11 @@ class ManualAutoComparator:
 
 
 class GuangdongChapterWriter:
+    @classmethod
+    def _format_config(cls):
+        from backend import minimal_docx
+        return minimal_docx._current_format_config()
+
     @staticmethod
     def _fmt(value, digits=2):
         if value is None or value == "": return "—"
@@ -2633,16 +2819,18 @@ class GuangdongChapterWriter:
         text=str(value or "—")
         return text if text.endswith("段") or text == "—" else text + "段"
 
-    @staticmethod
-    def _add_table(doc, headers, rows, merge=None):
+    @classmethod
+    def _add_table(cls, doc, headers, rows, merge=None):
         """表格：所有单元格文字无缩进、水平居中、垂直居中；表头加粗仿宋_GB2312。
         merge={起始列: 跨列数}：两级表头——第一行主表头（横向合并），其下列子表头；单列表头纵向合并两行。"""
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
+        from backend import minimal_docx
+        format_config = cls._format_config()["table"]
 
         def _style(cell, bold=False):
             for p in cell.paragraphs:
-                p.alignment=1  # 水平居中
+                minimal_docx._apply_paragraph(p, format_config, clear_indent=True)
                 pPr=p._p.get_or_add_pPr()
                 ind=pPr.find(qn('w:ind'))
                 if ind is None:
@@ -2654,7 +2842,7 @@ class GuangdongChapterWriter:
                     vAlign=OxmlElement('w:vAlign'); tcPr.append(vAlign)
                 vAlign.set(qn('w:val'),'center')  # 垂直居中
                 for run in p.runs:
-                    run.bold=bold; run.font.name="仿宋_GB2312"
+                    minimal_docx._apply_run(run, format_config, bold=bold and format_config["header_bold"])
 
         if merge:
             # 两级表头：merge={列号: (主表头名, 跨列数)}，原生 XML 构建（gridSpan/vMerge），物理列 = 逻辑列 - Σ(跨列数-1)
@@ -2678,12 +2866,15 @@ class GuangdongChapterWriter:
                 if span: sp=OxmlElement('w:gridSpan'); sp.set(qn('w:val'),str(span)); tcPr.append(sp)
                 if vmerge is not None:
                     vm=OxmlElement('w:vMerge'); vm.set(qn('w:val'),vmerge) if vmerge!="continue" else None; tcPr.append(vm)
+                v_align=OxmlElement('w:vAlign'); v_align.set(qn('w:val'),'center'); tcPr.append(v_align)
                 tc.append(tcPr); par=OxmlElement('w:p'); r=OxmlElement('w:r')
                 rPr=OxmlElement('w:rPr')
-                if bold: b=OxmlElement('w:b'); rPr.append(b)
-                fonts=OxmlElement('w:rFonts'); fonts.set(qn('w:eastAsia'),"仿宋_GB2312"); fonts.set(qn('w:ascii'),"Times New Roman"); fonts.set(qn('w:hAnsi'),"Times New Roman"); rPr.append(fonts)
+                if bold and format_config["header_bold"]: b=OxmlElement('w:b'); rPr.append(b)
+                fonts=OxmlElement('w:rFonts'); fonts.set(qn('w:eastAsia'),format_config["east_asia"]); fonts.set(qn('w:ascii'),format_config["latin"]); fonts.set(qn('w:hAnsi'),format_config["latin"]); rPr.append(fonts)
+                pPr=OxmlElement('w:pPr')
+                jc=OxmlElement('w:jc'); jc.set(qn('w:val'),format_config["alignment"] if format_config["alignment"] != "justify" else "center"); pPr.append(jc)
                 r.append(rPr)
-                t=OxmlElement('w:t'); t.text=str(text); r.append(t); par.append(r); tc.append(par)
+                t=OxmlElement('w:t'); t.text=str(text); r.append(t); par.append(pPr); par.append(r); tc.append(par)
                 return tc
             top=OxmlElement('w:tr'); sub=OxmlElement('w:tr')
             i=0
@@ -2715,39 +2906,34 @@ class GuangdongChapterWriter:
             for index,value in enumerate(row):
                 cells[index].text=str(value)
                 _style(cells[index])
+        if not format_config["allow_row_break"]:
+            for row in table.rows:
+                tr_pr = row._tr.get_or_add_trPr()
+                tr_pr.append(OxmlElement("w:cantSplit"))
         return table
 
     @classmethod
     def _body(cls, doc, text):
-        """正文段落：仿宋_GB2312五号，首行缩进2字符（firstLineChars=200）。"""
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-        paragraph=doc.add_paragraph(text)
-        pPr=paragraph._p.get_or_add_pPr()
-        ind=pPr.find(qn('w:ind'))
-        if ind is None:
-            ind=OxmlElement('w:ind'); pPr.append(ind)
-        ind.set(qn('w:firstLineChars'),'200')
-        ind.set(qn('w:firstLine'),'420')  # 备用磅值：2字符×10.5pt≈21pt=420twips
+        from backend import minimal_docx
+        format_config = cls._format_config()["body"]
+        paragraph = doc.add_paragraph()
+        minimal_docx._apply_paragraph(paragraph, format_config)
+        run = paragraph.add_run(text)
+        minimal_docx._apply_run(run, format_config)
         return paragraph
 
     @classmethod
     def _indent_existing_body(cls, doc):
-        """给已有正文段落（模板遗留正文）补首行缩进2字符；跳过标题与空段。"""
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
+        """给已有正文段落补模板配置的首行缩进；跳过标题、题注与空段。"""
+        from backend import minimal_docx
+        format_config = cls._format_config()["body"]
         for paragraph in doc.paragraphs:
             if not paragraph.text.strip():
                 continue
             style=paragraph.style.name if paragraph.style is not None else ""
-            if style.startswith("Heading"):
+            if style.startswith("Heading") or style == "Caption":
                 continue
-            pPr=paragraph._p.get_or_add_pPr()
-            ind=pPr.find(qn('w:ind'))
-            if ind is None:
-                ind=OxmlElement('w:ind'); pPr.append(ind)
-            ind.set(qn('w:firstLineChars'),'200')
-            ind.set(qn('w:firstLine'),'420')
+            minimal_docx._apply_paragraph(paragraph, format_config)
 
     @classmethod
     def _remove_template_placeholder(cls, doc):
@@ -2866,31 +3052,19 @@ class GuangdongChapterWriter:
 
     @classmethod
     def _apply_heading_format(cls, paragraph, level, main_title=False):
-        from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
-        from docx.shared import Pt, RGBColor
-        level = max(1, int(level or 1))
-        pPr = paragraph._p.get_or_add_pPr()
-        outline = pPr.find(qn("w:outlineLvl"))
-        if outline is None:
-            outline = OxmlElement("w:outlineLvl")
-            pPr.append(outline)
-        outline.set(qn("w:val"), str(level - 1))
-        paragraph.alignment = 0
-        cls._clear_paragraph_indent(paragraph)
-        east_asia = "黑体" if level in (1, 2, 3) else "仿宋_GB2312"
-        size = 16 if main_title else {1: 16, 2: 15, 3: 14, 4: 12, 5: 10.5}.get(level, 10.5)
+        from backend import minimal_docx
+        level = max(1, min(int(level or 1), 5))
+        heading_config = cls._format_config()["heading"][str(level)]
+        minimal_docx._apply_paragraph(paragraph, heading_config, clear_indent=True)
+        minimal_docx._warn(paragraph, heading_config["outline_level"] + 1)
         for run in paragraph.runs:
-            run.bold = False
-            run.italic = False
-            run.font.size = Pt(size)
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            cls._set_run_fonts(run, east_asia)
+            minimal_docx._apply_run(run, heading_config)
 
     @classmethod
     def _heading(cls, doc, text, level):
+        level = max(1, min(int(level or 1), 5))
         paragraph = doc.add_paragraph()
-        if 1 <= level <= 5 and f"Heading {level}" in doc.styles:
+        if f"Heading {level}" in doc.styles:
             paragraph.style = doc.styles[f"Heading {level}"]
         paragraph.add_run(text)
         cls._apply_heading_format(paragraph, level)
@@ -2938,46 +3112,13 @@ class GuangdongChapterWriter:
 
     @staticmethod
     def _set_run_fonts(run, east_asia="仿宋_GB2312", latin="Times New Roman"):
-        from docx.oxml.ns import qn
-        rPr=run._element.get_or_add_rPr()
-        rFonts=rPr.find(qn('w:rFonts'))
-        if rFonts is None:
-            rFonts=rPr.makeelement(qn('w:rFonts'),{}); rPr.append(rFonts)
-        rFonts.set(qn('w:eastAsia'), east_asia)
-        rFonts.set(qn('w:ascii'), latin)
-        rFonts.set(qn('w:hAnsi'), latin)
+        from backend import minimal_docx
+        minimal_docx._set_run_fonts(run, east_asia, latin)
 
     @classmethod
     def _configure_heading_styles(cls, doc):
-        from docx.enum.style import WD_STYLE_TYPE
-        from docx.oxml import OxmlElement
-        if "Caption" not in doc.styles:
-            doc.styles.add_style("Caption", WD_STYLE_TYPE.PARAGRAPH)
-        from docx.oxml.ns import qn
-        from docx.shared import Pt, RGBColor
-        for level in range(1, 6):
-            name = f"Heading {level}"
-            if name not in doc.styles:
-                style = doc.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
-            else:
-                style = doc.styles[name]
-            east_asia = "黑体" if level in (1, 2, 3) else "仿宋_GB2312"
-            style.font.name = east_asia
-            style.font.size = Pt({1: 16, 2: 15, 3: 14, 4: 12, 5: 10.5}[level])
-            style.font.bold = False
-            style.font.color.rgb = RGBColor(0, 0, 0)
-            style.paragraph_format.left_indent = Pt(0)
-            style.paragraph_format.right_indent = Pt(0)
-            style.paragraph_format.first_line_indent = Pt(0)
-            style.paragraph_format.alignment = 0
-            rPr = style._element.get_or_add_rPr()
-            rFonts = rPr.find(qn("w:rFonts"))
-            if rFonts is None:
-                rFonts = OxmlElement("w:rFonts")
-                rPr.append(rFonts)
-            rFonts.set(qn("w:eastAsia"), east_asia)
-            rFonts.set(qn("w:ascii"), "Times New Roman")
-            rFonts.set(qn("w:hAnsi"), "Times New Roman")
+        from backend import minimal_docx
+        minimal_docx.configure_document(doc, cls._format_config())
 
     @classmethod
     def _format_existing_headings(cls, doc):
@@ -3000,18 +3141,16 @@ class GuangdongChapterWriter:
 
     @classmethod
     def _format_chart_caption(cls, paragraph):
-        from docx.shared import Pt, RGBColor
-        paragraph.alignment = 1
-        cls._clear_paragraph_indent(paragraph)
+        from backend import minimal_docx
+        format_config = cls._format_config()["caption"]
+        minimal_docx._apply_paragraph(paragraph, format_config, clear_indent=True)
         for run in paragraph.runs:
-            run.bold = False
-            run.italic = False
-            run.font.size = Pt(10.5)
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            cls._set_run_fonts(run, "黑体")
+            minimal_docx._apply_run(run, format_config, bold=False)
 
     @classmethod
     def _format_all_run_fonts(cls, doc):
+        from backend import minimal_docx
+        format_config = cls._format_config()
         main_prefix = "五、交通安全设施技术状况检测评价"
         for paragraph in doc.paragraphs:
             style = paragraph.style.name if paragraph.style is not None else ""
@@ -3021,17 +3160,23 @@ class GuangdongChapterWriter:
             is_heading = is_main or level is not None or style.startswith("Heading")
             if style == "Caption":
                 cls._format_chart_caption(paragraph)
+            elif style == "TOC Heading":
+                minimal_docx._apply_paragraph(paragraph, format_config["heading"]["1"], clear_indent=True)
+                for run in paragraph.runs:
+                    minimal_docx._apply_run(run, format_config["heading"]["1"])
             elif is_heading:
                 cls._apply_heading_format(paragraph, level or 1, main_title=is_main)
             else:
+                minimal_docx._apply_paragraph(paragraph, format_config["body"])
                 for run in paragraph.runs:
-                    cls._set_run_fonts(run, "仿宋_GB2312")
+                    minimal_docx._apply_run(run, format_config["body"])
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for paragraph in cell.paragraphs:
+                        minimal_docx._apply_paragraph(paragraph, format_config["table"], clear_indent=True)
                         for run in paragraph.runs:
-                            cls._set_run_fonts(run, "仿宋_GB2312")
+                            minimal_docx._apply_run(run, format_config["table"])
 
     @staticmethod
     def _alpha_label(index):
@@ -3119,16 +3264,24 @@ class GuangdongChapterWriter:
 
     @classmethod
     def write(cls,city,bundle,output_dir,template,thresholds):
-        from docx import Document
-        from docx.shared import Pt
+        from backend import markdown_skeleton, minimal_docx
         city=_safe_city_component(city)
         template=Path(template)
         if not template.is_file(): raise FileNotFoundError(f"Word模板不存在：{template}")
         if template.suffix.lower() != ".md":
             raise ValueError(f"仅支持 Markdown 模板：{template}，请使用 .md 模板。")
-        from backend import markdown_skeleton
+        template_data = markdown_skeleton.read_template(template)
+        with minimal_docx.format_context(template_data.config):
+            return cls._write_document(city,bundle,output_dir,template,thresholds,template_data)
+
+    @classmethod
+    def _write_document(cls,city,bundle,output_dir,template,thresholds,template_data):
+        from docx import Document
+        from docx.shared import Pt
+        from backend import minimal_docx
         doc = Document()
-        blocks = markdown_skeleton.read_blocks(template)
+        cls._configure_heading_styles(doc)
+        blocks = template_data.blocks
         # 渲染完整骨架：标题/正文/表格/图片，支持 {{地市}} 占位与显式锚点（见 minimal_docx 锚点文档）。
         # 若模板包含 <!-- inject:* --> 标记，动态章节将在对应位置注入；否则追加末尾（兼容旧模板）。
         def _skeleton_picture(caption: str):
@@ -3144,16 +3297,14 @@ class GuangdongChapterWriter:
 
         markdown_skeleton.render_skeleton(
             doc, blocks,
-            heading=lambda text, level: cls._heading(doc, text, min(level, 2)),
+            heading=lambda text, level: cls._heading(doc, text, level),
             body=lambda text: cls._body(doc, text),
             table=lambda headers, rows, shading: cls._add_table(doc, headers, rows),
             picture=_skeleton_picture,
+            toc=lambda: minimal_docx.add_toc(doc, template_data.config["toc"]),
             replace={"{{地市}}": city},
         )
         chapter_no = 1
-        for style_name in ("Normal","Body Text"):
-            if style_name in doc.styles:
-                doc.styles[style_name].font.name="仿宋_GB2312"; doc.styles[style_name].font.size=Pt(10.5)
         caption_counts={"figure":0,"table":0}
 
         def _caption(kind,title):

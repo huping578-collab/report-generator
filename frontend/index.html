@@ -289,6 +289,8 @@
     }
     .path-field::placeholder { color: #526873; opacity: 1; }
     .path-field:not(:placeholder-shown) { color: var(--ink); background: #fff; }
+    select.path-field { color: var(--ink); background: #fff; cursor: pointer; }
+    #countySelect { grid-column: 2 / 4; }
 
     .button {
       min-height: 42px;
@@ -389,9 +391,11 @@
     .run-stage.is-done::after { border-color: var(--accent); background: var(--accent-soft); }
 
     .log-panel {
-      min-height: 170px;
-      flex: 1;
-      overflow: auto;
+      height: 220px;
+      min-height: 0;
+      flex: 0 0 220px;
+      overflow-x: hidden;
+      overflow-y: scroll;
       padding: 13px;
       border: 1px solid var(--line);
       border-radius: var(--radius-small);
@@ -438,7 +442,7 @@
       .run-stage { padding: 27px 8px 0 0; }
       .run-stage:not(:last-child)::before { top: 10px; left: 15px; right: -11px; bottom: auto; width: auto; height: 1px; }
       .run-stage::after { top: 5px; left: 7px; }
-      .log-panel { min-height: 150px; }
+      .log-panel { height: 190px; flex-basis: 190px; }
     }
 
     @media (max-width: 760px) {
@@ -530,7 +534,7 @@
       <section class="section" aria-labelledby="sourceTitle">
         <div class="section-head">
           <h2 id="sourceTitle">资料来源</h2>
-          <p id="sourceHint">5 项输入</p>
+          <p id="sourceHint">6 项必填，1 项可选</p>
         </div>
         <div class="form-stack" id="sourceForm">
           <div class="file-row">
@@ -552,6 +556,17 @@
             <div class="file-label"><label for="diseasePath">病害清单文件夹</label><small>用于匹配螺栓缺失图片</small></div>
             <input class="path-field" id="diseasePath" name="diseasePath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
             <button class="button choose-button" type="button" data-target="diseasePath">选择文件夹</button>
+          </div>
+          <div class="file-row only-cq">
+            <div class="file-label"><label for="tciPath">TCI数据文件夹</label><small>沿线设施技术状况病害明细</small></div>
+            <input class="path-field" id="tciPath" name="tciPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
+            <button class="button choose-button" type="button" data-target="tciPath">选择文件夹</button>
+          </div>
+          <div class="file-row only-cq">
+            <div class="file-label"><label for="countySelect">区县</label><small>文件名未识别到时手动选择</small></div>
+            <select class="path-field" id="countySelect" name="countySelect" data-optional="true">
+              <option value="">自动识别（推荐）</option>
+            </select>
           </div>
 
           <div class="file-row only-gd" hidden>
@@ -597,8 +612,8 @@
       <section class="section" aria-labelledby="outputTitle">
         <div class="section-head"><h2 id="outputTitle">预计输出</h2><p>路径随项目变化</p></div>
         <div class="output-strip only-cq">
-          <div class="output-item"><span>统计工作簿</span><strong>重庆G210护栏统计.xlsx</strong></div>
-          <div class="output-item"><span>检测报告</span><strong>重庆G210交安设施检测报告.docx</strong></div>
+          <div class="output-item"><span>统计工作簿</span><strong>重庆市XX区/县交安设施检测报告.xlsx</strong></div>
+          <div class="output-item"><span>检测报告</span><strong>重庆市XX区/县交安设施检测报告.docx</strong></div>
         </div>
         <div class="output-strip only-gd" hidden>
           <div class="output-item"><span>城市报告</span><strong>各地市在役公路检测评价报告第五部分.docx</strong></div>

@@ -24,6 +24,7 @@
   const stages = [...document.querySelectorAll('.run-stage')];
   const sideFlow = [...document.querySelectorAll('.flow-step')];
   const environmentStatus = document.getElementById('environmentStatus');
+  let logAutoFollow = true;
 
   const stageLabels = ['正在校验资料', '正在识别数据', '正在统计生成', '正在保存结果'];
 
@@ -47,6 +48,7 @@
   }
 
   function addLog(message, type = '') {
+    const shouldFollow = logAutoFollow;
     const line = document.createElement('div');
     const time = document.createElement('span');
     const content = document.createElement('span');
@@ -57,8 +59,18 @@
     content.textContent = String(message);
     line.append(time, content);
     logPanel.appendChild(line);
-    logPanel.scrollTop = logPanel.scrollHeight;
+    if (shouldFollow) {
+      logPanel.scrollTop = logPanel.scrollHeight;
+      logAutoFollow = true;
+    }
   }
+
+  function updateLogFollow() {
+    logAutoFollow = logPanel.scrollHeight - logPanel.clientHeight - logPanel.scrollTop <= 8;
+  }
+
+  logPanel.addEventListener('scroll', updateLogFollow);
+  updateLogFollow();
 
   function visibleRequiredFields() {
     return fields.filter((field) => {
@@ -119,7 +131,7 @@
       ? '选择检测资料所在位置。系统将生成统计工作簿和第五部分检测报告。'
       : '按地市扫描标线与护栏数据，生成评价报告、图表工作簿和人工复核对比。';
     document.getElementById('sourceHint').textContent = template === 'cq'
-      ? '5 项输入'
+      ? '6 项必填，1 项可选'
       : '4 项必填，2 项可选，3 项阈值';
     addLog(`已切换至${template === 'cq' ? '重庆' : '广东'}项目模板`);
     updateConfigStatus();
@@ -127,9 +139,32 @@
 
   function applyDetectedPaths(detected) {
     Object.entries(detected || {}).forEach(([key, value]) => {
+      if (key === 'countyOptions') return;
       const field = document.getElementById(key);
       if (field && value) field.value = value;
     });
+    if (detected && Array.isArray(detected.countyOptions)) refreshCountyOptions(detected.countyOptions);
+  }
+
+  function refreshCountyOptions(list) {
+    const select = document.getElementById('countySelect');
+    if (!select) return;
+    const current = select.value;
+    select.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = '自动识别（推荐）';
+    select.appendChild(auto);
+    (list || []).forEach((county) => {
+      const option = document.createElement('option');
+      option.value = county;
+      option.textContent = county;
+      select.appendChild(option);
+    });
+    if (current && [...select.options].some((option) => option.value === current)) {
+      select.value = current;
+    }
+    if ((list || []).length) addLog(`已识别区县候选：${list.join('、')}`);
   }
 
   async function choosePath(button) {
