@@ -2,15 +2,17 @@
 
 A Markdown template (templates/重庆项目报告模板.md) declares the report
 skeleton (headings, static body texts, tables). Dynamic data sections
-(overview table, height/bolt statistics, charts, conclusions) are injected at
-anchor headings; when an anchor is absent the section is appended at the end.
-Requires a Markdown skeleton; explicit anchors <!-- inject:... --> are preferred over keyword fallback.
+(overview table, tci/height/bolt statistics, charts, conclusions) are injected
+ONLY at explicit anchors <!-- inject:... -->; headings never trigger injection
+(Q2: 2.3.x 等静态标题不得被误作锚点吞掉). When an anchor is absent the section
+is appended at the end in canonical chapter order. Requires a Markdown skeleton.
 """
 
 from __future__ import annotations
 
 import math
 import re
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -211,6 +213,12 @@ def _ensure_heading_numbering(doc):
         indent.set(qn("w:hanging"), "0")
         p_pr.append(indent)
         lvl.append(p_pr)
+        # T9：编号符号直接染黑（Word 缺省继承蓝色时 1./1.1/1.1.1 渲染蓝）；标题汉字 run 本身已黑，不动。
+        r_pr = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), "000000")
+        r_pr.append(color)
+        lvl.append(r_pr)
         abstract.append(lvl)
     # numbering.xml 要求 abstractNum 位于 num 之前
     first_num = next((i for i, child in enumerate(numbering) if child.tag == qn("w:num")), len(numbering))
@@ -246,6 +254,22 @@ def _heading(doc, text, level):
         text = _LEADING_NUMBER_RE.sub("", str(text), count=1)
     run = paragraph.add_run(text)
     _apply_run(run, style_config)
+    # 目录收集：渲染顺序=文档顺序，编号与多级列表一致
+    toc_max = int(_current_format_config()["toc"]["max_level"])
+    if level <= toc_max:
+        counters = getattr(doc, "_toc_counters", None)
+        if counters is None:
+            counters = [0, 0, 0, 0, 0]
+            doc._toc_counters = counters
+        counters[level - 1] += 1
+        for deeper in range(level, 5):
+            counters[deeper] = 0
+        number = ".".join(str(c) for c in counters[:level])
+        entries = getattr(doc, "_toc_entries", None)
+        if entries is None:
+            entries = []
+            doc._toc_entries = entries
+        entries.append((number, str(text)))
     return paragraph
 
 
@@ -267,6 +291,16 @@ def _caption(doc, prefix, number, title):
     paragraph = doc.add_paragraph()
     _apply_paragraph(paragraph, style_config, clear_indent=True)
     run = paragraph.add_run(f"{prefix}{number} {title}")
+    _apply_run(run, style_config)
+    return paragraph
+
+
+def _caption_text(doc, text):
+    """整段表题/图题文本（如模板中的“表2.1-1 人员组织情况”）按 caption 样式渲染。"""
+    style_config = _current_format_config()["caption"]
+    paragraph = doc.add_paragraph()
+    _apply_paragraph(paragraph, style_config, clear_indent=True)
+    run = paragraph.add_run(text)
     _apply_run(run, style_config)
     return paragraph
 
@@ -322,41 +356,279 @@ def _add_toc(doc, toc_config=None):
     return add_toc(doc, toc_config)
 
 
-def _cover_paragraphs(doc, spec: str) -> None:
-    """按参考 Word 模板渲染封面：| 分隔 8 段，含主标题、城市、编号、单位与日期。"""
+def _populate_toc_cache(doc):
+    """把收集到的标题条目写入 TOC 域的缓存结果（separate 与 end 之间）。
+
+    updateFields 关闭（防 WPS/Word 弹"域可能引用其他文件"）时，Word 不会自动更新
+    目录；预填充缓存让目录打开即显示。页码写占位 0，交付前可用 Word 更新目录固化
+    （见 work/finalize_toc.py）。
+    """
+    entries = getattr(doc, "_toc_entries", None)
+    if not entries:
+        return
+    field_run = None
+    for paragraph in doc.paragraphs:
+        for run in paragraph.runs:
+            instrs = run._r.findall(qn("w:instrText"))
+            if any((t.text or "").strip().startswith("TOC") for t in instrs):
+                field_run = run._r
+                break
+        if field_run is not None:
+            break
+    if field_run is None:
+        return
+    children = list(field_run)
+    sep_idx = end_idx = None
+    for index, child in enumerate(children):
+        if child.tag == qn("w:fldChar") and child.get(qn("w:fldCharType")) == "separate":
+            sep_idx = index
+        elif child.tag == qn("w:fldChar") and child.get(qn("w:fldCharType")) == "end":
+            end_idx = index
+    if sep_idx is None or end_idx is None or end_idx <= sep_idx:
+        return
+    end_element = children[end_idx]
+    body_font = _current_format_config()["body"]
+
+    def _cache_run(text: str) -> OxmlElement:
+        r = OxmlElement("w:r")
+        r_pr = OxmlElement("w:rPr")
+        r_fonts = OxmlElement("w:rFonts")
+        r_fonts.set(qn("w:ascii"), "Times New Roman")
+        r_fonts.set(qn("w:hAnsi"), "Times New Roman")
+        r_fonts.set(qn("w:eastAsia"), body_font["east_asia"])
+        r_pr.append(r_fonts)
+        sz = OxmlElement("w:sz")
+        sz.set(qn("w:val"), "21")
+        r_pr.append(sz)
+        r.append(r_pr)
+        t = OxmlElement("w:t")
+        t.set(qn("xml:space"), "preserve")
+        t.text = text
+        r.append(t)
+        return r
+
+    for number, text in entries:
+        end_element.addprevious(_cache_run(f"{number} {text}"))
+        end_element.addprevious(_cache_run("\t"))
+        end_element.addprevious(_cache_run("0"))
+    # 目录行制表位：右对齐点线引导，对齐正文宽度
+    toc_paragraph = field_run.getparent()
+    p_pr = toc_paragraph.find(qn("w:pPr"))
+    if p_pr is None:
+        p_pr = OxmlElement("w:pPr")
+        toc_paragraph.insert(0, p_pr)
+    tabs = OxmlElement("w:tabs")
+    tab = OxmlElement("w:tab")
+    tab.set(qn("w:val"), "right")
+    tab.set(qn("w:leader"), "dot")
+    tab.set(qn("w:pos"), "9026")
+    tabs.append(tab)
+    p_pr.append(tabs)
+
+
+def _report_number_from_cover(spec_text: str) -> str:
+    """封面“报告编号：BG-2026-”→页眉右侧变量“BG-2026-”（去“报告编号：”标签前缀）。"""
+    text = str(spec_text or "").strip()
+    for sep in ("：", ":"):
+        label, found, value = text.partition(sep)
+        if found and "报告编号" in label:
+            return value.strip()
+    return text
+
+
+_MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+
+def _m_elem(tag, text=None):
+    element = ET.Element("{%s}%s" % (_MATH_NS, tag))
+    if text is not None:
+        run = ET.SubElement(element, "{%s}r" % _MATH_NS)
+        t = ET.SubElement(run, "{%s}t" % _MATH_NS)
+        t.text = text
+    return element
+
+
+def _math_run(text):
+    """创建直接的 m:r/m:t，避免生成无效的嵌套 m:r。"""
+    run = ET.Element("{%s}r" % _MATH_NS)
+    t = ET.SubElement(run, "{%s}t" % _MATH_NS)
+    t.text = text
+    return run
+
+
+def _tci_formula_omath():
+    """附件模板 2.3.1 的可编辑 TCI 公式（不重复输出纯文本公式）。"""
+    omath = _m_elem("oMath")
+    omath.append(_math_run("TCI="))
+    nary = ET.SubElement(omath, "{%s}nary" % _MATH_NS)
+    nary_pr = ET.SubElement(nary, "{%s}naryPr" % _MATH_NS)
+    chr_el = ET.SubElement(nary_pr, "{%s}chr" % _MATH_NS)
+    chr_el.set("{%s}val" % _MATH_NS, "∑")
+    lim_loc = ET.SubElement(nary_pr, "{%s}limLoc" % _MATH_NS)
+    lim_loc.set("{%s}val" % _MATH_NS, "undOvr")
+    nary.append(_m_elem("sub", "i=1"))
+    upper = ET.SubElement(nary, "{%s}sup" % _MATH_NS)
+    i_zero = ET.SubElement(upper, "{%s}sSub" % _MATH_NS)
+    i_zero.append(_m_elem("e", "i"))
+    i_zero.append(_m_elem("sub", "0"))
+    term = ET.SubElement(nary, "{%s}e" % _MATH_NS)
+    w_sub = ET.SubElement(term, "{%s}sSub" % _MATH_NS)
+    w_sub.append(_m_elem("e", "w"))
+    w_sub.append(_m_elem("sub", "i"))
+    omath.append(_math_run("(100−"))
+    gd_sub = ET.SubElement(omath, "{%s}sSub" % _MATH_NS)
+    gd_sub.append(_m_elem("e", "GD"))
+    gd_sub.append(_m_elem("sub", "iTCI"))
+    omath.append(_math_run(")/0.7"))
+    return omath
+
+
+def _subscript_omath(base, subscript):
+    """生成可编辑下标公式，如 GD_iTCI、w_i、i_0。"""
+    omath = _m_elem("oMath")
+    scripted = ET.SubElement(omath, "{%s}sSub" % _MATH_NS)
+    scripted.append(_m_elem("e", base))
+    scripted.append(_m_elem("sub", subscript))
+    return omath
+
+
+def _append_formula_paragraph(doc, omath, *, prefix="", suffix="", centered=False):
+    """追加可编辑 OMML；可附加与附件模板完全一致的前后文字。"""
+    from lxml import etree as lxml_etree
+
+    ET.register_namespace("m", _MATH_NS)
+    paragraph = doc.add_paragraph()
+    style_config = _current_format_config()["body"]
+    _apply_paragraph(paragraph, style_config, clear_indent=centered)
+    if centered:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if prefix:
+        run = paragraph.add_run(prefix)
+        _apply_run(run, style_config)
+    paragraph._p.append(lxml_etree.fromstring(ET.tostring(omath)))
+    if suffix:
+        run = paragraph.add_run(suffix)
+        _apply_run(run, style_config)
+    return paragraph
+
+
+def _cover_top_rule(doc) -> None:
+    """封面顶部横线（base.pdf 基准）：空段落 + 段落下框线。"""
+    paragraph = doc.add_paragraph()
+    _apply_paragraph(
+        paragraph,
+        {**_current_format_config()["body"], "alignment": "center", "first_line_chars": 0},
+        clear_indent=True,
+    )
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "9")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+    p_bdr.append(bottom)
+    p_pr.append(p_bdr)
+
+
+def _highlight_yellow(run) -> None:
+    """run 加黄色高亮（基准封面：报告编号值/项目名称值/左下黄块）。"""
+    r_pr = run._element.get_or_add_rPr()
+    highlight = OxmlElement("w:highlight")
+    highlight.set(qn("w:val"), "yellow")
+    r_pr.append(highlight)
+
+
+def _cover_paragraphs(doc, spec: str) -> str:
+    """按参考 Word 模板渲染封面：| 分隔 8 段，含主标题、城市、编号、单位与日期。
+
+    返回报告编号变量（供页眉右侧使用）。版式对齐 base.pdf 基准：顶部横线、
+    编号/项目名黄高亮、项目名下划线填空行、公司/日期 16pt 下沉、左下黄块、固定空段数。
+    """
     parts = [p.strip() for p in spec.split("|")]
     if len(parts) != 8:
         raise ValueError(f"封面标记需要 8 段（| 分隔）：{spec}")
     body_font = dict(_current_format_config()["body"])
     bold_center = {**body_font, "alignment": "center", "bold": True, "first_line_chars": 0}
-    h1_font = dict(_current_format_config()["heading"]["1"])
 
-    def _para(text, style_config):
+    def _para(text, style_config, highlight=False):
         paragraph = doc.add_paragraph()
         _apply_paragraph(paragraph, style_config, clear_indent=True)
         run = paragraph.add_run(text)
         _apply_run(run, style_config)
+        if highlight:
+            _highlight_yellow(run)
         return paragraph
 
-    # 主标题两行：22pt 黑体加粗居中
-    title_font = {**bold_center, "east_asia": "黑体", "latin": "黑体", "size_pt": 22, "line_spacing": 1.5}
+    def _blank(style_config):
+        paragraph = doc.add_paragraph()
+        _apply_paragraph(paragraph, style_config, clear_indent=True)
+        return paragraph
+
+    def _fill_line(text, style_config, highlight_value=False):
+        """“项目名称：<值>”填空行：标签不加下划线，填空值加单下划线（项目名另加黄高亮）。"""
+        label, sep, value = str(text).partition("：")
+        if not sep:
+            label, sep, value = str(text).partition(":")
+        paragraph = doc.add_paragraph()
+        _apply_paragraph(paragraph, style_config, clear_indent=True)
+        head = paragraph.add_run(label + sep if sep else label)
+        _apply_run(head, style_config)
+        if value.strip():
+            from docx.enum.text import WD_UNDERLINE
+
+            filled = paragraph.add_run(value.strip())
+            _apply_run(filled, style_config)
+            filled.underline = WD_UNDERLINE.SINGLE
+            if highlight_value:
+                _highlight_yellow(filled)
+        return paragraph
+
+    blank_config = {**body_font, "alignment": "center", "first_line_chars": 0}
+    # 顶部横线
+    _cover_top_rule(doc)
+    # 主标题两行：22pt 黑体（中文）/Times New Roman（英文）加粗居中
+    title_font = {**bold_center, "east_asia": "黑体", "latin": "Times New Roman", "size_pt": 22, "line_spacing": 1.5}
     _para(parts[0], title_font)
     _para(parts[1], title_font)
     # 城市名：18pt 黑体加粗居中
     _para(parts[2], {**bold_center, "east_asia": "黑体", "size_pt": 18, "line_spacing": 1.5})
-    # 报告编号、项目名称、委托单位：14pt 宋体加粗（参考模板继承正文字体宋体）
+    # 报告编号：14pt 宋体加粗，值黄高亮
     song = "宋体"
-    _para(parts[3], {**bold_center, "east_asia": song, "size_pt": 14, "line_spacing": 1.5})
+    label, sep, number_value = parts[3].partition("：")
+    if not sep:
+        label, sep, number_value = parts[3].partition(":")
+    number_para = doc.add_paragraph()
+    _apply_paragraph(number_para, {**bold_center, "east_asia": song, "size_pt": 14, "line_spacing": 1.5}, clear_indent=True)
+    label_run = number_para.add_run(label + sep if sep else label)
+    _apply_run(label_run, {**bold_center, "east_asia": song, "size_pt": 14})
+    if number_value.strip():
+        value_run = number_para.add_run(number_value.strip())
+        _apply_run(value_run, {**bold_center, "east_asia": song, "size_pt": 14})
+        _highlight_yellow(value_run)
+    # 编号后 10 空段（基准 P7–P16）
+    for _ in range(10):
+        _blank(blank_config)
     left_font = {**body_font, "bold": True, "east_asia": song, "size_pt": 14, "line_spacing": 1.5, "first_line_chars": 0}
-    _para(parts[4], left_font)
-    _para(parts[5], left_font)
-    # 公司与日期：16pt 宋体加粗居中，单倍行距
+    _fill_line(parts[4], left_font, highlight_value=True)
+    _fill_line(parts[5], left_font)
+    # 委托单位后 11 空段（基准 P19–P29）
+    for _ in range(11):
+        _blank(blank_config)
+    # 公司与日期：16pt 宋体加粗居中
     company_font = {**bold_center, "east_asia": song, "size_pt": 16}
     _para(parts[6], company_font)
     _para(parts[7], company_font)
+    # 左下黄块（基准 P32：黄高亮空 run sz32）
+    yellow_block = doc.add_paragraph()
+    _apply_paragraph(yellow_block, blank_config, clear_indent=True)
+    block_run = yellow_block.add_run("")
+    _apply_run(block_run, {**blank_config, "size_pt": 16})
+    _highlight_yellow(block_run)
     # 封面独立成页
     from docx.enum.text import WD_BREAK
     doc.paragraphs[-1].add_run().add_break(WD_BREAK.PAGE)
+    return _report_number_from_cover(parts[3])
 
 
 def _notes_paragraphs(doc, spec: str) -> None:
@@ -415,6 +687,20 @@ def _table(doc, headers, rows, header_shading=False):
         cells = table.add_row().cells
         for index, value in enumerate(row):
             fill(cells[index], value)
+    # 复刻附件模板中的纵向合并：只作用于两张静态方法表。
+    def _keep_first_paragraph(cell):
+        """合并后删除后续空段落，避免合并单元格内出现多余换行。"""
+        tc = cell._tc
+        paragraphs = tc.findall(qn("w:p"))
+        for extra in paragraphs[1:]:
+            tc.remove(extra)
+
+    if list(headers) == ["姓名", "组别", "职务", "职责"] and len(table.rows) >= 5:
+        for column in (1, 3):
+            _keep_first_paragraph(table.cell(2, column).merge(table.cell(4, column)))
+    elif list(headers) == ["类型i", "损坏名称", "损坏程度", "计量单位", "单位扣分", "权重wi", "备  注"] and len(table.rows) >= 3:
+        for column in (0, 1, 3, 5):
+            _keep_first_paragraph(table.cell(1, column).merge(table.cell(2, column)))
     if not style_config["allow_row_break"]:
         for row in table.rows:
             tr_pr = row._tr.get_or_add_trPr()
@@ -423,19 +709,97 @@ def _table(doc, headers, rows, header_shading=False):
     return table
 
 
-def _picture(doc, path, width_cm, height_cm):
+_DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_REPORT_IMAGE_WIDTH_CM = 15.0
+_REPORT_IMAGE_HEIGHT_CM = 8.0
+
+
+def _unlock_aspect(run) -> None:
+    """取消图片锁定纵横比（noChangeAspect=0）。"""
+    for locks in run._element.iter(qn("a:graphicFrameLocks")):
+        locks.set("noChangeAspect", "0")
+
+
+def _photo_text_table(doc, image_data, extension, text, temp_dir, name):
+    """单列表格：行1=15×8cm图片，行2=说明文字。"""
+    # 只有"数据/结果表"后需要显式段落防止 Word 自动合并；
+    # 两张示例图片表之间不加空段（用户要求示例图连续排版，无空格分隔）。
+    body = doc._body._element
+    children = list(body)
+    previous = None
+    if len(children) >= 2 and children[-1].tag == qn("w:sectPr"):
+        previous = children[-2]
+    elif len(children) == 1 and children[-1].tag != qn("w:sectPr"):
+        previous = children[-1]
+    if previous is not None and previous.tag == qn("w:tbl"):
+        grid_cols = list(previous.iter(qn("w:gridCol")))
+        if len(grid_cols) > 1:
+            separator = doc.add_paragraph()
+            _apply_paragraph(separator, _current_format_config()["body"], clear_indent=True)
+    style_config = _current_format_config()["table"]
+    table = doc.add_table(rows=0, cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.style = "Table Grid"
+    image_cell = table.add_row().cells[0]
+    paragraph = image_cell.paragraphs[0]
+    _apply_paragraph(paragraph, style_config, clear_indent=True)
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run()
+    image_path = Path(temp_dir) / f"{name}{extension}"
+    image_path.write_bytes(image_data)
+    run.add_picture(
+        str(image_path), width=Cm(_REPORT_IMAGE_WIDTH_CM), height=Cm(_REPORT_IMAGE_HEIGHT_CM)
+    )
+    _unlock_aspect(run)
+    text_cell = table.add_row().cells[0]
+    text_paragraph = text_cell.paragraphs[0]
+    _apply_paragraph(text_paragraph, style_config, clear_indent=True)
+    text_run = text_paragraph.add_run(text)
+    _apply_run(text_run, style_config, bold=True)
+    return table
+
+
+def _picture(doc, path, width_cm, height_cm=None):
+    """插入居中图片；示例/设备图固定 15×8（_REPORT_IMAGE_*），统计图按调用方传入尺寸。"""
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = paragraph.add_run()
-    run.add_picture(str(path), width=Cm(width_cm), height=Cm(height_cm))
+    if width_cm is None:
+        width_cm, height_cm = _REPORT_IMAGE_WIDTH_CM, _REPORT_IMAGE_HEIGHT_CM
+    if height_cm is None:
+        run.add_picture(str(path), width=Cm(width_cm))
+    else:
+        run.add_picture(str(path), width=Cm(width_cm), height=Cm(height_cm))
+    _unlock_aspect(run)
 
 
-def _example_table(doc, points):
+def _example_table(doc, points, photos=None, temp_dir=None):
+    """基准表9结构：每示例点=上行 1-2 张照片 + 下行合并文字行（桩号+数值）。
+
+    photos: {示例点序号: [(字节, 扩展名)]}；无照片时仅输出文字行。
+    """
     style_config = _current_format_config()["table"]
     table = doc.add_table(rows=0, cols=2)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     table.style = "Table Grid"
-    for record in points:
+    for index, record in enumerate(points):
+        photo_list = (photos or {}).get(index) or []
+        if photo_list and temp_dir is not None:
+            cells = table.add_row().cells
+            merged = cells[0].merge(cells[1])
+            paragraph = merged.paragraphs[0]
+            _apply_paragraph(paragraph, style_config, clear_indent=True)
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = paragraph.add_run()
+            image_data, extension = photo_list[0]
+            image_path = Path(temp_dir) / f"example_{index}0{extension}"
+            image_path.write_bytes(image_data)
+            run.add_picture(
+                str(image_path),
+                width=Cm(_REPORT_IMAGE_WIDTH_CM),
+                height=Cm(_REPORT_IMAGE_HEIGHT_CM),
+            )
+            _unlock_aspect(run)
         cells = table.add_row().cells
         merged = cells[0].merge(cells[1])
 
@@ -453,6 +817,13 @@ def _example_table(doc, points):
 
 def _distribution_images(segments, stats, records, temp_dir):
     return engine.report_images(temp_dir, segments, stats, records)
+
+
+def _tci_distribution_images(segments, tci_stats, temp_dir):
+    try:
+        return engine.report_tci_images(temp_dir, segments, tci_stats)
+    except Exception:
+        return {}
 
 
 def generate_guangdong_stub(city, bundle, output_dir, log=lambda _x: None):
@@ -482,22 +853,25 @@ def _section_overview(doc, config, segments):
 
 def _section_method(doc, height_stats, bolt_stats):
     if height_stats is not None:
-        _body(doc, "二波按560、580、620、640mm分档，580≤h≤620mm为合格；三波按657、677、717、737mm分档，677≤h≤717mm为合格。")
+        _body(doc, "二波按550、580、620、650mm分档，580≤h≤620mm为合格；三波按647、677、717、747mm分档，677≤h≤717mm为合格。")
     if bolt_stats is not None:
         _body(doc, "螺栓缺失率按缺失数量÷（拼接螺栓数量+连接螺栓数量+缺失数量）×100%计算。")
 
 
-def _section_height(doc, segments, height_stats, height_records, images, temp_dir, drawing_id=1000):
-    # 二级标题：该节位于第 3 章内，用一级会打乱 1-5 章连续编号
-    _heading(doc, "波形梁护栏横梁中心高度检测结果", 2)
+def _section_height(doc, segments, height_stats, height_records, images, temp_dir, drawing_id=1000, height_photo_index=None, height_photo_workbook=None):
+    # 章标题由模板 #4 提供，此处只写“区县整体→逐段”小节；无数据写明确占位句，不留空章/空标题（Q2）。
     from collections import defaultdict
+    if not segments:
+        _body(doc, "本章暂无有效高度检测记录。")
+        return drawing_id
     has_county = bool(segments and any(s.get("county") for s in segments))
     by_county = defaultdict(list)
     for idx, seg in enumerate(segments):
-        stat = height_stats[idx] if idx < len(height_stats) else None
+        stat = height_stats[idx] if height_stats is not None and idx < len(height_stats) else None
         by_county[seg.get("county", "")].append((idx, seg, stat))
     for county_idx, (county, items) in enumerate(by_county.items()):
         _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
+        county_has = any(it[2] is not None and any(it[2]["types"][kind]["count"] for kind in ("二波", "三波")) for it in items)
         for kind in ("二波", "三波"):
             total = sum(it[2]["types"][kind]["count"] for it in items if it[2] is not None)
             if not total:
@@ -507,7 +881,9 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                 _body(doc, f"{county}{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{good * 100 / total:.2f}%。")
             else:
                 _body(doc, f"G210线{kind}形梁护栏有效检测点共{total}个，横梁中心高度合格率为{good * 100 / total:.2f}%。")
-        labels = ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"]
+        if not county_has:
+            _body(doc, f"{county}暂无有效高度检测记录。" if county else "本路段暂无有效高度检测记录。")
+        labels = ["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"]
         rows = []
         for idx, seg, stat in items:
             if stat is None:
@@ -521,12 +897,12 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                 else:
                     rows.append([route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
         if rows:
-            _caption(doc, "表", f"3.{county_idx+1}.1", f"{county}二波形梁护栏横梁中心高度检测结果" if county else "G210线二波形梁护栏横梁中心高度检测结果")
+            _caption(doc, "表", f"4.{county_idx+1}.1", f"{county}二波形梁护栏横梁中心高度检测结果" if county else "G210线二波形梁护栏横梁中心高度检测结果")
             if has_county:
                 _table(doc, ["区县", "路线编号", "起点桩号", "终点桩号", *labels], rows, True)
             else:
                 _table(doc, ["路线编号", "起点桩号", "终点桩号", *labels], rows, True)
-        labels = ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"]
+        labels = ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"]
         rows = []
         for idx, seg, stat in items:
             if stat is None:
@@ -540,16 +916,17 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                 else:
                     rows.append([route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), *[f"{value:.2f}%" for value in data["pcts"]]])
         if rows:
-            _caption(doc, "表", f"3.{county_idx+1}.2", f"{county}三波形梁护栏横梁中心高度检测结果" if county else "G210线三波形梁护栏横梁中心高度检测结果")
+            _caption(doc, "表", f"4.{county_idx+1}.2", f"{county}三波形梁护栏横梁中心高度检测结果" if county else "G210线三波形梁护栏横梁中心高度检测结果")
             if has_county:
                 _table(doc, ["区县", "路线编号", "起点桩号", "终点桩号", *labels], rows, True)
             else:
                 _table(doc, ["路线编号", "起点桩号", "终点桩号", *labels], rows, True)
         for idx, seg, stat in items:
-            if stat is None or not any(stat["types"][kind]["count"] for kind in ("二波", "三波")):
-                continue
             route_val = seg.get("route", "G210")
             _heading(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段", 2)
+            if stat is None or not any(stat["types"][kind]["count"] for kind in ("二波", "三波")):
+                _body(doc, f"本段{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}暂无有效高度检测记录。")
+                continue
             for kind in ("二波", "三波"):
                 data = stat["types"][kind]
                 if not data["count"]:
@@ -562,24 +939,71 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                     continue
                 drawing_id += 1
                 _picture(doc, image_set["line"], 13, 8)
-                _caption(doc, "图", f"3.{idx + 2}-{1}", f"{kind}形梁护栏横梁中心高度检测结果")
+                _caption(doc, "图", f"4.{idx + 2}-{1}", f"{kind}形梁护栏横梁中心高度检测结果")
                 _picture(doc, image_set["pie"], 14, 8.5)
-                _caption(doc, "图", f"3.{idx + 2}-{2}", f"{kind}形梁护栏横梁中心高度分布情况")
+                _caption(doc, "图", f"4.{idx + 2}-{2}", f"{kind}形梁护栏横梁中心高度分布情况")
                 example_rows = [record for record in (height_records or []) if record["segment"] == idx and record["kind"] == kind]
-                example_points = engine.select_height_example_points(example_rows, idx, kind)
+                example_points = engine.select_height_example_points(
+                    example_rows, idx, kind, photo_index=height_photo_index
+                )
                 if example_points:
-                    _example_table(doc, example_points)
-                    _caption(doc, "图", f"3.{idx + 2}-{3}", f"{kind}形梁护栏横梁中心高度自动计算示例")
+                    photos = _match_station_photos(example_points, height_photo_index, height_photo_workbook)
+                    _example_table(doc, example_points, photos, temp_dir)
+                    _caption(doc, "图", f"4.{idx + 2}-{3}", f"{kind}形梁护栏横梁中心高度自动计算示例")
     return drawing_id
 
 
-def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir):
-    _heading(doc, "波形梁护栏螺栓缺失", 1)
+def _match_station_photos(points, photo_index, workbook=None):
+    """示例点 -> {序号: [(字节, 扩展名)]}：按 (方向, 桩号) 命中病害照片索引（最多 2 张）。"""
+    if not photo_index or workbook is None:
+        return {}
+    result = {}
+    for index, point in enumerate(points):
+        if not engine.row_has_height_photo(point, photo_index):
+            continue
+        direction = engine.normalize_direction(point.get("direction"))
+        for station_key in ("raw_station", "electronic_station", "station"):
+            station = point.get(station_key)
+            if station is None:
+                continue
+            photos = photo_index.get((direction, round(float(station), 1)))
+            if photos:
+                result[index] = [
+                    engine.read_media(workbook, media_name) for media_name, _ in photos[:2]
+                ]
+                break
+    return result
+
+
+def _height_point_count(height_stats, index: int) -> int:
+    """同区段高度有效检测点总数；缺高度统计时返回 0（视为同样无数据）。"""
+    try:
+        stat = height_stats[index] if height_stats is not None and index < len(height_stats) else None
+    except (TypeError, IndexError):
+        return 0
+    if not stat or not isinstance(stat.get("types"), dict):
+        return 0
+    total = 0
+    for kind in ("二波", "三波"):
+        data = stat["types"].get(kind) or {}
+        try:
+            total += int(data.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir, height_stats=None):
+    # 章标题由模板 #5 提供，此处只写“区县整体→逐段”小节。
+    # 示例图逻辑不变：0 记录写占位句；有记录时仅关联到病害图才挂图。
     from collections import defaultdict
+    if not segments:
+        _body(doc, "本章暂无有效螺栓检测记录。")
+        return
     has_county = bool(segments and any(s.get("county") for s in segments))
     by_county = defaultdict(list)
     for idx, seg in enumerate(segments):
-        stat = bolt_stats[idx] if idx < len(bolt_stats) else None
+        stat = bolt_stats[idx] if bolt_stats is not None and idx < len(bolt_stats) else None
         by_county[seg.get("county", "")].append((idx, seg, stat))
     for county_idx, (county, items) in enumerate(by_county.items()):
         _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
@@ -603,23 +1027,28 @@ def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, 
                 overall.append([route_val, engine.format_station(stat["segment"]["start"]), engine.format_station(stat["segment"]["end"]), f"{stat['segment']['mileage']:.3f}", stat["splice"], stat["connection"], stat["missing"], f"{_rate_text(stat['rate'])}"])
         if has_county:
             overall.append(["合计", "", "", "", "", total_splice, total_connection, total_missing, f"{_rate_text(total_rate)}"])
-            _caption(doc, "表", f"4.{county_idx+1}.1", f"{county}波形梁护栏螺栓缺失检测结果" if county else "G210线波形梁护栏螺栓缺失检测结果")
+            _caption(doc, "表", f"5.{county_idx+1}.1", f"{county}波形梁护栏螺栓缺失检测结果" if county else "G210线波形梁护栏螺栓缺失检测结果")
             _table(doc, ["区县", "路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"], overall, True)
         else:
             overall.append(["合计", "", "", "", total_splice, total_connection, total_missing, f"{_rate_text(total_rate)}"])
-            _caption(doc, "表", f"4.{county_idx+1}.1", f"{county}波形梁护栏螺栓缺失检测结果" if county else "G210线波形梁护栏螺栓缺失检测结果")
+            _caption(doc, "表", f"5.{county_idx+1}.1", f"{county}波形梁护栏螺栓缺失检测结果" if county else "G210线波形梁护栏螺栓缺失检测结果")
             _table(doc, ["路线编号", "起点桩号", "止点桩号", "检测里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）", "缺失率（%）"], overall, True)
         for idx, seg, stat in items:
-            if stat is None:
-                continue
             route_val = seg.get("route", "G210")
             section_number = idx + 2
             _heading(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段", 2)
+            if stat is None:
+                _body(doc, f"本段{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}暂无有效螺栓检测记录。")
+                continue
             if not stat["points"]:
-                _body(doc, "本段无波形护栏")
+                if _height_point_count(height_stats, idx) > 0:
+                    # 同段高度有有效数据：不断言“无波形护栏”，仅说明螺栓明细缺失。
+                    _body(doc, "本段螺栓明细无有效记录。")
+                else:
+                    _body(doc, "本段无波形护栏")
                 continue
             _body(doc, f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段共检出拼接螺栓{stat['splice']}颗，连接螺栓{stat['connection']}颗，缺失螺栓{stat['missing']}颗，缺失率为{_rate_text(stat['rate'])}%。")
-            _caption(doc, "表", f"4.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失检测结果")
+            _caption(doc, "表", f"5.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失检测结果")
             county_val = seg.get("county", "")
             if has_county:
                 _table(doc, ["区县", "路线编号", "起点桩号", "止点桩号", "里程（km）", "拼接螺栓（颗）", "连接螺栓（颗）", "缺失数量（颗）"], [[county_val, route_val, engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", stat["splice"], stat["connection"], stat["missing"]]], True)
@@ -631,57 +1060,96 @@ def _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, 
             if bolt_examples:
                 for example in bolt_examples:
                     image_data, image_extension = engine.read_disease_image(example["image"])
-                    path = Path(temp_dir) / f"bolt_{section_number}.{image_extension.lstrip('.')}"
-                    path.write_bytes(image_data)
-                    _picture(doc, path, 16, 8.5)
-                    _body(doc, engine.bolt_example_text(example))
-                _caption(doc, "图", f"4.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失自动识别示例")
+                    _photo_text_table(doc, image_data, image_extension, engine.bolt_example_text(example), temp_dir, f"bolt_{section_number}")
+                _caption(doc, "图", f"5.{section_number}-1", f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段波形梁护栏螺栓缺失自动识别示例")
 
 
-def _section_tci(doc, segments, tci_stats):
-    _heading(doc, "沿线设施技术状况评价", 1)
+def _tci_has_data(st) -> bool:
+    """该分段是否有有效 TCI 记录（count>0 才算有数据；0 记录的 TCI=100 仅为缺省值）。"""
+    return st is not None and int(st.get("count") or 0) > 0
+
+
+def _section_tci(doc, segments, tci_stats, tci_images=None, temp_dir=None, tci_photos=None, segment_tci_photos=None):
+    # 章标题由模板 #3 提供，此处写“区县整体→逐段”小节，与高度/螺栓同构：
+    # 每段=总结文字+单段统计表+病害构成分布图；无数据写明确占位句，不留空章/空标题（Q2）。
     if tci_stats is None:
         _body(doc, "未提供 TCI 病害清单，沿线设施技术状况未评定。")
         return
+    if not segments:
+        _body(doc, "本章暂无有效沿线设施检测记录。")
+        return
     from collections import defaultdict
     has_county = bool(segments and any(s.get("county") for s in segments))
+    tci_workbook_path = tci_photos[0] if tci_photos else None
     by_county = defaultdict(list)
     for idx, seg in enumerate(segments):
         st = tci_stats[idx] if idx < len(tci_stats) else None
         by_county[seg.get("county", "")].append((idx, seg, st))
     for county_idx, (county, items) in enumerate(by_county.items()):
         _heading(doc, f"{county}整体情况" if county else "整体情况", 2)
-        # 县内汇总：平均 TCI 或按总扣分重新计算？ 此处取算术平均并按等级分布
-        vals = [it[2]["tci"] for it in items if it[2] is not None]
-        if vals:
+        # 县内汇总：只计有有效记录的分段（取算术平均并按等级分布）
+        valid = [(idx, seg, st) for idx, seg, st in items if _tci_has_data(st)]
+        if valid:
+            vals = [st["tci"] for _, _, st in valid]
             avg = sum(vals)/len(vals)
             # 等级分布
-            grades = [it[2]["grade"] for it in items if it[2] is not None]
+            grades = [st["grade"] for _, _, st in valid]
             cnt = {g: grades.count(g) for g in ["优","良","中","次","差"]}
             _body(doc, f"{county or 'G210线'}沿线设施技术状况共评定{len(vals)}段，平均 TCI{avg:.2f}，等级分布：优{cnt['优']}段、良{cnt['良']}段、中{cnt['中']}段、次{cnt['次']}段、差{cnt['差']}段。")
+        else:
+            _body(doc, f"{county}暂无有效沿线设施检测记录。" if county else "本路段暂无有效沿线设施检测记录。")
         rows = []
-        for idx, seg, st in items:
-            if st is None:
-                continue
+        for idx, seg, st in valid:
             if has_county:
                 rows.append([seg.get("county",""), seg.get("route","G210"), engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]])
             else:
                 rows.append([seg.get("route","G210"), engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]])
         if rows:
-            _caption(doc, "表", f"2.{county_idx+1}.1", f"{county}沿线设施技术状况评价结果" if county else "沿线设施技术状况评价结果")
+            _caption(doc, "表", f"3.{county_idx+1}.1", f"{county}沿线设施技术状况评价结果" if county else "沿线设施技术状况评价结果")
             if has_county:
                 _table(doc, ["区县","路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], rows, True)
             else:
                 _table(doc, ["路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], rows, True)
-        # 逐段明细文字
+        # 示例图片：每种病害类型选一张（TCI 工作簿图片列锚定图）——单列表格：图行+说明行
+        if tci_photos:
+            tci_workbook, tci_type_photos = tci_photos
+            _body(doc, f"{county or '本路线'}沿线设施典型病害示例图片如下：")
+            for photo_number, (type_label, photos) in enumerate(tci_type_photos.items(), 1):
+                if not photos:
+                    continue
+                media_name, extension = photos[0]
+                image_data, _ = engine.read_media(tci_workbook, media_name)
+                _photo_text_table(doc, image_data, extension, type_label, temp_dir, f"tci_{county_idx}_{photo_number}")
+                _caption(doc, "图", f"3.{county_idx+1}.{photo_number}", f"{type_label}示例图片")
+        # 逐区间段小节：总结文字+单段统计表+分布图
         for idx, seg, st in items:
-            if st is None:
+            route_val = seg.get("route", "G210")
+            seg_title = f"{route_val}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段"
+            _heading(doc, seg_title, 2)
+            if not _tci_has_data(st):
+                _body(doc, f"本段{seg_title}暂无有效沿线设施检测记录。")
                 continue
-            _body(doc, f"{seg.get('route','G210')}线{engine.format_station(seg['start'])}～{engine.format_station(seg['end'])}段：轻{st['light']}处、重{st['heavy']}处、标志{st['sign']}处、标线{st['marking']}m，TCI{st['tci']:.2f}（{st['grade']}）。")
+            _body(doc, f"{seg_title}：防护设施缺损轻{st['light']}处、重{st['heavy']}处、标志缺损{st['sign']}处、标线缺损{st['marking']}m，TCI{st['tci']:.2f}（{st['grade']}）。")
+            _caption(doc, "表", f"3.{idx + 2}-1", f"{seg_title}沿线设施技术状况评价结果")
+            if has_county:
+                _table(doc, ["区县","路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], [[seg.get("county",""), route_val, engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]]], True)
+            else:
+                _table(doc, ["路线编号","起点桩号","止点桩号","里程(km)","防护-轻","防护-重","标志缺损","标线缺损(m)","TCI","等级"], [[route_val, engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{seg['mileage']:.3f}", st["light"], st["heavy"], st["sign"], st["marking"], f"{st['tci']:.2f}", st["grade"]]], True)
+            image_path = (tci_images or {}).get(idx) if isinstance(tci_images, dict) else None
+            if image_path is not None:
+                _picture(doc, image_path, 13, 8)
+                _caption(doc, "图", f"3.{idx + 2}-1", f"{seg_title}沿线设施病害构成")
+            # 区段典型病害图：单列表格（图行+具体病害名行），标题「XXX段交安设施典型病害图」
+            segment_photos = (segment_tci_photos or {}).get(idx) or []
+            if segment_photos and tci_workbook_path is not None:
+                description, media_name, extension = segment_photos[0]
+                image_data, _ = engine.read_media(tci_workbook_path, media_name)
+                _photo_text_table(doc, image_data, extension, description, temp_dir, f"seg_disease_{idx}")
+                _caption(doc, "图", f"3.{idx + 2}-2", f"{seg_title}交安设施典型病害图")
 
 
 def _section_conclusion(doc, segments, height_stats, bolt_stats):
-    _heading(doc, "结论与建议", 1)
+    # 章标题由模板 #6 提供，此处只写“结论/建议”二级小节。
     _heading(doc, "结论", 2)
     has_county = bool(segments and any(s.get("county") for s in segments))
     if has_county:
@@ -722,55 +1190,206 @@ def _section_conclusion(doc, segments, height_stats, bolt_stats):
     _body(doc, "建议管养单位优先对横梁中心高度合格率较低的分段开展现场复核，结合路缘石、路面加铺及护栏结构实际情况制定整治计划，并在养护后复测；加强护栏连接件养护巡查，对螺栓缺失位置及时补装同规格螺栓并复核紧固状态。")
 
 
-def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=None):
-    # 显式锚点优先，关键词回退。显式锚点语法（任一满足即注入）：
-    #   <!-- inject:overview -->  <!-- inject:height -->  <!-- inject:bolt -->  <!-- inject:conclusion -->
-    # 兼容旧模板的关键词匹配：项目概况/整体情况/螺栓/结论
+_STATIC_CONCLUSION_HEADINGS = frozenset({"结论", "建议", "结论与建议"})
+_STATIC_CONCLUSION_PARAGRAPHS = ("结论章节由程序根据检测统计自动生成", "建议章节由程序根据检测统计自动生成")
+
+
+def _strip_section_number(text: str) -> str:
+    """去掉“5.1 ”“5 ”等章节编号前缀，便于识别静态结论残留标题。"""
+    stripped = (text or "").strip()
+    index = 0
+    while index < len(stripped) and (stripped[index].isdigit() or stripped[index] in ".．·、）) "):
+        index += 1
+    return stripped[index:].strip()
+
+
+_CQ_HEADER_COMPANY = "四川京炜交通工程技术有限公司"
+
+
+def _paragraph_bottom_border(paragraph, size="6") -> None:
+    """段落下框线：页眉/封面横线共用（base.pdf 基准单线）。"""
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = p_pr.find(qn("w:pBdr"))
+    if p_bdr is None:
+        p_bdr = OxmlElement("w:pBdr")
+        p_pr.append(p_bdr)
+    bottom = p_bdr.find(qn("w:bottom"))
+    if bottom is None:
+        bottom = OxmlElement("w:bottom")
+        p_bdr.append(bottom)
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), size)
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+
+
+def _add_page_field(paragraph, instruction: str) -> None:
+    """页码域（PAGE / NUMPAGES）：无缓存结果，Word 打开时计算；数字 Times 黑色。"""
+    run = paragraph.add_run()
+    _set_run_fonts(run, "宋体", LATIN_FONT)
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    run._r.append(begin)
+    run = paragraph.add_run()
+    _set_run_fonts(run, "宋体", LATIN_FONT)
+    instr = OxmlElement("w:instrText")
+    instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+    instr.text = f" {instruction} "
+    run._r.append(instr)
+    run = paragraph.add_run()
+    _set_run_fonts(run, "宋体", LATIN_FONT)
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    run._r.append(separate)
+    run = paragraph.add_run()
+    _set_run_fonts(run, "宋体", LATIN_FONT)
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.append(end)
+
+
+def _set_chongqing_header_footer(section, report_no: str) -> None:
+    """重庆页眉页脚（base.pdf 基准）：左公司名 + 右报告编号变量 + 页眉下横线；
+    页脚“第 X 页 共 Y 页”居中。仅重庆链路调用，广东 writer 不经过此函数。"""
+    from docx.enum.text import WD_TAB_ALIGNMENT
+
+    section.header.is_linked_to_previous = False
+    section.footer.is_linked_to_previous = False
+    header = section.header
+    paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    paragraph.text = ""
+    content_width = section.page_width - section.left_margin - section.right_margin
+    try:
+        paragraph.paragraph_format.tab_stops.add_tab_stop(content_width, WD_TAB_ALIGNMENT.RIGHT)
+    except Exception:
+        pass
+    left = paragraph.add_run(_CQ_HEADER_COMPANY)
+    _set_run_fonts(left, "宋体", LATIN_FONT)
+    left.font.size = Pt(9)
+    paragraph.add_run().add_tab()
+    right = paragraph.add_run(report_no or "")
+    _set_run_fonts(right, "宋体", LATIN_FONT)
+    right.font.size = Pt(9)
+    _paragraph_bottom_border(paragraph)
+    footer = section.footer
+    fpara = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    fpara.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fpara.text = ""
+    for text in ("第 ",):
+        run = fpara.add_run(text)
+        _set_run_fonts(run, "宋体", LATIN_FONT)
+        run.font.size = Pt(9)
+    _add_page_field(fpara, "PAGE")
+    mid = fpara.add_run(" 页 共 ")
+    _set_run_fonts(mid, "宋体", LATIN_FONT)
+    mid.font.size = Pt(9)
+    _add_page_field(fpara, "NUMPAGES")
+    tail = fpara.add_run(" 页")
+    _set_run_fonts(tail, "宋体", LATIN_FONT)
+    tail.font.size = Pt(9)
+
+
+def _cover_section_rule(section) -> None:
+    """封面节页眉规则线（base.pdf 基准）：空文本 + 段落下框线。
+
+    封面/注意事项/目录页（第 1 节）共用此页眉；正文节由
+    _set_chongqing_header_footer 提供公司名+编号+横线。
+    """
+    section.header.is_linked_to_previous = False
+    header = section.header
+    paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+    paragraph.text = ""
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "9")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
+    p_bdr.append(bottom)
+    p_pr.append(p_bdr)
+
+
+def _start_chongqing_body_section(doc, report_no: str):
+    """封面/注意事项/目录节之后另起一节：正文加页眉页脚，页码从 1 重计（base.pdf 第 1 页起于概况）。"""
+    from docx.enum.section import WD_SECTION
+
+    first = doc.sections[0]
+    body = doc.add_section(WD_SECTION.NEW_PAGE)
+    body.page_width = first.page_width
+    body.page_height = first.page_height
+    body.left_margin = first.left_margin
+    body.right_margin = first.right_margin
+    body.top_margin = first.top_margin
+    body.bottom_margin = first.bottom_margin
+    body.orientation = first.orientation
+    pg_num = OxmlElement("w:pgNumType")
+    pg_num.set(qn("w:start"), "1")
+    body._sectPr.append(pg_num)
+    _set_chongqing_header_footer(body, report_no)
+    # T9：正文节首页也要页眉页脚。titlePg 会随 add_section 从封面节克隆而来，
+    # 不清除会导致正文第一页（概况页）无页眉（base.pdf 基准仅封面/目录节无页眉）。
+    body.different_first_page_header_footer = False
+    return body
+
+
+def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=None, tci_images=None, height_photo_index=None, height_photo_workbook=None, tci_photos=None, segment_tci_photos=None):
+    # 只认显式锚点 <!-- inject:xxx -->，无关键词回退：
+    # 静态标题（含 2.3.x）一律按原样渲染，绝不触发注入、不吞掉（Q2）。
+    # 章标题由模板 #1~#6 提供，各 _section_* 只写章内小节，不再自写章标题。
     import re as _re
     anchor_re = _re.compile(r"<!--\s*inject:\s*(overview|tci|height|bolt|conclusion)\s*-->")
-    keyword_map = {
-        "项目概况": "overview",
-        "沿线设施技术状况评价": "tci",
-        "沿线设施": "tci",
-        "整体情况": "height",
-        "螺栓": "bolt",
-        "结论": "conclusion",
-    }
+    _CANONICAL_ORDER = ("overview", "tci", "height", "bolt", "conclusion")
     def _writer_for(key: str):
         if key == "overview":
             return lambda: _section_overview(doc, config, segments)
         if key == "tci":
-            return (lambda: _section_tci(doc, segments, tci_stats)) if tci_stats is not None else (lambda: None)
+            return lambda: _section_tci(doc, segments, tci_stats, tci_images, temp_dir, tci_photos, segment_tci_photos)
         if key == "height":
-            return (lambda: _section_height(doc, segments, height_stats, height_records, images, temp_dir)) if height_stats is not None else (lambda: None)
+            if height_stats is None:
+                return lambda: _body(doc, "本章暂无有效高度检测记录。")
+            return lambda: _section_height(doc, segments, height_stats, height_records, images, temp_dir, height_photo_index=height_photo_index, height_photo_workbook=height_photo_workbook)
         if key == "bolt":
-            return (lambda: _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir)) if bolt_stats is not None else (lambda: None)
+            if bolt_stats is None:
+                return lambda: _body(doc, "本章暂无有效螺栓检测记录。")
+            return lambda: _section_bolt(doc, segments, bolt_stats, bolt_records, disease_image_index, temp_dir, height_stats)
         if key == "conclusion":
             return lambda: _section_conclusion(doc, segments, height_stats, bolt_stats)
         return lambda: None
 
     # pending 按显式 key 索引，便于锚点直接命中
     pending_by_key = {
-        "overview": ("项目概况", True, _writer_for("overview")),
-        "tci": ("沿线设施技术状况评价", False, _writer_for("tci")),
-        "height": ("整体情况", False, _writer_for("height")),
-        "bolt": ("螺栓", False, _writer_for("bolt")),
-        "conclusion": ("结论", False, _writer_for("conclusion")),
+        "overview": _writer_for("overview"),
+        "tci": _writer_for("tci"),
+        "height": _writer_for("height"),
+        "bolt": _writer_for("bolt"),
+        "conclusion": _writer_for("conclusion"),
     }
     pending_keys = set(pending_by_key.keys())
 
-    def _inject(key: str, render_heading: bool, block_text: str = "", level: int = 2):
+    def _inject(key: str):
         if key not in pending_keys:
             return
-        keyword, do_render, writer = pending_by_key[key]
+        writer = pending_by_key[key]
         pending_keys.remove(key)
-        if do_render and block_text:
-            _heading(doc, block_text, level)
         writer()
 
     skeleton_dir = Path(skeleton_md).parent if skeleton_md else None
 
-    for block in blocks:
+    # T9：封面（首页）无页眉页脚；目录节后另起正文节（页眉页脚 + 页码从 1 重计）。
+    # 无目录块的极简模板退化为单节：首页仍不同（封面干净），其余页共用页眉页脚。
+    doc.sections[0].different_first_page_header_footer = True
+    # T11：封面节页眉规则线（空文本+下框线），封面/注意事项/目录页顶线可见
+    _cover_section_rule(doc.sections[0])
+    toc_idx = next((i for i, b in enumerate(blocks) if b.kind == "toc"), None)
+    report_no = ""
+    body_started = False
+
+    for index, block in enumerate(blocks):
+        if toc_idx is not None and index > toc_idx and not body_started:
+            body_started = True
+            _start_chongqing_body_section(doc, report_no)
         # 1) 显式锚点：任意块（标题/段落）的文本中包含 <!-- inject:xxx -->
         anchor_hit = None
         if block.text:
@@ -779,32 +1398,46 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
                 anchor_hit = m.group(1)
         if anchor_hit:
             # 显式锚点不渲染原块文本，直接注入
-            _inject(anchor_hit, False)
+            _inject(anchor_hit)
             continue
 
         if block.kind == "toc":
             if _current_format_config()["toc"]["enabled"]:
                 _add_toc(doc)
         elif block.kind == "cover":
-            _cover_paragraphs(doc, block.text)
+            report_no = _cover_paragraphs(doc, block.text) or report_no
         elif block.kind == "notes":
             _notes_paragraphs(doc, block.text)
         elif block.kind == "heading":
-            # 关键词回退
-            hit_key = None
-            for kw, key in keyword_map.items():
-                if kw in block.text and key in pending_keys:
-                    hit_key = key
-                    break
-            if hit_key:
-                _keyword, do_render, _ = pending_by_key[hit_key]
-                _inject(hit_key, do_render, block.text, block.level)
-                continue
+            # 无关键词回退：所有静态标题（含 2.3.x）原样渲染。
             if "G210线K" in block.text and block.level >= 3:
+                continue
+            if "conclusion" not in pending_keys and _strip_section_number(block.text) in _STATIC_CONCLUSION_HEADINGS:
+                # 结论已程序注入：跳过模板残留的静态 5.1结论/5.2建议，避免结论/建议各出现两轮（D2）。
                 continue
             _heading(doc, block.text, block.level)
         elif block.kind == "paragraph":
             if block.text:
+                if "conclusion" not in pending_keys and any(
+                    marker in block.text for marker in _STATIC_CONCLUSION_PARAGRAPHS
+                ):
+                    continue
+                formula_match = _re.match(r"^<!--\s*formula:\s*(tci|gd|w|i0)\s*-->(.*)$", block.text, _re.S)
+                if formula_match:
+                    formula_key, suffix = formula_match.groups()
+                    if formula_key == "tci":
+                        _append_formula_paragraph(doc, _tci_formula_omath(), centered=True)
+                    elif formula_key == "gd":
+                        _append_formula_paragraph(doc, _subscript_omath("GD", "iTCI"), suffix=suffix)
+                    elif formula_key == "w":
+                        _append_formula_paragraph(doc, _subscript_omath("w", "i"), suffix=suffix)
+                    else:
+                        _append_formula_paragraph(doc, _subscript_omath("i", "0"), suffix=suffix)
+                    continue
+                # 模板中的静态表题/图题（“表2.1-1 …”“图 2.3.2-1 …”）按 caption 样式渲染
+                if _re.match(r"^[表图]\s*\d", block.text):
+                    _caption_text(doc, block.text)
+                    continue
                 _body(doc, block.text)
         elif block.kind == "table":
             if block.rows:
@@ -824,22 +1457,67 @@ def _report_with_skeleton(doc, config, blocks, segments, height_stats, height_re
                     pass
             # 无有效图片时跳过（报告图片由引擎生成）
             continue
-    # 未命中锚点追加末尾（不丢数据但位置错，模板编辑时保留关键词或显式锚点可避免）
-    for key in list(pending_keys):
-        _, _, writer = pending_by_key[key]
-        writer()
+    # 未命中锚点按基准章序追加末尾（不丢数据；模板含全部显式锚点时此分支不触发）
+    # T9：目录后无块时在此处另起正文节；无目录时单节页眉页脚落到首页之外的所有页。
+    if toc_idx is None:
+        _set_chongqing_header_footer(doc.sections[0], report_no)
+    elif not body_started:
+        _start_chongqing_body_section(doc, report_no)
+    for key in _CANONICAL_ORDER:
+        if key in pending_keys:
+            pending_by_key[key]()
 
 
 def make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, temp_dir, log=lambda _x: None, skeleton_md=None):
     """Build the full report document from computed statistics."""
     images = _distribution_images(segments, height_stats, height_records, temp_dir) if height_stats is not None else {}
+    tci_images = _tci_distribution_images(segments, tci_stats, temp_dir) if tci_stats is not None else {}
     if skeleton_md is None:
         raise FileNotFoundError(f"Markdown 模板不存在：{skeleton_md}，仅支持 .md 模板。")
     template = markdown_skeleton.read_template(skeleton_md)
+    # T11：病害照片索引（高度示例表挂真实照片）与 TCI 类型示例图
+    height_photo_index = {}
+    height_photo_workbook = None
+    if disease_image_index:
+        workbook = next(iter(disease_image_index.values()))[0]["workbook"]
+        image_map = engine.build_disease_image_map(workbook)
+        if image_map:
+            height_photo_index = engine.disease_station_photo_index(workbook, image_map)
+            height_photo_workbook = workbook
+    tci_photos = None
+    segment_tci_photos = None
+    tci_file = None
+    if config.tci_path is not None:
+        tci_candidate = Path(config.tci_path)
+        if tci_candidate.is_file():
+            tci_file = tci_candidate
+        elif tci_candidate.is_dir():
+            matches = sorted(tci_candidate.glob("*.xlsx"))
+            # 按内容过滤：文件内能落本县 segments 才算本县 TCI 数据（避免串区县照片）
+            if segments:
+                usable = []
+                for candidate in matches:
+                    candidate_map = engine.build_tci_image_map(candidate)
+                    if candidate_map and engine.build_segment_tci_photos(candidate, candidate_map, segments):
+                        usable.append(candidate)
+                if usable:
+                    matches = usable
+            if matches:
+                tci_file = matches[0]
+    if tci_file is not None and tci_stats is not None:
+        image_map = engine.build_tci_image_map(tci_file)
+        if image_map:
+            routes = sorted({str(s.get("route", "")).strip() for s in segments if str(s.get("route", "")).strip()})
+            type_photos = engine.tci_type_photo_index(tci_file, image_map, routes=routes)
+            if type_photos:
+                tci_photos = (tci_file, type_photos)
+            segment_tci_photos = engine.build_segment_tci_photos(tci_file, image_map, segments)
     doc = Document()
     with format_context(template.config):
         configure_document(doc, template.config)
-        _report_with_skeleton(doc, config, template.blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=skeleton_md)
+        _report_with_skeleton(doc, config, template.blocks, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, images, temp_dir, skeleton_md=skeleton_md, tci_images=tci_images, height_photo_index=height_photo_index, height_photo_workbook=height_photo_workbook, tci_photos=tci_photos, segment_tci_photos=segment_tci_photos)
+        # 预填充目录缓存（updateFields 关闭时 Word/WPS 打开即显示目录，页码占位待固化）
+        _populate_toc_cache(doc)
     try:
         doc.save(config.out_docx)
     except PermissionError as exc:
@@ -853,5 +1531,5 @@ def run(config, segments, height_stats, height_records, bolt_stats, bolt_records
 
     with tempfile.TemporaryDirectory(prefix="g210_report_builtin_") as temp_dir:
         config.output_dir.mkdir(parents=True, exist_ok=True)
-        log("未检测到内置 Word 模板，切换到程序化报告生成模式。")
+        log("使用 Markdown 报告模板，以程序化方式生成报告。")
         return make_report(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records, disease_image_index, temp_dir, log, skeleton_md=skeleton_md)

@@ -356,6 +356,22 @@ def resolve_report_counties(segments, filenames=(), override=None):
     return matched
 
 
+def county_route_summary(segments):
+    """区县→{路线编号}映射：识别各区县在汇总表中对应的道路编号及分段。
+
+    数据收集后各区县报告按“区县整体→每个区段详情”展开（总结文字、统计表格、
+    matplotlib 统计图、病害/螺栓示例图片匹配），分段定位统一走“路线+桩号”
+    口径（见 _segment_index）。
+    """
+    summary = {}
+    for segment in segments or []:
+        county = str(segment.get("county") or "").strip()
+        route = str(segment.get("route") or "").strip() or "G210"
+        summary.setdefault(county, {}).setdefault(route, 0)
+        summary[county][route] += 1
+    return summary
+
+
 def cell_value(cell, shared_strings=None):
     if cell.get("t") == "inlineStr":
         return "".join(t.text or "" for t in cell.findall(f".//{q(X, 't')}"))
@@ -394,17 +410,50 @@ def iter_height_rows(path):
 
 
 def iter_bolt_rows(path):
-    """定位含“拼接螺栓数量”表头的工作表并流式读取。"""
-    marker = "拼接螺栓数量".encode("utf-8")
+    """定位含“拼接螺栓数量”表头的工作表并流式读取。
+
+    表头在 sheet XML 中以共享字符串索引存储，不能按字面量探测；
+    先取共享字符串索引号，再探测各 sheet 头部是否含该索引。
+    """
+    marker_text = "拼接螺栓数量"
     with ZipFile(path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
+        marker_text_bytes = marker_text.encode("utf-8")
+        shared_index_hits = [
+            ("<v>%d</v>" % index).encode("ascii")
+            for index, value in enumerate(shared_strings)
+            if marker_text in str(value)
+        ]
+        sheet_files = [
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        ]
         sheet_name = None
-        for name in archive.namelist():
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"):
-                with archive.open(name) as probe:
-                    if marker in probe.read(8192):
-                        sheet_name = name
+        # 快速路径：共享字符串索引或字面量字节探测
+        for name in sheet_files:
+            with archive.open(name) as probe:
+                head = probe.read(32768)
+                if marker_text_bytes in head or any(hit in head for hit in shared_index_hits):
+                    sheet_name = name
+                    break
+        # 兜底：inlineStr 等其他编码——逐 sheet 解析首行表头判断
+        if sheet_name is None:
+            for name in sheet_files:
+                with archive.open(name) as stream:
+                    for _, element in ET.iterparse(stream, events=("end",)):
+                        if element.tag != q(X, "row"):
+                            continue
+                        values = {}
+                        for cell in element.findall(q(X, "c")):
+                            match = re.match(r"[A-Z]+", cell.get("r", ""))
+                            if match:
+                                values[match.group(0)] = cell_value(cell, shared_strings)
+                        if any(marker_text in str(value or "") for value in values.values()):
+                            sheet_name = name
+                        element.clear()
                         break
+                if sheet_name:
+                    break
         if sheet_name is None:
             return
         with archive.open(sheet_name) as stream:
@@ -478,7 +527,7 @@ def parse_progress(message):
 
 
 def bin_index(kind, height):
-    limits = (560, 580, 620, 640) if kind == "二波" else (657, 677, 717, 737)
+    limits = (550, 580, 620, 650) if kind == "二波" else (647, 677, 717, 747)
     if height < limits[0]:
         return 0
     if height < limits[1]:
@@ -675,10 +724,10 @@ def collect_disease_image_index(disease_dir, log=lambda _: None):
                 )
                 if drawing_relation is None:
                     continue
-                drawing_name = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_name), drawing_relation.get("Target")))
+                drawing_name = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_name), drawing_relation.get("Target"))).lstrip("/")
                 drawing_rels_name = posixpath.join(
                     posixpath.dirname(drawing_name), "_rels", posixpath.basename(drawing_name) + ".rels"
-                )
+                ).lstrip("/")
                 if drawing_name not in archive.namelist() or drawing_rels_name not in archive.namelist():
                     continue
                 rows = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
@@ -742,12 +791,236 @@ def match_disease_image(record, image_index):
 def read_disease_image(descriptor):
     with ZipFile(descriptor["workbook"]) as archive:
         data = archive.read(descriptor["media"])
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+    if data.startswith(b"\x89PNG\x0d\x0a\x1a\x0a"):
         return data, ".png"
     if data.startswith(b"\xff\xd8\xff"):
         return data, ".jpeg"
     extension = Path(descriptor["media"]).suffix.lower() or ".png"
     return data, extension
+
+
+def _anchored_image_map(path, photo_column, workbook_sheet_names=None):
+    """解析工作簿各 sheet 的浮动图片锚点，建立 (sheet名, excel行号) -> [(media部件名, 扩展名)] 映射。
+
+    - 只收锚定在 photo_column 列的图片；跳过表头行（from.row==0，含装饰图/logo）。
+    - 值为媒体部件名（懒读，不加载图片字节），调用方按需从同一工作簿读取。
+    - workbook_sheet_names: 可选 {sheet部件名: 显示sheet名}，缺省用 sheetN 部件名。
+    """
+    path = Path(path)
+    result = {}
+    with ZipFile(path) as archive:
+        sheet_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        for sheet_name in sheet_names:
+            sheet_rels_name = posixpath.join(
+                posixpath.dirname(sheet_name), "_rels", posixpath.basename(sheet_name) + ".rels"
+            )
+            if sheet_rels_name not in archive.namelist():
+                continue
+            sheet_relationships = ET.fromstring(archive.read(sheet_rels_name))
+            drawing_relation = next(
+                (relation for relation in sheet_relationships if relation.get("Type", "").endswith("/drawing")),
+                None,
+            )
+            if drawing_relation is None:
+                continue
+            drawing_name = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_name), drawing_relation.get("Target"))).lstrip("/")
+            drawing_rels_name = posixpath.join(
+                posixpath.dirname(drawing_name), "_rels", posixpath.basename(drawing_name) + ".rels"
+            ).lstrip("/")
+            if drawing_name not in archive.namelist() or drawing_rels_name not in archive.namelist():
+                continue
+            drawing_relationships = ET.fromstring(archive.read(drawing_rels_name))
+            media_by_rid = {
+                relation.get("Id"): posixpath.normpath(
+                    posixpath.join(posixpath.dirname(drawing_name), relation.get("Target"))
+                )
+                for relation in drawing_relationships
+                if relation.get("Type", "").endswith("/image")
+            }
+            drawing = ET.fromstring(archive.read(drawing_name))
+            for anchor in list(drawing):
+                anchor_from = anchor.find(q(XDR, "from"))
+                if anchor_from is None:
+                    continue
+                row_node = anchor_from.find(q(XDR, "row"))
+                col_node = anchor_from.find(q(XDR, "col"))
+                blip = anchor.find(f".//{q(A, 'blip')}")
+                if row_node is None or col_node is None or blip is None:
+                    continue
+                row_index = int(row_node.text or 0)
+                col_index = int(col_node.text or 0)
+                if row_index <= 0 or col_index != photo_column:
+                    continue
+                media_name = media_by_rid.get(blip.get(q(R, "embed")))
+                if not media_name:
+                    continue
+                # openpyxl 写绝对 Target（/xl/media/...），Excel 写相对路径；统一去前导斜杠
+                media_name = media_name.lstrip("/")
+                if media_name not in archive.namelist():
+                    continue
+                extension = Path(media_name).suffix.lower() or ".png"
+                label = sheet_name
+                if workbook_sheet_names:
+                    label = workbook_sheet_names.get(sheet_name, sheet_name)
+                excel_row = row_index + 1
+                result.setdefault((label, excel_row), []).append((media_name, extension))
+    return result
+
+
+def build_disease_image_map(disease_path):
+    """建立病害明细工作簿的 (sheet名, excel行号) -> [(媒体部件, 扩展名)] 图片映射（病害照片列）。"""
+    return _anchored_image_map(disease_path, photo_column=12)
+
+
+def build_tci_image_map(tci_path):
+    """建立 TCI 工作簿的 (sheet名, excel行号) -> [(媒体部件, 扩展名)] 图片映射（图片列）。"""
+    return _anchored_image_map(tci_path, photo_column=15)
+
+
+def read_media(path, media_name):
+    """从工作簿读取媒体部件字节并识别扩展名。"""
+    with ZipFile(path) as archive:
+        data = archive.read(media_name)
+    if data.startswith(b"\x89PNG\x0d\x0a\x1a\x0a"):
+        return data, ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return data, ".jpeg"
+    return data, Path(media_name).suffix.lower() or ".png"
+
+
+def disease_station_photo_index(disease_path, image_map):
+    """病害明细：(方向, 桩号≈1m) -> [(媒体部件, 扩展名)]。
+
+    数据行与图片锚点按 (sheet部件名, excel行号) 对齐；同一行可能有多张照片；
+    原始桩号与电子修正桩号双键索引，便于示例点按任一路径命中。
+    """
+    disease_path = Path(disease_path)
+    result = {}
+    with ZipFile(disease_path) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
+        sheet_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        for sheet_name in sheet_names:
+            if not any(key[0] == sheet_name for key in image_map):
+                continue
+            rows = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
+            for excel_row, row in rows.items():
+                photos = image_map.get((sheet_name, excel_row))
+                if not photos:
+                    continue
+                direction = normalize_direction(row.get("方向"))
+                for column in ("原始桩号", "电子修正桩号"):
+                    station = station_to_m(row.get(column))
+                    if station is not None:
+                        result.setdefault((direction, round(station, 1)), []).extend(photos)
+    return result
+
+
+def tci_type_photo_index(tci_path, image_map, routes=None):
+    """TCI 工作簿：{病害类型: [(媒体部件, 扩展名)]}，每类取第一条有图记录。
+
+    routes: 可选路线编号集合；给定后仅取该路线的行（避免串区县/串路线照片）。
+    """
+    tci_path = Path(tci_path)
+    with ZipFile(tci_path) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
+        sheet_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        if not sheet_names:
+            return {}
+        sheet_name = sheet_names[0]
+        rows = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
+    type_columns = [
+        ("防护设施缺损（处）", "防护设施缺损"),
+        ("标志缺损（处）", "交通标志缺损"),
+        ("标线缺损（m）", "交通标线缺损"),
+    ]
+    result = {}
+    for (sheet, excel_row), photos in image_map.items():
+        if sheet != sheet_name:
+            continue
+        row = rows.get(excel_row)
+        if not row:
+            continue
+        if routes:
+            row_route = _route(row.get("路线编号"))
+            if row_route and row_route not in {_route(r) for r in routes}:
+                continue
+        for column, label in type_columns:
+            value = row.get(column)
+            if value is not None:
+                try:
+                    positive = float(value) > 0
+                except (TypeError, ValueError):
+                    positive = False
+                if positive:
+                    result.setdefault(label, photos)
+    return result
+
+
+def build_segment_tci_photos(tci_path, image_map, segments):
+    """TCI 工作簿：段序号 -> [(病害描述, 媒体部件, 扩展名)]（仅含图片的行）。
+
+    按 路线+方向+桩号（原始/电子修正）落在 segments 区间内匹配；病害描述取
+    「防护设施缺损/交通标志缺损/交通标线缺损」三列中第一个非空值（具体病害名，
+    如“反光膜污染”“标志板遮挡”）。
+    """
+    tci_path = Path(tci_path)
+    if not segments or not image_map:
+        return {}
+    with ZipFile(tci_path) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
+        sheet_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        if not sheet_names:
+            return {}
+        rows = _xlsx_sheet_rows(archive, sheet_names[0], shared_strings)
+    desc_columns = ("防护设施缺损", "交通标志缺损", "交通标线缺损")
+    result = {}
+    for (sheet, excel_row), photos in image_map.items():
+        if sheet != sheet_names[0]:
+            continue
+        row = rows.get(excel_row)
+        if not row:
+            continue
+        direction = normalize_direction(row.get("方向"))
+        station = None
+        for column in ("电子修正桩号", "原始桩号"):
+            station = station_to_m(row.get(column))
+            if station is not None:
+                break
+        if station is None:
+            continue
+        description = ""
+        for column in desc_columns:
+            value = str(row.get(column) or "").strip()
+            if value:
+                description = value
+                break
+        route = _route(row.get("路线编号"))
+        for idx, seg in enumerate(segments):
+            seg_route = _route(seg.get("route"))
+            if seg_route and route and seg_route != route:
+                continue
+            seg_direction = normalize_direction(seg.get("direction"))
+            if seg_direction and seg_direction != direction:
+                continue
+            start = float(seg.get("start") or 0)
+            end = float(seg.get("end") or 0)
+            if start <= station <= end:
+                for media_name, extension in photos:
+                    result.setdefault(idx, []).append((description or "病害", media_name, extension))
+                break
+    return result
 
 
 def bolt_missing_rate(splice, connection, missing):
@@ -1024,8 +1297,14 @@ def style_sheet(ws, widths):
     ws.auto_filter.ref = ws.dimensions
 
 
-def add_interval_sheets(out_path, summary_path, log=lambda _: None):
-    segments = read_segments(summary_path)
+def add_interval_sheets(out_path, summary_path, log=lambda _: None, segments=None):
+    """按给定分段（默认重读汇总表全量）展开区间明细表。
+
+    区县子报告必须传入该区县的 segments，使区间表收敛到本区县/本区段；
+    无区县维度（旧汇总表）或“仅更新区间明细”模式仍走全量汇总表。
+    """
+    if segments is None:
+        segments = read_segments(summary_path)
     wb = openpyxl.load_workbook(out_path)
     for name in list(wb.sheetnames):
         if name.startswith("区间"):
@@ -1088,8 +1367,8 @@ def make_excel(
     wb.remove(wb.active)
     if height_stats is not None:
         for title, kind, labels in (
-            ("二波统计", "二波", ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"]),
-            ("三波统计", "三波", ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"]),
+            ("二波统计", "二波", ["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"]),
+            ("三波统计", "三波", ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"]),
         ):
             ws = wb.create_sheet(title)
             if has_county:
@@ -1282,7 +1561,7 @@ def make_excel(
     wb.save(config.out_xlsx)
     log(f"统计工作簿已生成：{config.out_xlsx}")
     if height_stats is not None:
-        add_interval_sheets(config.out_xlsx, config.summary_xlsx, log)
+        add_interval_sheets(config.out_xlsx, config.summary_xlsx, log, segments)
 
 
 def run_properties(bold=False, size=21):
@@ -1470,7 +1749,7 @@ def add_multilevel_numbering(numbering_xml):
 
 
 def percentage_phrases(kind, percentages):
-    limits = (560, 580, 620, 640) if kind == "二波" else (657, 677, 717, 737)
+    limits = (550, 580, 620, 650) if kind == "二波" else (647, 677, 717, 747)
     labels = [
         f"小于{limits[0]}mm的约占{{:.2f}}%",
         f"介于{limits[0]}～{limits[1]}mm的约占{{:.2f}}%",
@@ -1495,29 +1774,63 @@ def order_example_records(records):
     return sorted(records, key=key)
 
 
-def select_height_example_points(rows, segment_index=0, kind=""):
-    """按检测点数量和高度分位选择自动计算示例点，返回顺序固定且可复现。"""
+def row_has_height_photo(row, photo_index):
+    """示例行是否命中病害照片索引（(方向, 桩号≈0.1m) 双键，任一桩号键命中即可）。"""
+    if not photo_index:
+        return False
+    direction = normalize_direction(row.get("direction"))
+    for station_key in ("raw_station", "electronic_station", "station"):
+        station = row.get(station_key)
+        if station is None:
+            continue
+        if photo_index.get((direction, round(float(station), 1))):
+            return True
+    return False
+
+
+def select_height_example_points(rows, segment_index=0, kind="", photo_index=None):
+    """按检测点数量和高度分位选择自动计算示例点，返回顺序固定且可复现。
+
+    photo_index 提供时优先从各分位区间内“带病害照片”的行中选取，
+    使自动计算示例尽量挂上现场照片；区间内无照片行时回退原中位/随机选择。
+    """
     ordered = sorted(rows, key=lambda item: (item["height"], item["station"]))
     count = len(ordered)
     if not count:
         return []
+
+    def prefer_photo(group):
+        if photo_index is not None:
+            photo_rows = [r for r in group if row_has_height_photo(r, photo_index)]
+            if photo_rows:
+                return photo_rows[len(photo_rows) // 2]
+        return group[len(group) // 2]
+
     if count > 1000:
         selected = []
         for index in range(4):
             start = index * count // 4
             end = (index + 1) * count // 4
             group = ordered[start:end]
-            selected.append(group[len(group) // 2])
+            selected.append(prefer_photo(group))
         return order_example_records(selected)
     if count > 100:
         quarter_count = max(1, math.ceil(count * 0.25))
-        randomizer = random.Random(f"G210|{segment_index}|{kind}|{count}")
+        randomizer = random.Random(f"{segment_index}|{kind}|{count}")
+        low, high = ordered[:quarter_count], ordered[-quarter_count:]
+        if photo_index is not None:
+            low_photo = [r for r in low if row_has_height_photo(r, photo_index)]
+            high_photo = [r for r in high if row_has_height_photo(r, photo_index)]
+            if low_photo:
+                low = low_photo
+            if high_photo:
+                high = high_photo
         return order_example_records([
-            randomizer.choice(ordered[:quarter_count]),
-            randomizer.choice(ordered[-quarter_count:]),
+            randomizer.choice(low),
+            randomizer.choice(high),
         ])
     # 偶数个点时采用靠前的中位点，确保选中的是实际存在的数据点。
-    return order_example_records([ordered[(count - 1) // 2]])
+    return order_example_records([prefer_photo(ordered)])
 
 
 def select_bolt_example_points(rows, disease_image_index=None):
@@ -1605,8 +1918,8 @@ def report_images(temp_dir, segments, stats, records):
             figure.savefig(line_path, transparent=False); plt.close(figure)
 
             values = item["types"][kind]["pcts"]
-            labels = (["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"] if kind == "二波" else
-                      ["h＜657", "657≤h＜677", "677≤h≤717", "717＜h≤737", "h＞737"])
+            labels = (["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"] if kind == "二波" else
+                      ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"])
             nonzero = [(label, value, f"#{PIE_COLORS[i]}") for i, (label, value) in enumerate(zip(labels, values)) if value > 0]
             figure, axis = plt.subplots(figsize=(14 / 2.54, 8.5 / 2.54), dpi=180)
             wedges, _, _ = axis.pie(
@@ -1618,6 +1931,41 @@ def report_images(temp_dir, segments, stats, records):
             figure.subplots_adjust(left=0.02, right=0.76, top=0.88, bottom=0.05)
             figure.savefig(pie_path, transparent=False); plt.close(figure)
             images[key] = {"line": line_path, "pie": pie_path}
+    return images
+
+
+def report_tci_images(temp_dir, segments, tci_stats):
+    """逐分段 TCI 病害构成分布图：防护-轻/防护-重/标志缺损/标线缺损(m)柱状图。
+
+    只对有有效记录（count>0）的分段成图；无数据分段由报告写占位句、不挂图。
+    返回 {segment_index: Path}，供 minimal_docx._section_tci 挂图。
+    """
+    images = {}
+    plt.rcParams["font.sans-serif"] = ["SimSun", "Microsoft YaHei", "Arial Unicode MS"]
+    plt.rcParams["axes.unicode_minus"] = False
+    for segment_index, item in enumerate(tci_stats or []):
+        if not item or int(item.get("count") or 0) <= 0:
+            continue
+        segment = segments[segment_index] if segment_index < len(segments) else {}
+        route = str(segment.get("route", "G210") if isinstance(segment, dict) else "G210")
+        try:
+            start_text = format_station(segment["start"]) if isinstance(segment, dict) else ""
+            end_text = format_station(segment["end"]) if isinstance(segment, dict) else ""
+        except (KeyError, TypeError, ValueError):
+            start_text, end_text = "", ""
+        labels = ["防护-轻(处)", "防护-重(处)", "标志缺损(处)", "标线缺损(m)"]
+        values = [item.get("light", 0), item.get("heavy", 0), item.get("sign", 0), item.get("marking", 0)]
+        figure, axis = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
+        bars = axis.bar(labels, values, color=["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000"])
+        axis.set_ylabel("数量")
+        axis.set_title(f"{route}线{start_text}～{end_text}段沿线设施病害构成（TCI{item.get('tci', 0):.2f}·{item.get('grade', '')}）", fontsize=10)
+        for bar, value in zip(bars, values):
+            axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:g}", ha="center", va="bottom", fontsize=8)
+        figure.subplots_adjust(left=0.10, right=0.98, top=0.88, bottom=0.22)
+        out_path = Path(temp_dir) / f"tci_{segment_index}.png"
+        figure.savefig(out_path, transparent=False)
+        plt.close(figure)
+        images[segment_index] = out_path
     return images
 
 
@@ -1656,7 +2004,7 @@ def make_docx(
     if config.template_docx.suffix.lower() != ".md":
         raise ValueError(f"仅支持 Markdown 模板：{config.template_docx}，请使用 .md 模板。")
     if not config.template_docx.is_file():
-        raise FileNotFoundError(f"Word模板不存在：{config.template_docx}")
+        raise FileNotFoundError(f"Markdown 模板不存在：{config.template_docx}")
     from backend import minimal_docx
     log("使用 Markdown 报告模板。")
     return minimal_docx.run(
@@ -1676,14 +2024,19 @@ def add_distribution_charts(wb, source_name, target_name):
     display_name = source_name.replace("双波", "二波").replace("两波", "二波")
     target["A1"] = f"{display_name}各区段波形梁护栏横梁中心高度分布情况图"
     target["A1"].font = Font(size=14, bold=True)
+    # 按表头定位列：区县模式比无区县模式多一列“区县”，硬编码列号会错位（R3）。
+    headers = [cell.value for cell in source[1]]
+    start_col = headers.index("起点桩号") + 1
+    end_col = headers.index("终点桩号") + 1
+    count_col = headers.index("检测点数") + 1
     count = 0
     for row in range(2, source.max_row + 1):
-        start, end = source.cell(row, 5).value, source.cell(row, 6).value
+        start, end = source.cell(row, start_col).value, source.cell(row, end_col).value
         if not start or not end:
             continue
         chart = PieChart()
-        chart.add_data(Reference(source, min_col=9, max_col=13, min_row=row, max_row=row), from_rows=True)
-        chart.set_categories(Reference(source, min_col=9, max_col=13, min_row=1, max_row=1))
+        chart.add_data(Reference(source, min_col=count_col + 1, max_col=count_col + 5, min_row=row, max_row=row), from_rows=True)
+        chart.set_categories(Reference(source, min_col=count_col + 1, max_col=count_col + 5, min_row=1, max_row=1))
         chart.title, chart.legend.position, chart.roundedCorners = f"{start}-{end}", "r", False
         chart.title.tx.rich.p[0].r[0].rPr = CharacterProperties(
             latin=DrawingFont(typeface="Times New Roman"),
@@ -1701,7 +2054,7 @@ def add_distribution_charts(wb, source_name, target_name):
         # 对占比为0的扇区单独设置删除标签，避免显示0.00%。
         zero_labels = []
         for index in range(5):
-            if not (source.cell(row, 9 + index).value or 0):
+            if not (source.cell(row, count_col + 1 + index).value or 0):
                 label = DataLabel(idx=index)
                 label.delete = True
                 zero_labels.append(label)
@@ -1872,77 +2225,167 @@ def generate_statistics_and_report(
         if config.disease_dir is None or not Path(config.disease_dir).is_dir():
             raise FileNotFoundError("处理螺栓缺失时，请选择有效的病害清单文件夹。")
         disease_image_index = collect_disease_image_index(config.disease_dir, log)
-    make_excel(
-        config, segments,
-        height_stats=height_stats, height_records=height_records,
-        height_duplicates=height_duplicates, excluded=excluded,
-        bolt_stats=bolt_stats, bolt_records=bolt_records, bolt_duplicates=bolt_duplicates,
-        tci_stats=tci_stats, tci_records=tci_records,
-        log=log,
-    )
-    if generate_charts_first and process_height:
-        add_charts(config.out_xlsx, log)
-    make_docx(
-        config, segments,
-        height_stats=height_stats, height_records=height_records,
-        bolt_stats=bolt_stats, bolt_records=bolt_records,
-        tci_stats=tci_stats, tci_records=tci_records,
-        disease_image_index=disease_image_index, log=log,
-        require_template=require_template,
-    )
-    # 按区县分报告：若含区县则为每个区县单独生成一份（文件名前缀区县）
-    has_county = bool(segments and any(s.get("county") for s in segments))
-    if has_county and segments:
-        from collections import defaultdict
-        by_county = defaultdict(list)
-        for idx, seg in enumerate(segments):
-            by_county[seg.get("county","")].append(idx)
-        for county, idxs in by_county.items():
-            if not county:
-                continue
-            sub_segments = [segments[i] for i in idxs]
-            # 重映射记录的 segment 索引到子集 0..n-1
-            def _remap(records):
-                out=[]
-                mp={orig:new for new,orig in enumerate(idxs)}
-                for r in records:
-                    if r["segment"] in mp:
-                        nr=dict(r)
-                        nr["segment"]=mp[r["segment"]]
-                        out.append(nr)
-                return out
-            sub_height_stats = [height_stats[i] for i in idxs] if height_stats else None
-            # 调整 stats 内 segment 引用到 sub_segments
-            if sub_height_stats:
-                for ns, st in zip(sub_segments, sub_height_stats):
-                    st["segment"]=ns
-            sub_bolt_stats = [bolt_stats[i] for i in idxs] if bolt_stats else None
-            if sub_bolt_stats:
-                for ns, st in zip(sub_segments, sub_bolt_stats):
-                    st["segment"]=ns
-            sub_tci_stats = [tci_stats[i] for i in idxs] if tci_stats else None
-            if sub_tci_stats:
-                for ns, st in zip(sub_segments, sub_tci_stats):
-                    st["segment"]=ns
-            sub_height_records = _remap(height_records)
-            sub_bolt_records = _remap(bolt_records)
-            sub_tci_records = _remap(tci_records)
-            sub_out = config.output_dir / county
-            sub_out.mkdir(parents=True, exist_ok=True)
-            sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None), county=county)
-            # 复用 make_excel/make_docx 生成子报告
-            try:
-                make_excel(sub_cfg, sub_segments, height_stats=sub_height_stats, height_records=sub_height_records, height_duplicates=height_duplicates, excluded=excluded, bolt_stats=sub_bolt_stats, bolt_records=sub_bolt_records, bolt_duplicates=bolt_duplicates, tci_stats=sub_tci_stats, tci_records=sub_tci_records, log=log)
-                make_docx(sub_cfg, sub_segments, height_stats=sub_height_stats, height_records=sub_height_records, bolt_stats=sub_bolt_stats, bolt_records=sub_bolt_records, tci_stats=sub_tci_stats, tci_records=sub_tci_records, disease_image_index=disease_image_index, log=log, require_template=False)
-                log(f"区县分报告已生成：{county} -> {sub_out}")
-            except Exception as e:
-                log(f"区县 {county} 分报告生成失败：{e}")
+    for county, routes in sorted(county_route_summary(segments).items()):
+        if not county:
+            continue
+        detail = "、".join(f"{route}{count}段" for route, count in sorted(routes.items()))
+        log(f"区县{county}：识别到道路编号{detail}。")
+
+    def _write_outputs(cfg, segs, h_stats, h_recs, b_stats, b_recs, t_stats, t_recs):
+        make_excel(
+            cfg, segs,
+            height_stats=h_stats, height_records=h_recs,
+            height_duplicates=height_duplicates, excluded=excluded,
+            bolt_stats=b_stats, bolt_records=b_recs, bolt_duplicates=bolt_duplicates,
+            tci_stats=t_stats, tci_records=t_recs,
+            log=log,
+        )
+        if generate_charts_first and process_height and h_stats is not None:
+            add_charts(cfg.out_xlsx, log)
+        make_docx(
+            cfg, segs,
+            height_stats=h_stats, height_records=h_recs,
+            bolt_stats=b_stats, bolt_records=b_recs,
+            tci_stats=t_stats, tci_records=t_recs,
+            disease_image_index=disease_image_index, log=log,
+            require_template=require_template,
+        )
+
+    # R2：不再生成整体报告，只逐区县生成。单区县时顶层直接用区县命名即为该区县报告；
+    # 多区县时只生成各区县子目录报告，不生成顶层整体文件。无区县维度（旧汇总表）保留 legacy 行为。
+    counties = sorted({str(s.get("county") or "").strip() for s in segments if str(s.get("county") or "").strip()})
+    if counties and segments:
+        if len(counties) == 1:
+            if not getattr(config, "county", None):
+                config.county = counties[0]
+            _write_outputs(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records)
+        else:
+            from collections import defaultdict
+            by_county = defaultdict(list)
+            for idx, seg in enumerate(segments):
+                by_county[seg.get("county", "")].append(idx)
+            for county, idxs in by_county.items():
+                if not county:
+                    continue
+                sub_segments = [segments[i] for i in idxs]
+                # 重映射记录的 segment 索引到子集 0..n-1
+                def _remap(records):
+                    out = []
+                    mp = {orig: new for new, orig in enumerate(idxs)}
+                    for r in records:
+                        if r["segment"] in mp:
+                            nr = dict(r)
+                            nr["segment"] = mp[r["segment"]]
+                            out.append(nr)
+                    return out
+                # 浅拷贝 stats 后再调整 segment 引用，避免污染其他区县
+                sub_height_stats = [dict(height_stats[i]) for i in idxs] if height_stats else None
+                if sub_height_stats:
+                    for ns, st in zip(sub_segments, sub_height_stats):
+                        st["segment"] = ns
+                sub_bolt_stats = [dict(bolt_stats[i]) for i in idxs] if bolt_stats else None
+                if sub_bolt_stats:
+                    for ns, st in zip(sub_segments, sub_bolt_stats):
+                        st["segment"] = ns
+                sub_tci_stats = [dict(tci_stats[i]) for i in idxs] if tci_stats else None
+                if sub_tci_stats:
+                    for ns, st in zip(sub_segments, sub_tci_stats):
+                        st["segment"] = ns
+                sub_height_records = _remap(height_records)
+                sub_bolt_records = _remap(bolt_records)
+                sub_tci_records = _remap(tci_records)
+                sub_out = config.output_dir / county
+                sub_out.mkdir(parents=True, exist_ok=True)
+                sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None), county=county)
+                # 复用 make_excel/make_docx 生成子报告
+                try:
+                    _write_outputs(sub_cfg, sub_segments, sub_height_stats, sub_height_records, sub_bolt_stats, sub_bolt_records, sub_tci_stats, sub_tci_records)
+                    log(f"区县分报告已生成：{county} -> {sub_out}")
+                except Exception as e:
+                    log(f"区县 {county} 分报告生成失败：{e}")
+    else:
+        _write_outputs(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records)
 
     if process_height:
         log(f"中心高度有效记录{len(height_records)}条；备注排除{sum(excluded.values())}条；重复排除{height_duplicates}条。")
     if process_bolts:
         log(f"螺栓有效记录{len(bolt_records)}条；重复排除{bolt_duplicates}条。")
     return {"height": height_stats, "bolts": bolt_stats, "tci": tci_stats}
+
+
+def _workbook_head_text(path, max_rows=3, max_sheets=3):
+    """读取工作簿前几张表前几行的文本，供 discover 回退按表头确认文件类型。"""
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return ""
+    try:
+        texts = []
+        for sheet_name in wb.sheetnames[:max_sheets]:
+            try:
+                ws = wb[sheet_name]
+            except Exception:
+                continue
+            try:
+                for row in ws.iter_rows(min_row=1, max_row=max_rows, values_only=True):
+                    for value in row or ():
+                        if value is not None and str(value).strip():
+                            texts.append(str(value).strip())
+            except Exception:
+                continue
+        return "\n".join(texts)
+    except Exception:
+        return ""
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
+def _fallback_summary_file(folder):
+    """汇总表回退：*汇总*/*整理*.xlsx，按表头含路线/桩号列确认；旧死文件名优先（见 discover_paths）。"""
+    candidates = []
+    for path in sorted(folder.rglob("*.xlsx")):
+        if path.name.startswith("~$"):
+            continue
+        if "汇总" not in path.name and "整理" not in path.name:
+            continue
+        head = _workbook_head_text(path)
+        if "路线" in head and "桩号" in head:
+            candidates.append(path)
+    candidates.sort(key=lambda p: (0 if "汇总" in p.name else 1, str(p)))
+    return candidates[0] if candidates else None
+
+
+def _fallback_detail_dir(folder):
+    """明细回退：*明细*.xlsx（排除病害清单），按表头含护栏/螺栓列确认；返回含匹配最多的目录。"""
+    grouped: dict = {}
+    for path in sorted(folder.rglob("*.xlsx")):
+        if path.name.startswith("~$"):
+            continue
+        if "明细" not in path.name or "病害" in path.name:
+            continue
+        head = _workbook_head_text(path)
+        if "护栏类型" in head or "梁板中心高度" in head or "拼接螺栓数量" in head:
+            grouped.setdefault(path.parent, []).append(path)
+    if not grouped:
+        return None
+    return max(grouped.items(), key=lambda item: (len(item[1]), str(item[0])))[0]
+
+
+def _fallback_disease_dir(folder):
+    """病害清单回退：*病害*.xlsx；返回含匹配最多的目录。"""
+    grouped: dict = {}
+    for path in sorted(folder.rglob("*.xlsx")):
+        if path.name.startswith("~$"):
+            continue
+        if "病害" not in path.name:
+            continue
+        grouped.setdefault(path.parent, []).append(path)
+    if not grouped:
+        return None
+    return max(grouped.items(), key=lambda item: (len(item[1]), str(item[0])))[0]
 
 
 def discover_paths(folder):
@@ -1963,6 +2406,13 @@ def discover_paths(folder):
     detail = max(detail_candidates, default=(0, None))[1]
     disease = max(disease_candidates, default=(0, None))[1]
     tci = max(tci_candidates, default=(0, None))[1]
+    # 旧文件名优先；真实文件（整理/明细/病害命名）走回退识别。
+    if summary is None:
+        summary = _fallback_summary_file(folder)
+    if detail is None:
+        detail = _fallback_detail_dir(folder)
+    if disease is None:
+        disease = _fallback_disease_dir(folder)
     return summary, detail, disease, tci
 
 
@@ -2093,7 +2543,7 @@ class GuardrailApp(tk.Tk):
             if "螺栓缺失" in selected and (config.disease_dir is None or not config.disease_dir.is_dir()):
                 raise FileNotFoundError("处理螺栓缺失时，请选择有效的病害清单文件夹。")
             if not config.template_docx.is_file():
-                raise FileNotFoundError(f"内置Word报告模板不存在：{config.template_docx}")
+                raise FileNotFoundError(f"内置报告模板不存在：{config.template_docx}")
         elif mode == self.MODES[2]:
             if "中心高度" not in selected: raise ValueError("更新区间明细仅适用于中心高度，请勾选中心高度。")
             if not config.out_xlsx.is_file(): raise FileNotFoundError(f"未找到统计工作簿：{config.out_xlsx}")
@@ -3501,7 +3951,7 @@ def _gd_height_charts(rows, route, direction, chart_dir, prefix=""):
             plt.close(fig)
 
             pie_path = chart_dir / f"{prefix}height_{safe_route}_{safe_dir}_{safe_seg}_{kind}_pie.png"
-            limits = (560, 580, 620, 640) if kind == "二波" else (657, 677, 717, 737)
+            limits = (550, 580, 620, 650) if kind == "二波" else (647, 677, 717, 747)
             labels = [
                 f"h＜{limits[0]}", f"{limits[0]}≤h＜{limits[1]}",
                 f"{limits[1]}≤h≤{limits[2]}", f"{limits[2]}＜h≤{limits[3]}", f"h＞{limits[3]}",
@@ -3711,7 +4161,7 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         if not points:
             continue
         standards = (580, 620) if kind == "二波" else (677, 717)
-        limits = (560, 580, 620, 640) if kind == "二波" else (657, 677, 717, 737)
+        limits = (550, 580, 620, 650) if kind == "二波" else (647, 677, 717, 747)
         header_row = line_slot
         header_cells(ws, header_row, [
             "桩号", "梁板中心高度(mm)", f"标准值（{standards[0]}mm）", f"标准值（{standards[1]}mm）",

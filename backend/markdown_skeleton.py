@@ -282,6 +282,11 @@ def parse_blocks(text: str) -> list[Block]:
             blocks.append(Block("toc"))
             index += 1
             continue
+        if re.match(r"^<!--\s*formula:\s*(?:tci|gd|w|i0)\s*-->.*$", stripped):
+            # Formula markers are standalone semantic blocks even without a blank line.
+            blocks.append(Block("paragraph", text=stripped))
+            index += 1
+            continue
         cover = re.match(r"^#\s*@cover\s+(.*)$", stripped)
         if cover:
             blocks.append(Block("cover", text=cover.group(1).strip()))

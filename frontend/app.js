@@ -110,7 +110,7 @@
     } else if (filled === required.length) {
       status.textContent = '资料已就绪';
     } else {
-      status.textContent = `已配置 ${filled}/${required.length} 项`;
+      status.textContent = '等待选择资料';
       status.classList.add('is-warning');
     }
     updateActionAvailability();
@@ -127,12 +127,6 @@
     document.getElementById('pageTitle').textContent = template === 'cq'
       ? '重庆项目资料配置'
       : '广东项目资料配置';
-    document.getElementById('pageDescription').textContent = template === 'cq'
-      ? '选择检测资料所在位置。系统将生成统计工作簿和第五部分检测报告。'
-      : '按地市扫描标线与护栏数据，生成评价报告、图表工作簿和人工复核对比。';
-    document.getElementById('sourceHint').textContent = template === 'cq'
-      ? '6 项必填，1 项可选'
-      : '4 项必填，2 项可选，3 项阈值';
     addLog(`已切换至${template === 'cq' ? '重庆' : '广东'}项目模板`);
     updateConfigStatus();
   }
@@ -348,10 +342,10 @@
         if (!info.exists) state.missingTemplates.add(name);
       });
       if (state.missingTemplates.has('广东项目第五章模板')) {
-        environmentStatus.innerHTML = '数据仅在本机处理<br><strong>广东模板待补充</strong>';
+        environmentStatus.innerHTML = '<strong>广东模板待补充</strong>';
         addLog('未检测到广东第五章模板：广东报告需要该模板，重庆报告可程序化生成。', 'error');
       } else {
-        environmentStatus.innerHTML = '数据仅在本机处理<br>桌面服务已连接';
+        environmentStatus.innerHTML = '桌面服务已连接';
         addLog('桌面服务已连接，内置模板检查通过', 'ok');
       }
       updateConfigStatus();
@@ -377,7 +371,7 @@
   updateConfigStatus();
   setTimeout(() => {
     if (!state.desktop && !desktopApi()) {
-      environmentStatus.innerHTML = '浏览器预览模式<br>本地文件功能仅在桌面版可用';
+      environmentStatus.innerHTML = '本地文件功能仅在桌面版可用';
       addLog('当前为浏览器预览模式', 'error');
       updateConfigStatus();
     }

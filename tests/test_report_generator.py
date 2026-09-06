@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import openpyxl
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -115,6 +118,21 @@ title = """目录
         self.assertFalse(any(block.kind == "toc" for block in guangdong.blocks))
         for config in (chongqing.config, guangdong.config):
             self.assertEqual(set(config), {"page", "body", "heading", "table", "caption", "toc"})
+
+    def test_chongqing_template_conclusion_has_single_injection_without_static_duplicates(self) -> None:
+        # D2 回归锁：结论以程序注入为准，模板不得残留静态 5.1结论/5.2建议。
+        from backend import minimal_docx
+
+        root = Path(__file__).resolve().parents[1]
+        template = markdown_skeleton.read_template(root / "templates" / "重庆项目报告模板.md")
+        anchors = [block for block in template.blocks if block.text and "inject:conclusion" in block.text]
+        self.assertEqual(len(anchors), 1)
+        static_leftovers = [
+            block.text
+            for block in template.blocks
+            if block.kind == "heading" and minimal_docx._strip_section_number(block.text) in ("结论", "建议")
+        ]
+        self.assertEqual(static_leftovers, [])
 
     def test_invalid_template_config_reports_path_and_field(self) -> None:
         cases = (
@@ -469,6 +487,67 @@ class SharedRulesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             minimal_docx._section_bolt(document, [segment], [stat], [], {}, temp_dir)
         self.assertIn("缺失率为%。", "\n".join(p.text for p in document.paragraphs))
+
+    def test_docx_bolt_zero_points_with_height_data_uses_neutral_sentence(self) -> None:
+        # D6：同段高度有有效数据时，不得写“本段无波形护栏”。
+        segment = {
+            "county": "测试区",
+            "route": "G1",
+            "start": 1000.0,
+            "end": 2000.0,
+            "mileage": 1.0,
+        }
+        stat = {
+            "segment": segment,
+            "splice": 0,
+            "connection": 0,
+            "missing": 0,
+            "rate": None,
+            "points": 0,
+        }
+        height_stats = [{
+            "segment": segment,
+            "types": {
+                "二波": {"count": 12, "bins": [0, 0, 12, 0, 0], "pcts": [0, 0, 100, 0, 0], "pass": 100},
+                "三波": {"count": 0, "bins": [0, 0, 0, 0, 0], "pcts": [0, 0, 0, 0, 0], "pass": 0},
+            },
+        }]
+        document = Document()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            minimal_docx._section_bolt(document, [segment], [stat], [], {}, temp_dir, height_stats)
+        text = "\n".join(p.text for p in document.paragraphs)
+        self.assertIn("本段螺栓明细无有效记录", text)
+        self.assertNotIn("本段无波形护栏", text)
+
+    def test_docx_bolt_zero_points_without_height_data_keeps_no_guardrail_sentence(self) -> None:
+        # D6：高度同样无数据时，保留“本段无波形护栏”判断。
+        segment = {
+            "county": "测试区",
+            "route": "G1",
+            "start": 1000.0,
+            "end": 2000.0,
+            "mileage": 1.0,
+        }
+        stat = {
+            "segment": segment,
+            "splice": 0,
+            "connection": 0,
+            "missing": 0,
+            "rate": None,
+            "points": 0,
+        }
+        height_stats = [{
+            "segment": segment,
+            "types": {
+                "二波": {"count": 0, "bins": [0, 0, 0, 0, 0], "pcts": [0, 0, 0, 0, 0], "pass": 0},
+                "三波": {"count": 0, "bins": [0, 0, 0, 0, 0], "pcts": [0, 0, 0, 0, 0], "pass": 0},
+            },
+        }]
+        document = Document()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            minimal_docx._section_bolt(document, [segment], [stat], [], {}, temp_dir, height_stats)
+        text = "\n".join(p.text for p in document.paragraphs)
+        self.assertIn("本段无波形护栏", text)
 
 
     def test_iter_height_rows_resolves_shared_string_headers(self) -> None:
@@ -853,9 +932,9 @@ def build_demo_stats(segments, records):
 def report_engine_bin(record):
     kind = record["kind"]
     if kind == "二波":
-        limits = (560, 580, 620, 640)
+        limits = (550, 580, 620, 650)
     else:
-        limits = (657, 677, 717, 737)
+        limits = (647, 677, 717, 747)
     height = record["height"]
     if height < limits[0]:
         return 0
@@ -1011,10 +1090,19 @@ class MinimalDocxTests(unittest.TestCase):
             skeleton.write_text(
                 "# 2026年普通公路国省道交通安全设施自动化检测报告\n\n"
                 "## 1.1 项目概况\n\n"
+                "<!-- inject:overview -->\n\n"
                 "本报告依据委托单位提供的数据生成。\n\n"
-                "## 3.1 G210线整体情况\n\n"
+                "## 1.2 检测依据\n\n"
+                "依据《公路技术状况评定标准》开展检测。\n\n"
+                "# 3 沿线设施技术状况评价\n\n"
+                "<!-- inject:tci -->\n\n"
+                "# 4 波形梁护栏横梁中心高度检测结果\n\n"
+                "<!-- inject:height -->\n\n"
                 "### 3.2 G210线K2264+000~K2265+000段（样例）\n\n"
-                "## 5 结论与建议\n\n"
+                "# 5 波形梁护栏螺栓缺失\n\n"
+                "<!-- inject:bolt -->\n\n"
+                "# 6 结论与建议\n\n"
+                "<!-- inject:conclusion -->\n\n"
                 "## 6 建议\n\n"
                 "标志牌安装情况检查合格。\n",
                 encoding="utf-8",
@@ -1050,6 +1138,57 @@ class MinimalDocxTests(unittest.TestCase):
             self.assertIn("波形梁护栏横梁中心高度检测结果", text)
             self.assertIn("结论与建议", text)
             self.assertNotIn("（样例）", text)
+
+    def test_conclusion_renders_once_despite_static_template_leftovers(self) -> None:
+        # D2：即使模板残留静态 5.1结论/5.2建议，结论/建议也只渲染一轮。
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skeleton = root / "重庆项目报告模板.md"
+            skeleton.write_text(
+                "# 2026年普通公路国省道交通安全设施自动化检测报告\n\n"
+                "## 1.1 项目概况\n\n"
+                "# 5 结论与建议\n\n"
+                "<!-- inject:conclusion -->\n\n"
+                "## 5.1 结论\n\n"
+                "结论章节由程序根据检测统计自动生成。\n\n"
+                "## 5.2 建议\n\n"
+                "建议章节由程序根据检测统计自动生成。\n",
+                encoding="utf-8",
+            )
+            config = engine.Config(
+                project_dir=root,
+                summary_xlsx=root / "summary.xlsx",
+                detail_dir=root,
+                template_docx=skeleton,
+                output_dir=root / "output",
+                disease_dir=None,
+            )
+            segments = build_demo_segments()
+            records = build_demo_height_records()
+            bolt_records = build_demo_bolt_records()
+            height_stats = build_demo_stats(segments, records)
+            bolt_stats = engine.make_bolt_stats(segments, bolt_records)
+            result = minimal_docx.run(
+                config,
+                segments,
+                height_stats,
+                records,
+                bolt_stats,
+                bolt_records,
+                None,
+                skeleton_md=skeleton,
+            )
+            self.assertTrue(result.is_file())
+            document = Document(result)
+            headings = [p.text for p in document.paragraphs if p.style.name.startswith("Heading")]
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            self.assertEqual(headings.count("结论"), 1, headings)
+            self.assertEqual(headings.count("建议"), 1, headings)
+            self.assertFalse(any("5.1" in h or "5.2" in h for h in headings), headings)
+            self.assertNotIn("由程序根据检测统计自动生成", text)
+            # D6 联动：第二段螺栓无记录但高度有数据，应为中性表述。
+            self.assertIn("本段螺栓明细无有效记录", text)
+            self.assertNotIn("本段无波形护栏", text)
 
     def test_overview_table_has_county_column(self) -> None:
         segs = [{"county": "两江新区", "route": "G210", "route_name": "满都拉－防城港", "grade": "一级公路", "start": 2157392, "end": 2159964, "mileage": 2.572, "total_mileage": 37.476, "manager": ""}]
@@ -1716,6 +1855,132 @@ class ChongqingHeadingNumberingTests(unittest.TestCase):
         by_style = self._paragraphs_by_style(document)
         self.assertEqual(by_style["Heading1"][0][0], "2026年普通公路检测报告")
 
+    def test_numbering_symbols_are_black_on_all_levels(self) -> None:
+        # T9：抽象编号全部 lvl 的 rPr 直接黑；标题汉字 run 已黑，不动（字体测试另覆）。
+        _, numbering = self._document_xml(
+            "# 1 概况\n\n## 1.1 项目概况\n\n### 2.3.1 评价\n"
+        )
+        from xml.etree import ElementTree as ET
+
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        root = ET.fromstring(numbering)
+        # 默认模板自带多个抽象编号：只校验与 Heading 样式绑定的那一个（我们创建的）。
+        ours = [
+            abstract for abstract in root.findall(".//w:abstractNum", ns)
+            if any(
+                (style.get(qn("w:val")) or "").startswith("Heading")
+                for style in abstract.findall(".//w:pStyle", ns)
+            )
+        ]
+        self.assertEqual(len(ours), 1)
+        lvls = ours[0].findall("w:lvl", ns)
+        self.assertEqual(len(lvls), 3)
+        for lvl in lvls:
+            with self.subTest(ilvl=lvl.get(qn("w:ilvl"))):
+                color = lvl.find("w:rPr/w:color", ns)
+                self.assertIsNotNone(color)
+                self.assertEqual((color.get(qn("w:val")) or "").lower(), "000000")
+
+
+class ChongqingHeaderFooterTests(unittest.TestCase):
+    """T9：重庆页眉页脚 + 封面版式 + E-Mail（只重庆链路，广东 writer 不经过页眉页脚函数）。"""
+
+    _COVER_TEMPLATE = (
+        "# @cover 主标题行一|主标题行二|重庆市|报告编号：BG-2026-T9"
+        "|项目名称：测试项目|委托单位：测试单位|测试公司|二〇二六年七月\n"
+        "\n<!-- toc -->\n\n# 1 概况\n"
+    )
+
+    @staticmethod
+    def _build(template_text: str) -> tuple:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            template.write_text(template_text, encoding="utf-8")
+            output = root / "output"
+            output.mkdir()
+            config = engine.Config(root, root / "summary.xlsx", root, template, output)
+            minimal_docx.make_report(
+                config, [], None, [], None, [], None, [], {}, root,
+                skeleton_md=template,
+            )
+            out = output / engine.OUT_DOCX_NAME
+            with zipfile.ZipFile(out) as archive:
+                parts = {
+                    name: archive.read(name).decode("utf-8")
+                    for name in archive.namelist()
+                    if name.startswith("word/header") or name.startswith("word/footer")
+                    or name == "word/document.xml"
+                }
+            text = "\n".join(paragraph.text for paragraph in Document(out).paragraphs)
+            return parts, text
+
+    def test_header_has_company_report_no_and_underline(self) -> None:
+        parts, _ = self._build(self._COVER_TEMPLATE)
+        headers = {name: xml for name, xml in parts.items() if "/header" in name}
+        self.assertTrue(headers, "重庆报告应生成页眉部件")
+        body_header = max(headers)  # 正文节页眉（序号最大的页眉部件），首页无页眉引用
+        self.assertIn("四川京炜交通工程技术有限公司", headers[body_header])
+        self.assertIn("BG-2026-T9", headers[body_header])
+        self.assertNotIn("报告编号：", headers[body_header])
+        self.assertIn("w:bottom", headers[body_header])
+        footers = {name: xml for name, xml in parts.items() if "/footer" in name}
+        self.assertTrue(footers, "重庆报告应生成页脚部件")
+        body_footer = max(footers)
+        self.assertIn("PAGE", footers[body_footer])
+        self.assertIn("NUMPAGES", footers[body_footer])
+        self.assertIn('w:val="center"', footers[body_footer])
+
+    def test_first_page_clean_and_body_page_number_restarts(self) -> None:
+        parts, _ = self._build(self._COVER_TEMPLATE)
+        document = parts["word/document.xml"]
+        self.assertIn("w:titlePg", document)
+        self.assertIn("w:pgNumType", document)
+        self.assertIn('w:start="1"', document)
+
+    def test_body_section_has_no_title_pg(self) -> None:
+        # T9：正文节不可带 titlePg，否则正文第一页（概况页）无页眉页脚。
+        parts, _ = self._build(self._COVER_TEMPLATE)
+        root = ET.fromstring(parts["word/document.xml"])
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        sectprs = root.findall(".//w:sectPr", ns)
+        self.assertGreaterEqual(len(sectprs), 2, "应有封面节+正文节")
+        for sectpr in sectprs[1:]:
+            self.assertIsNone(
+                sectpr.find("w:titlePg", ns), "正文节不应含 titlePg（首页须显示页眉页脚）"
+            )
+
+    def test_cover_has_top_rule_and_underlined_fill_lines(self) -> None:
+        parts, text = self._build(self._COVER_TEMPLATE)
+        document = parts["word/document.xml"]
+        self.assertIn("w:pBdr", document)  # 顶部横线
+        self.assertIn('w:u w:val="single"', document)  # 填空值下划线
+        self.assertIn("测试项目", text)
+        self.assertIn("测试单位", text)
+
+    def test_notes_email_uses_english_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "output"
+            output.mkdir()
+            template = engine.resource_template_path("重庆项目报告模板.md")
+            config = engine.Config(root, root / "summary.xlsx", root, template, output)
+            segment = {
+                "county": "万州区", "route": "G210", "route_name": "", "grade": "一级",
+                "manager": "", "start": 2264000.0, "end": 2265000.0,
+                "mileage": 1.0, "total_mileage": 1.0,
+            }
+            minimal_docx.make_report(
+                config, [segment], None, [], None, [], None, [], {}, root,
+                skeleton_md=template,
+            )
+            text = "\n".join(
+                paragraph.text
+                for paragraph in Document(output / engine.OUT_DOCX_NAME).paragraphs
+            )
+        self.assertIn("E-Mail：scjwjt@163.com", text)
+        self.assertEqual(text.count("Mail："), text.count("E-Mail："))
+
 
 class ChongqingTableHeaderTests(unittest.TestCase):
     def test_template_fonts_bold_and_gray_shading(self) -> None:
@@ -1821,6 +2086,9 @@ class ChongqingCountyEndToEndTests(unittest.TestCase):
                 stem = engine.county_report_stem(county)
                 self.assertTrue((root / "output" / county / f"{stem}.docx").is_file(), county)
                 self.assertTrue((root / "output" / county / f"{stem}.xlsx").is_file(), county)
+            # R2：多区县时不再生成顶层整体报告
+            self.assertFalse((root / "output" / engine.OUT_DOCX_NAME).exists())
+            self.assertFalse((root / "output" / engine.OUT_XLSX_NAME).exists())
 
     def test_single_county_file_filters_segments_and_names_top_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1829,11 +2097,674 @@ class ChongqingCountyEndToEndTests(unittest.TestCase):
             self.assertEqual(config.out_docx.name, "重庆市万州区交安设施检测报告.docx")
             self.assertEqual(config.out_xlsx.name, "重庆市万州区交安设施检测报告.xlsx")
             self.assertTrue(config.out_docx.is_file())
+            # R2：单区县时顶层即为该区县报告，不再另建区县子目录副本
+            self.assertFalse((root / "output" / "万州区").exists())
             workbook = openpyxl.load_workbook(config.out_xlsx, data_only=True)
             detail = workbook["检测明细"]
             counties = {row[7] for row in detail.iter_rows(min_row=2, values_only=True)}
             workbook.close()
             self.assertEqual(counties, {"万州区"})
+
+
+class ChongqingFontTimesTests(unittest.TestCase):
+    """R1：标题保持黑色，全文英文 Times New Roman（含封面标题）。"""
+
+    def _write_cover_template(self, path: Path) -> None:
+        path.write_text(
+            "# @cover 主标题行一|主标题行二|重庆市|报告编号：BG-2026-001|项目名称：测试项目|委托单位：测试单位|测试公司|二〇二六年七月\n"
+            "\n# 报告章标题\n\n正文段落文字ABC。\n\n<!-- inject:overview -->\n",
+            encoding="utf-8",
+        )
+
+    def _report_document_xml(self, root: Path, template: Path) -> str:
+        output = root / "output"
+        output.mkdir()
+        config = engine.Config(root, root / "summary.xlsx", root, template, output)
+        segment = {
+            "county": "万州区", "route": "G210", "route_name": "", "grade": "一级",
+            "manager": "", "start": 2264000.0, "end": 2265000.0,
+            "mileage": 1.0, "total_mileage": 1.0,
+        }
+        minimal_docx.make_report(
+            config, [segment], None, [], None, [], None, [], {}, root,
+            skeleton_md=template,
+        )
+        with zipfile.ZipFile(output / engine.OUT_DOCX_NAME) as archive:
+            return archive.read("word/document.xml").decode("utf-8")
+
+    def test_cover_title_latin_is_times_not_heiti(self) -> None:
+        import re
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            self._write_cover_template(template)
+            document = self._report_document_xml(root, template)
+        self.assertNotIn('w:ascii="黑体"', document)
+        self.assertNotIn('w:hAnsi="黑体"', document)
+        self.assertIn('w:ascii="Times New Roman"', document)
+        self.assertIn('w:val="44"', document)  # 封面主标题 22pt
+
+    def test_all_document_runs_are_black_times(self) -> None:
+        import re
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            self._write_cover_template(template)
+            document = self._report_document_xml(root, template)
+        latins = set(re.findall(r'w:ascii="([^"]+)"', document)) | set(
+            re.findall(r'w:hAnsi="([^"]+)"', document)
+        )
+        self.assertEqual(latins, {"Times New Roman"})
+        colors = set(re.findall(r'w:color w:val="([0-9A-Fa-f]+)"', document))
+        self.assertEqual(colors, {"000000"})
+
+
+class ChongqingCountyRouteTests(unittest.TestCase):
+    """R3：识别区县→识别道路编号→查汇总表中该道路编号对应分段。"""
+
+    def _segments(self) -> list:
+        return [
+            {"county": "城口县", "route": "G211", "start": 1000.0, "end": 2000.0},
+            {"county": "城口县", "route": "G211", "start": 2000.0, "end": 3000.0},
+            {"county": "城口县", "route": "G347", "start": 1000.0, "end": 2000.0},
+            {"county": "万州区", "route": "G348", "start": 1000.0, "end": 2000.0},
+        ]
+
+    def test_county_route_summary_groups_segments_by_route(self) -> None:
+        self.assertEqual(
+            engine.county_route_summary(self._segments()),
+            {"城口县": {"G211": 2, "G347": 1}, "万州区": {"G348": 1}},
+        )
+
+    def test_overlapping_stations_resolve_by_route_within_county(self) -> None:
+        segments = self._segments()
+        self.assertEqual(engine._segment_index(segments, 1500.0, "G211"), 0)
+        self.assertEqual(engine._segment_index(segments, 1500.0, "G347"), 2)
+        self.assertEqual(engine._segment_index(segments, 1500.0, "G348"), 3)
+        self.assertIsNone(engine._segment_index(segments, 1500.0, "G210"))
+
+
+class ChongqingIntervalConvergenceTests(unittest.TestCase):
+    """R3：区间明细表按区县/区段收敛，不按全量汇总表展开。"""
+
+    def _write_summary(self, path: Path) -> None:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "各区县项目概况"
+        sheet.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+        sheet.append([1, "万州区", "G210", "", "一级", 2264.0, 2265.0, 1.0, 1.0])
+        sheet.append([2, "渝北区", "G210", "", "一级", 2265.0, 2266.0, 1.0, 1.0])
+        workbook.save(path)
+
+    def test_add_interval_sheets_converges_to_given_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            summary = root / "summary.xlsx"
+            self._write_summary(summary)
+            segments = engine.read_segments(summary)
+            county_segments = [s for s in segments if s["county"] == "万州区"]
+            record = {
+                "file": "f.xlsx", "direction": "上行", "station": 2264100.0,
+                "raw_station": 2264100.0, "electronic_station": 2264100.0,
+                "basis": "电子修正桩号", "kind": "二波", "height": 600.0, "segment": 0,
+            }
+            height_stats = engine.make_stats(county_segments, [record])
+            config = engine.Config(
+                root, summary, root, root / "template.md", root / "output",
+                county="万州区",
+            )
+            engine.make_excel(
+                config, county_segments,
+                height_stats=height_stats, height_records=[record],
+            )
+            workbook = openpyxl.load_workbook(config.out_xlsx, data_only=True)
+            intervals = [name for name in workbook.sheetnames if name.startswith("区间")]
+            count = workbook[intervals[0]]["K2"].value if intervals else None
+            workbook.close()
+        self.assertEqual(len(intervals), 1)
+        self.assertIn("2264+000", intervals[0])
+        self.assertEqual(count, 1)
+
+    def test_add_charts_places_pies_in_county_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            summary = root / "summary.xlsx"
+            self._write_summary(summary)
+            segments = engine.read_segments(summary)
+            county_segments = [s for s in segments if s["county"] == "万州区"]
+            record = {
+                "file": "f.xlsx", "direction": "上行", "station": 2264100.0,
+                "raw_station": 2264100.0, "electronic_station": 2264100.0,
+                "basis": "电子修正桩号", "kind": "二波", "height": 600.0, "segment": 0,
+            }
+            height_stats = engine.make_stats(county_segments, [record])
+            config = engine.Config(
+                root, summary, root, root / "template.md", root / "output",
+                county="万州区",
+            )
+            engine.make_excel(
+                config, county_segments,
+                height_stats=height_stats, height_records=[record],
+            )
+            engine.add_charts(config.out_xlsx)
+            workbook = openpyxl.load_workbook(config.out_xlsx)
+            self.assertIn("二波分布图", workbook.sheetnames)
+            charts = workbook["二波分布图"]._charts
+            workbook.close()
+        self.assertEqual(len(charts), 1)
+
+
+class ChongqingMarkdownOnlyTests(unittest.TestCase):
+    """R4：重庆链路只接受 Markdown 模板，不再读取 Word 模板。"""
+
+    def test_docx_suffix_template_rejected_with_markdown_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake = root / "template.docx"
+            fake.write_bytes(b"fake")
+            config = engine.Config(root, root / "summary.xlsx", root, fake, root / "output")
+            with self.assertRaisesRegex(ValueError, "Markdown"):
+                engine.make_docx(config, [], disease_image_index=None)
+
+    def test_run_log_mentions_markdown_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skeleton = root / "template.md"
+            skeleton.write_text("# 标题\n", encoding="utf-8")
+            config = engine.Config(root, root / "summary.xlsx", root, skeleton, root / "output")
+            messages: list = []
+            minimal_docx.run(
+                config, [], None, [], None, [], None,
+                log=messages.append, skeleton_md=skeleton,
+            )
+            self.assertTrue(any("Markdown" in message for message in messages))
+            self.assertFalse(
+                any("Word模板" in message or "Word 模板" in message for message in messages)
+            )
+
+    def test_chongqing_bridge_passes_markdown_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            project = root / "project"
+            project.mkdir()
+            detail = root / "detail"
+            detail.mkdir()
+            disease = root / "disease"
+            disease.mkdir()
+            tci = root / "tci"
+            tci.mkdir()
+            cq = root / "重庆项目报告模板.md"
+            cq.write_text("# 重庆模板\n", encoding="utf-8")
+            gd = root / "广东项目第五章模板.md"
+            gd.write_text("# 广东模板\n", encoding="utf-8")
+            bridge = DesktopBridge()
+            captured: dict = {}
+
+            def fake_run(config, **kwargs):
+                captured["config"] = config
+
+            values = {
+                "projectPath": str(project),
+                "summaryPath": str(root / "summary.xlsx"),
+                "detailPath": str(detail),
+                "diseasePath": str(disease),
+                "tciPath": str(tci),
+                "outputPath": str(root / "output"),
+            }
+            templates = {"重庆项目报告模板": cq, "广东项目第五章模板": gd}
+            with patch.object(bridge, "_template_paths", return_value=templates), \
+                    patch.object(engine, "generate_statistics_and_report", side_effect=fake_run):
+                bridge._run_chongqing(values)
+            self.assertEqual(captured["config"].template_docx.suffix, ".md")
+
+
+class ChongqingSkeletonStructureTests(unittest.TestCase):
+    """T10：重庆模板基准式显式锚点结构 + 只认锚点（无关键词回退）+ TCI 分段小节/占位。"""
+
+    @staticmethod
+    def _demo_tci_stats(segments):
+        stats = []
+        for index, seg in enumerate(segments):
+            if index == 0:
+                tci = engine.compute_tci(1, 0, 2, 10.0)
+                stats.append({
+                    "segment": seg, "light": 1, "heavy": 0, "sign": 2, "marking": 10.0,
+                    "tci": tci, "grade": engine.tci_grade(tci), "count": 2,
+                })
+            else:
+                stats.append({
+                    "segment": seg, "light": 0, "heavy": 0, "sign": 0, "marking": 0.0,
+                    "tci": 100.0, "grade": "优", "count": 0,
+                })
+        return stats
+
+    def test_template_has_benchmark_anchor_structure(self) -> None:
+        from backend import minimal_docx
+
+        root = Path(__file__).resolve().parents[1]
+        template = markdown_skeleton.read_template(root / "templates" / "重庆项目报告模板.md")
+        h1 = [block.text for block in template.blocks if block.kind == "heading" and block.level == 1]
+        self.assertEqual(
+            [minimal_docx._strip_section_number(text) for text in h1],
+            ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
+        )
+        anchors = [block.text for block in template.blocks if block.text and "inject:" in block.text]
+        self.assertEqual(len(anchors), 5)
+        for key in ("overview", "tci", "height", "bolt", "conclusion"):
+            self.assertEqual(sum(1 for text in anchors if f"inject:{key}" in text), 1, key)
+        sub = [
+            minimal_docx._strip_section_number(block.text)
+            for block in template.blocks
+            if block.kind == "heading" and block.level in (2, 3)
+        ]
+        for required in (
+            "项目概况", "检测依据", "人员组织", "检测内容及方法", "检测设备与评定方法",
+            "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测", "波形梁护栏螺栓缺失检测",
+        ):
+            self.assertIn(required, sub, required)
+        for block in template.blocks:
+            self.assertNotIn("两江新区", block.text or "")
+            self.assertNotIn("由程序自动生成", block.text or "")
+
+    def test_static_subsection_headings_are_not_swallowed_as_anchors(self) -> None:
+        # 2.3.x 静态标题必须原样渲染，不得触发注入、不得被吞掉。
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skeleton = root / "template.md"
+            skeleton.write_text(
+                "# 1 概况\n\n"
+                "## 1.1 项目概况\n\n"
+                "<!-- inject:overview -->\n\n"
+                "## 1.2 检测依据\n\n"
+                "依据文本。\n\n"
+                "# 2 组织实施情况\n\n"
+                "## 2.1 人员组织\n\n"
+                "## 2.2 检测内容及方法\n\n"
+                "## 2.3 检测设备与评定方法\n\n"
+                "### 2.3.1 沿线设施技术状况评价\n\n"
+                "评定方法文本。\n\n"
+                "### 2.3.2 波形梁护栏横梁中心高度检测\n\n"
+                "高度方法文本。\n\n"
+                "### 2.3.3 波形梁护栏螺栓缺失检测\n\n"
+                "螺栓方法文本。\n\n"
+                "# 3 沿线设施技术状况评价\n\n"
+                "<!-- inject:tci -->\n\n"
+                "# 4 波形梁护栏横梁中心高度检测结果\n\n"
+                "<!-- inject:height -->\n\n"
+                "# 5 波形梁护栏螺栓缺失\n\n"
+                "<!-- inject:bolt -->\n\n"
+                "# 6 结论与建议\n\n"
+                "<!-- inject:conclusion -->\n",
+                encoding="utf-8",
+            )
+            config = engine.Config(root, root / "summary.xlsx", root, skeleton, root / "output")
+            segments = build_demo_segments()
+            records = build_demo_height_records()
+            height_stats = build_demo_stats(segments, records)
+            bolt_stats = engine.make_bolt_stats(segments, build_demo_bolt_records())
+            tci_stats = self._demo_tci_stats(segments)
+            result = minimal_docx.run(
+                config, segments, height_stats, records, bolt_stats, build_demo_bolt_records(),
+                None, skeleton_md=skeleton, tci_stats=tci_stats, tci_records=[],
+            )
+            document = Document(result)
+            headings = [p.text for p in document.paragraphs if p.style.name.startswith("Heading")]
+            text = "\n".join(p.text for p in document.paragraphs)
+            h1 = [p.text for p in document.paragraphs if p.style.name == "Heading 1"]
+            self.assertEqual(
+                [minimal_docx._strip_section_number(h) for h in h1],
+                ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
+            )
+        for required in ("检测依据", "检测设备与评定方法", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测", "波形梁护栏螺栓缺失检测"):
+            self.assertTrue(any(required in h for h in headings), f"missing static heading: {required}")
+        # TCI 有一段无数据 → 占位句；高度/螺栓同构小节正常展开。
+        self.assertIn("暂无有效沿线设施检测记录", text)
+        self.assertIn("本段螺栓明细无有效记录", text)
+
+    def test_tci_section_writes_per_segment_subsections_and_placeholders(self) -> None:
+        segments = build_demo_segments()
+        tci_stats = self._demo_tci_stats(segments)
+        document = Document()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tci_images = engine.report_tci_images(temp_dir, segments, tci_stats)
+            image_files = {index: path.is_file() for index, path in tci_images.items()}
+            minimal_docx._section_tci(document, segments, tci_stats, tci_images, temp_dir)
+        headings = [p.text for p in document.paragraphs if p.style.name.startswith("Heading")]
+        text = "\n".join(p.text for p in document.paragraphs)
+        seg0 = f"G210线{engine.format_station(segments[0]['start'])}～{engine.format_station(segments[0]['end'])}段"
+        seg1 = f"G210线{engine.format_station(segments[1]['start'])}～{engine.format_station(segments[1]['end'])}段"
+        self.assertIn(seg0, headings)
+        self.assertIn(seg1, headings)
+        self.assertIn(f"本段{seg1}暂无有效沿线设施检测记录", text)
+        self.assertEqual(len(tci_images), 1)
+        self.assertTrue(all(image_files.values()), image_files)
+
+    def test_tci_section_without_source_writes_explicit_sentence(self) -> None:
+        document = Document()
+        minimal_docx._section_tci(document, build_demo_segments(), None)
+        text = "\n".join(p.text for p in document.paragraphs)
+        self.assertIn("未提供 TCI 病害清单", text)
+
+
+class DiscoverPathsFallbackTests(unittest.TestCase):
+    def _write_xlsx(self, path: Path, rows: list) -> None:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        for row in rows:
+            sheet.append(row)
+        workbook.save(path)
+
+    def test_summary_fallback_matches整理_with_route_station_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_xlsx(
+                root / "0. 各区县路段整理.xlsx",
+                [["序号", "路线编号", "路线名", "起点桩号", "止点桩号", "里程"],
+                 [1, "G210", "测试路", 1000.0, 2000.0, 1.0]],
+            )
+            summary, _, _, _ = engine.discover_paths(root)
+        self.assertEqual(summary, root / "0. 各区县路段整理.xlsx")
+
+    def test_summary_fallback_ignores整理_without_route_station_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_xlsx(root / "人员整理.xlsx", [["姓名", "电话"], ["张三", "123"]])
+            summary, _, _, _ = engine.discover_paths(root)
+        self.assertIsNone(summary)
+
+    def test_legacy_summary_keeps_priority_over_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy = root / "G210采集路段信息汇总.xlsx"
+            legacy.write_bytes(b"legacy")
+            self._write_xlsx(
+                root / "0. 各区县路段整理.xlsx",
+                [["序号", "路线编号", "起点桩号"], [1, "G210", 1000.0]],
+            )
+            summary, _, _, _ = engine.discover_paths(root)
+        self.assertEqual(summary, legacy)
+
+    def test_detail_fallback_excludes_disease_and_requires_guardrail_header(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            detail_dir = root / "detail"
+            detail_dir.mkdir()
+            self._write_xlsx(
+                detail_dir / "城口县-G211-明细.xlsx",
+                [["序号", "路线编号", "护栏类型", "梁板中心高度(mm)"], [1, "G211", "二波", 600]],
+            )
+            disease_dir = root / "disease"
+            disease_dir.mkdir()
+            self._write_xlsx(
+                disease_dir / "城口县-G211-病害明细.xlsx",
+                [["序号", "路线", "病害类型"], [1, "G211", "螺栓缺失"]],
+            )
+            plain_dir = root / "plain"
+            plain_dir.mkdir()
+            self._write_xlsx(plain_dir / "说明-明细.xlsx", [["姓名"], ["张三"]])
+            _, detail, disease, _ = engine.discover_paths(root)
+        self.assertEqual(detail, detail_dir)
+        self.assertEqual(disease, disease_dir)
+
+
+class T11aDataLayerTests(unittest.TestCase):
+    """T11a：螺栓 sheet 读取 + 浮动图片锚点映射（含装饰图跳过）。"""
+
+    @staticmethod
+    def _write_xlsx(path, rows):
+        import openpyxl as xl
+
+        wb = xl.Workbook()
+        ws = wb.active
+        for row in rows:
+            ws.append(row)
+        wb.save(path)
+        wb.close()
+
+    @staticmethod
+    def _tiny_png() -> bytes:
+        import base64
+
+        return base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+
+    def test_iter_bolt_rows_finds_sheet_via_shared_string_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "明细.xlsx"
+            self._write_xlsx(
+                path,
+                [["序号", "路线编号", "梁板中心高度(mm)"], [1, "G211", 600.0]],
+            )
+            wb = openpyxl.load_workbook(path)
+            ws2 = wb.create_sheet("螺栓缺失")
+            ws2.append(["序号", "路线编号", "电子修正桩号", "拼接螺栓数量（颗）", "拼接螺栓缺失数量（颗）", "连接螺栓数量（颗）", "连接螺栓缺失数量（颗）"])
+            ws2.append([1, "G211", "1157+874", 10, 1, 20, 2])
+            ws2.append([2, "G211", "1158+000", 0, 0, 0, 0])
+            wb.save(path)
+            wb.close()
+            rows = list(engine.iter_bolt_rows(path))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["拼接螺栓数量（颗）"], 10)
+        self.assertEqual(rows[0]["连接螺栓缺失数量（颗）"], 2)
+
+    def test_iter_bolt_rows_ignores_sheets_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "明细.xlsx"
+            self._write_xlsx(
+                path,
+                [["序号", "路线编号", "梁板中心高度(mm)"], [1, "G211", 600.0]],
+            )
+            rows = list(engine.iter_bolt_rows(path))
+        self.assertEqual(rows, [])
+
+    def test_build_disease_image_map_skips_header_decorations(self) -> None:
+        import io
+
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "病害.xlsx"
+            self._write_xlsx(
+                path,
+                [
+                    ["序号", "路线", "原始桩号", "病害类型", "工程量", "单位", "病害照片", "备注"],
+                    [1, "G211", "1157+874", "高度异常", 1, "处", None, None],
+                    [2, "G211", "1158+000", "螺栓缺失", 1, "颗", None, None],
+                ],
+            )
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            png = self._tiny_png()
+            ws.add_image(XLImage(io.BytesIO(png)), "A1")  # 表头行装饰图，应跳过
+            ws.add_image(XLImage(io.BytesIO(png)), "M2")  # 第一数据行照片列(0-based col12)
+            ws.add_image(XLImage(io.BytesIO(png)), "M3")
+            wb.save(path)
+            wb.close()
+            mapping = engine.build_disease_image_map(path)
+        rows_with_images = {row for (sheet, row) in mapping}
+        self.assertEqual(rows_with_images, {2, 3})
+        self.assertTrue(all(sheet.endswith(".xml") for (sheet, _) in mapping))
+        self.assertTrue(all(len(v) == 1 for v in mapping.values()))
+
+    def test_build_tci_image_map_uses_photo_column_15(self) -> None:
+        import io
+
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "tci.xlsx"
+            self._write_xlsx(
+                path,
+                [
+                    ["区域", "路线编号", "原始桩号", "防护设施缺损（处）", "标志缺损（处）", "标线缺损（m）", "图片"],
+                    ["万州区", "G348", "949+680", 1, 0, 0, None],
+                    ["万州区", "G348", "950+000", 0, 1, 5, None],
+                ],
+            )
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            png = self._tiny_png()
+            ws.add_image(XLImage(io.BytesIO(png)), "P3")  # 0-based col15, row2
+            wb.save(path)
+            wb.close()
+            mapping = engine.build_tci_image_map(path)
+        self.assertEqual(set(mapping.keys()), {("xl/worksheets/sheet1.xml", 3)})
+
+
+class T11bPresentationTests(unittest.TestCase):
+    """T11b：封面黄高亮/黄块/规则页眉线 + TCI 公式 OMML。"""
+
+    _TEMPLATE = (
+        "# @cover 主标题行一|主标题行二|重庆市|报告编号：BG-2026-T11"
+        "|项目名称：测试项目|委托单位：测试单位|测试公司|二〇二六年七月\n"
+        "\n# @notes 注意事项|1、测试条款|6、联系方式：\n"
+        "\n<!-- toc -->\n\n# 1 概况\n## 1.1 项目概况\n<!-- inject:overview -->\n"
+        "# 2 组织实施情况\n## 2.3 检测设备与评定方法\n### 2.3.1 沿线设施技术状况评价\n"
+        "<!-- formula:tci -->\n"
+        "<!-- formula:gd --> —— 第i类设施损坏的累计扣分，最高扣分为100，按表2.3.1-1的规定取值；\n"
+        "# 3 沿线设施技术状况评价\n<!-- inject:tci -->\n"
+    )
+
+    def _build(self) -> dict:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            template.write_text(self._TEMPLATE, encoding="utf-8")
+            output = root / "output"
+            output.mkdir()
+            config = engine.Config(root, root / "summary.xlsx", root, template, output)
+            minimal_docx.make_report(
+                config, [], None, [], None, [], None, [], {}, root,
+                skeleton_md=template,
+            )
+            out = output / engine.OUT_DOCX_NAME
+            with zipfile.ZipFile(out) as archive:
+                parts = {
+                    name: archive.read(name).decode("utf-8")
+                    for name in archive.namelist()
+                    if name.startswith("word/header") or name == "word/document.xml"
+                }
+            return parts
+
+    def test_cover_highlight_and_yellow_block_present(self) -> None:
+        parts = self._build()
+        document = parts["word/document.xml"]
+        self.assertIn("w:highlight", document)
+        self.assertIn('w:val="yellow"', document)
+        # 编号值 BG-2026-T11 与项目名称值都被高亮
+        self.assertIn("BG-2026-T11", document)
+        self.assertIn("测试项目", document)
+
+    def test_tci_formula_is_editable_omath_without_plaintext_duplicate(self) -> None:
+        parts = self._build()
+        document = parts["word/document.xml"]
+        self.assertGreaterEqual(document.count("m:oMath"), 2)
+        self.assertIn("TCI=", document)
+        self.assertNotIn("TCI = Σ_{i=1}", document)
+        self.assertIn("第i类设施损坏的累计扣分", document)
+
+    def test_cover_section_header_has_rule(self) -> None:
+        parts = self._build()
+        headers = [xml for name, xml in parts.items() if "/header" in name]
+        self.assertTrue(headers, "应生成页眉部件")
+        self.assertTrue(any("w:pBdr" in xml and "w:bottom" in xml for xml in headers))
+
+
+class R12TemplateTests(unittest.TestCase):
+    """R12/R13：区间分档 + 示例图统一15×8cm无锁 + TCI类型图路线过滤。"""
+
+    def test_height_limits_new_bands(self) -> None:
+        from backend.report_engine import bin_index
+
+        # 二波：550/580/620/650（中心600，±20合格，±50外界）
+        self.assertEqual(bin_index("二波", 545.0), 0)
+        self.assertEqual(bin_index("二波", 555.0), 1)
+        self.assertEqual(bin_index("二波", 600.0), 2)
+        self.assertEqual(bin_index("二波", 625.0), 3)
+        self.assertEqual(bin_index("二波", 655.0), 4)
+        # 三波：647/677/717/747（中心697）
+        self.assertEqual(bin_index("三波", 640.0), 0)
+        self.assertEqual(bin_index("三波", 650.0), 1)
+        self.assertEqual(bin_index("三波", 700.0), 2)
+        self.assertEqual(bin_index("三波", 720.0), 3)
+        self.assertEqual(bin_index("三波", 750.0), 4)
+
+    def test_example_photo_table_15x8_unlocked_and_tables_separated_only_after_data_table(self) -> None:
+        import tempfile
+
+        from docx import Document
+
+        from backend import minimal_docx
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1) 多列结果表之后必须插入独立段落（防与示例表合并）
+            doc = Document()
+            minimal_docx._table(doc, ["起点桩号", "止点桩号", "缺失数量（颗）"], [["K1", "K2", "3"]], True)
+            minimal_docx._photo_text_table(doc, png, ".png", "标志板遮挡", tmp, "test_photo")
+            out = Path(tmp) / "t.docx"
+            doc.save(out)
+            with zipfile.ZipFile(out) as z:
+                xml = z.read("word/document.xml").decode("utf-8")
+            self.assertIn('cx="5400000"', xml)  # 15cm
+            self.assertIn('cy="2880000"', xml)  # 8cm
+            self.assertIn('noChangeAspect="0"', xml)
+            self.assertRegex(xml, r"</w:tbl><w:p[ >].*?</w:p><w:tbl>")
+            self.assertIn("标志板遮挡", xml)
+        with tempfile.TemporaryDirectory() as tmp:
+            # 2) 单列示例表之间不加空段（两张示例图片连续排版）
+            doc = Document()
+            minimal_docx._photo_text_table(doc, png, ".png", "示例一", tmp, "t1")
+            minimal_docx._photo_text_table(doc, png, ".png", "示例二", tmp, "t2")
+            out = Path(tmp) / "t.docx"
+            doc.save(out)
+            with zipfile.ZipFile(out) as z:
+                xml = z.read("word/document.xml").decode("utf-8")
+            self.assertNotRegex(xml, r"</w:tbl><w:p[ >].*?</w:p><w:tbl>")
+            self.assertRegex(xml, r"</w:tbl><w:tbl>")
+            self.assertIn("示例一", xml)
+            self.assertIn("示例二", xml)
+
+    def test_tci_type_photo_index_routes_filter(self) -> None:
+        import openpyxl
+
+        from backend import report_engine as engine
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            xlsx = tmp_path / "tci.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            headers = ["区域", "路线编号", "方向", "原始桩号", "标注修正桩号", "电子修正桩号", "经度", "纬度",
+                       "防护设施缺损（处）", "J", "标志缺损（处）", "标线缺损（m）", "防护设施缺损", "交通标志缺损", "交通标线缺损"]
+            ws.append(headers)
+            ws.append(["重庆市", "G348", "上行", "K949+680", "K949+680", "K949+680", "", "", 0, "重", 1, 0, "", "标志板遮挡", ""])
+            ws.append(["重庆市", "G210", "上行", "K1157+874", "K1157+874", "K1157+874", "", "", 1, "重", 0, 0, "波形梁护栏锈蚀", "", ""])
+            img = openpyxl.drawing.image.Image(io.BytesIO(png))
+            img.width = 16
+            img.height = 8.5
+            ws.add_image(img, "P2")
+            ws.add_image(openpyxl.drawing.image.Image(io.BytesIO(png)), "P3")
+            wb.save(xlsx)
+            image_map = engine.build_tci_image_map(xlsx)
+            self.assertTrue(image_map, "合成 TCI 图片映射为空")
+            filtered = engine.tci_type_photo_index(xlsx, image_map, routes=["G348"])
+            self.assertIn("交通标志缺损", filtered)
+            self.assertNotIn("防护设施缺损", filtered)
+            all_types = engine.tci_type_photo_index(xlsx, image_map)
+            self.assertIn("防护设施缺损", all_types)
 
 
 if __name__ == "__main__":

@@ -161,7 +161,6 @@
       border-color: #70c7bf;
     }
     .template-button strong { display: block; font-size: 13px; font-weight: 650; }
-    .template-button small { color: #9fb3bd; font-size: 11px; }
 
     .flow-mini {
       margin-top: 30px;
@@ -229,7 +228,6 @@
       font-weight: 720;
       text-wrap: balance;
     }
-    .workspace-header p { max-width: 58ch; margin: 8px 0 0; color: var(--muted); }
 
     .health {
       flex: 0 0 auto;
@@ -253,7 +251,6 @@
       margin-bottom: 11px;
     }
     .section-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
-    .section-head p { margin: 0; color: var(--muted); font-size: 12px; }
 
     .form-stack {
       overflow: hidden;
@@ -274,7 +271,6 @@
     .file-row:last-child { border-bottom: 0; }
     .file-label { min-width: 0; }
     .file-label label { display: block; font-weight: 650; }
-    .file-label small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
     .path-field {
       width: 100%;
       min-width: 0;
@@ -412,7 +408,6 @@
 
     .run-actions { display: grid; grid-template-columns: 1fr auto; gap: 9px; margin-top: 12px; }
     .run-actions .primary { width: 100%; }
-    .monitor-note { margin: 12px 0 0; color: var(--muted); font-size: 11px; }
 
     .toast {
       position: fixed;
@@ -500,12 +495,10 @@
         <button class="template-button" type="button" aria-pressed="true" data-template="cq">
           <span class="template-code">CQ</span>
           <strong>重庆项目</strong>
-          <small>分段统计与检测报告</small>
         </button>
         <button class="template-button" type="button" aria-pressed="false" data-template="gd">
           <span class="template-code">GD</span>
           <strong>广东项目</strong>
-          <small>多地市批量报告</small>
         </button>
       </div>
 
@@ -516,14 +509,13 @@
         <div class="flow-step"><b>报告输出</b><span>EXPORT</span></div>
       </div>
 
-      <div class="side-foot" id="environmentStatus">数据仅在本机处理<br>正在连接桌面服务…</div>
+      <div class="side-foot" id="environmentStatus">正在连接桌面服务…</div>
     </aside>
 
     <section class="workspace" id="mainWorkspace" tabindex="-1" aria-labelledby="pageTitle">
       <header class="workspace-header">
         <div>
           <h1 id="pageTitle">重庆项目资料配置</h1>
-          <p id="pageDescription">选择检测资料所在位置。系统将生成统计工作簿和第五部分检测报告。</p>
         </div>
         <div class="health" aria-live="polite">
           <span>配置状态</span>
@@ -534,63 +526,62 @@
       <section class="section" aria-labelledby="sourceTitle">
         <div class="section-head">
           <h2 id="sourceTitle">资料来源</h2>
-          <p id="sourceHint">6 项必填，1 项可选</p>
         </div>
         <div class="form-stack" id="sourceForm">
           <div class="file-row">
-            <div class="file-label"><label for="projectPath">项目资料文件夹</label><small>选择后自动补全可识别路径</small></div>
+            <div class="file-label"><label for="projectPath">项目资料文件夹</label></div>
             <input class="path-field" id="projectPath" name="projectPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
             <button class="button choose-button" type="button" data-target="projectPath">选择文件夹</button>
           </div>
           <div class="file-row only-cq">
-            <div class="file-label"><label for="summaryPath">分段汇总表</label><small>G210 采集路段信息汇总</small></div>
+            <div class="file-label"><label for="summaryPath">分段汇总表</label></div>
             <input class="path-field" id="summaryPath" name="summaryPath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
             <button class="button choose-button" type="button" data-target="summaryPath">选择文件</button>
           </div>
           <div class="file-row only-cq">
-            <div class="file-label"><label for="detailPath">检测明细文件夹</label><small>交安设施现场检测明细</small></div>
+            <div class="file-label"><label for="detailPath">检测明细文件夹</label></div>
             <input class="path-field" id="detailPath" name="detailPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
             <button class="button choose-button" type="button" data-target="detailPath">选择文件夹</button>
           </div>
           <div class="file-row only-cq">
-            <div class="file-label"><label for="diseasePath">病害清单文件夹</label><small>用于匹配螺栓缺失图片</small></div>
+            <div class="file-label"><label for="diseasePath">病害清单文件夹</label></div>
             <input class="path-field" id="diseasePath" name="diseasePath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
             <button class="button choose-button" type="button" data-target="diseasePath">选择文件夹</button>
           </div>
           <div class="file-row only-cq">
-            <div class="file-label"><label for="tciPath">TCI数据文件夹</label><small>沿线设施技术状况病害明细</small></div>
+            <div class="file-label"><label for="tciPath">TCI数据文件夹</label></div>
             <input class="path-field" id="tciPath" name="tciPath" type="text" autocomplete="off" readonly placeholder="尚未选择…">
             <button class="button choose-button" type="button" data-target="tciPath">选择文件夹</button>
           </div>
           <div class="file-row only-cq">
-            <div class="file-label"><label for="countySelect">区县</label><small>文件名未识别到时手动选择</small></div>
+            <div class="file-label"><label for="countySelect">区县</label></div>
             <select class="path-field" id="countySelect" name="countySelect" data-optional="true">
               <option value="">自动识别（推荐）</option>
             </select>
           </div>
 
           <div class="file-row only-gd" hidden>
-            <div class="file-label"><label for="markingPath">标线数据文件夹</label><small>可由项目资料自动识别</small></div>
+            <div class="file-label"><label for="markingPath">标线数据文件夹</label></div>
             <input class="path-field" id="markingPath" name="markingPath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时扫描项目文件夹…">
             <button class="button choose-button" type="button" data-target="markingPath">更改位置</button>
           </div>
           <div class="file-row only-gd" hidden>
-            <div class="file-label"><label for="guardrailPath">护栏数据文件夹</label><small>可由项目资料自动识别</small></div>
+            <div class="file-label"><label for="guardrailPath">护栏数据文件夹</label></div>
             <input class="path-field" id="guardrailPath" name="guardrailPath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时扫描项目文件夹…">
             <button class="button choose-button" type="button" data-target="guardrailPath">更改位置</button>
           </div>
           <div class="file-row only-gd" hidden>
-            <div class="file-label"><label for="manualPath">人工自动化对比表</label><small>用于一致性检验</small></div>
+            <div class="file-label"><label for="manualPath">人工自动化对比表</label></div>
             <input class="path-field" id="manualPath" name="manualPath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
             <button class="button choose-button" type="button" data-target="manualPath">选择文件</button>
           </div>
           <div class="file-row only-gd" hidden>
-            <div class="file-label"><label for="routePath">路线分类表</label><small>高速公路与普通国省道分类</small></div>
+            <div class="file-label"><label for="routePath">路线分类表</label></div>
             <input class="path-field" id="routePath" name="routePath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
             <button class="button choose-button" type="button" data-target="routePath">选择文件</button>
           </div>
           <div class="file-row">
-            <div class="file-label"><label for="outputPath">输出文件夹</label><small>保存生成的 Word 与 Excel</small></div>
+            <div class="file-label"><label for="outputPath">输出文件夹</label></div>
             <input class="path-field" id="outputPath" name="outputPath" type="text" autocomplete="off" readonly placeholder="默认使用项目资料文件夹…">
             <button class="button choose-button" type="button" data-target="outputPath">选择文件夹</button>
           </div>
@@ -600,7 +591,6 @@
       <section class="section only-gd" hidden aria-labelledby="thresholdTitle">
         <div class="section-head">
           <h2 id="thresholdTitle">一致性阈值</h2>
-          <p>可直接修改</p>
         </div>
         <div class="threshold-grid">
           <div class="threshold"><label for="markingThreshold">标线相对偏差</label><div class="number-wrap"><input id="markingThreshold" name="markingThreshold" type="number" inputmode="decimal" autocomplete="off" value="7" min="0" max="100"><span>%</span></div></div>
@@ -610,7 +600,7 @@
       </section>
 
       <section class="section" aria-labelledby="outputTitle">
-        <div class="section-head"><h2 id="outputTitle">预计输出</h2><p>路径随项目变化</p></div>
+        <div class="section-head"><h2 id="outputTitle">预计输出</h2></div>
         <div class="output-strip only-cq">
           <div class="output-item"><span>统计工作簿</span><strong>重庆市XX区/县交安设施检测报告.xlsx</strong></div>
           <div class="output-item"><span>检测报告</span><strong>重庆市XX区/县交安设施检测报告.docx</strong></div>
@@ -630,22 +620,20 @@
       </div>
 
       <div class="run-stages" aria-label="运行阶段">
-        <div class="run-stage" data-stage="0"><strong>校验资料</strong><span>检查输入路径</span></div>
-        <div class="run-stage" data-stage="1"><strong>识别数据</strong><span>读取表头和记录</span></div>
-        <div class="run-stage" data-stage="2"><strong>统计生成</strong><span>生成图表与章节</span></div>
-        <div class="run-stage" data-stage="3"><strong>保存结果</strong><span>写入输出文件夹</span></div>
+        <div class="run-stage" data-stage="0"><strong>校验资料</strong></div>
+        <div class="run-stage" data-stage="1"><strong>识别数据</strong></div>
+        <div class="run-stage" data-stage="2"><strong>统计生成</strong></div>
+        <div class="run-stage" data-stage="3"><strong>保存结果</strong></div>
       </div>
 
       <div class="log-panel" id="logPanel" aria-live="polite" aria-label="运行日志">
         <div class="log-line"><span class="log-time">--:--</span><span class="log-message">等待配置项目资料</span></div>
-        <div class="log-line"><span class="log-time">--:--</span><span class="log-message">桌面服务连接后即可选择本地文件</span></div>
       </div>
 
       <div class="run-actions">
         <button class="button primary" id="runButton" type="button" disabled>开始生成</button>
         <button class="button" id="openButton" type="button" disabled>打开输出</button>
       </div>
-      <p class="monitor-note">运行时请关闭正在占用的 Excel 或 Word 文件。</p>
     </aside>
   </main>
 
