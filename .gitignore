@@ -27,3 +27,6 @@ templates/*.docx
 HANDOFF.md
 HANDOFF-*.md
 docs/HANDOFF*.md
+
+# Local Superpowers plans and specs
+docs/superpowers/
