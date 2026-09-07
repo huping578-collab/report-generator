@@ -656,15 +656,28 @@ def normalize_direction(value):
     return text.strip()
 
 
-def _segment_index(segments, station, route=""):
+def _segment_index(segments, station, route="", county="", direction=""):
+    """唯一落段；相邻边界归后段，身份不明且重叠时不猜测。"""
     route = _route(route) if route else ""
+    county = str(county or "").strip()
+    if county == "重庆市":
+        county = ""
+    direction = normalize_direction(direction)
+    candidates = []
     for index, segment in enumerate(segments):
-        if not segment["start"] <= station <= segment["end"]:
+        start, end = sorted((segment["start"], segment["end"]))
+        if not start <= station <= end:
             continue
         if route and _route(segment.get("route", "")) != route:
             continue
-        return index
-    return None
+        if county and segment.get("county") and county not in county_short_names(segment["county"]):
+            continue
+        if direction and segment.get("direction") and direction != normalize_direction(segment["direction"]):
+            continue
+        candidates.append(index)
+    interior = [i for i in candidates if station < max(segments[i]["start"], segments[i]["end"])]
+    candidates = interior or candidates
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _xlsx_shared_strings(archive):
@@ -1007,19 +1020,11 @@ def build_segment_tci_photos(tci_path, image_map, segments):
                 description = value
                 break
         route = _route(row.get("路线编号"))
-        for idx, seg in enumerate(segments):
-            seg_route = _route(seg.get("route"))
-            if seg_route and route and seg_route != route:
-                continue
-            seg_direction = normalize_direction(seg.get("direction"))
-            if seg_direction and seg_direction != direction:
-                continue
-            start = float(seg.get("start") or 0)
-            end = float(seg.get("end") or 0)
-            if start <= station <= end:
-                for media_name, extension in photos:
-                    result.setdefault(idx, []).append((description or "病害", media_name, extension))
-                break
+        county = row.get("区县") or row.get("所属区县") or row.get("区域") or ""
+        index = _segment_index(segments, station, route, county, direction)
+        if index is not None:
+            for media_name, extension in photos:
+                result.setdefault(index, []).append((description or "病害", media_name, extension))
     return result
 
 
@@ -1260,26 +1265,96 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                 sign = num_at("sign")
                 marking = num_at("marking")
             row_route = vals[route_idx] if route_idx is not None and route_idx < len(vals) else route_value
-            seg_idx = _segment_index(segments, station, row_route)
+            headers = [str(v or "").strip() for v in rows[header_row_idx - 1]]
+            def identity_value(names):
+                index = next((i for i, h in enumerate(headers) if h in names), None)
+                return str(vals[index] or "").strip() if index is not None and index < len(vals) else ""
+            county = identity_value(("区县", "所属区县", "区域"))
+            direction = normalize_direction(identity_value(("方向", "行驶方向")))
+            seg_idx = _segment_index(segments, station, row_route, county, direction)
             if seg_idx is None:
                 continue
-            records.append({"segment": seg_idx, "station": station, "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
+            if any(not math.isfinite(v) or v < 0 for v in (light, heavy, sign, marking)):
+                raise ValueError(f"{fpath.name}：桩号{format_station(station)}的 TCI 病害数量必须为非负有限数值")
+            records.append({"segment": seg_idx, "station": station, "county": segments[seg_idx].get("county", ""),
+                            "route": row_route, "direction": direction, "file": str(fpath),
+                            "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
         log(f"TCI 病害 {fpath.name}: 落段 {len([r for r in records if True])} 条")
     return records
 
 def make_tci_stats(segments, tci_records):
+    """在原检测区段内按整公里、方向评定；汇总直接平均单元而非段均值。"""
     stats = []
     for idx, seg in enumerate(segments):
-        rows = [r for r in tci_records if r["segment"]==idx]
-        light = sum(r["light"] for r in rows)
-        heavy = sum(r["heavy"] for r in rows)
-        sign = sum(r["sign"] for r in rows)
-        marking = sum(r["marking"] for r in rows)
-        gd1, gd2, gd3 = tci_gd(light, heavy, sign, marking)
-        tci = compute_tci(light, heavy, sign, marking)
-        grade = tci_grade(tci)
-        stats.append({"segment": seg, "light": light, "heavy": heavy, "sign": sign, "marking": marking, "gd1": gd1, "gd2": gd2, "gd3": gd3, "tci": tci, "grade": grade, "count": len(rows)})
+        rows = [r for r in tci_records if r["segment"] == idx]
+        totals = {key: sum(r[key] for r in rows) for key in ("light", "heavy", "sign", "marking")}
+        directions = {normalize_direction(r.get("direction")) for r in rows}
+
+        units = []
+        start, end = sorted((seg["start"], seg["end"]))
+        bounds = [start, *range((math.floor(start / 1000) + 1) * 1000, math.ceil(end / 1000) * 1000, 1000), end]
+        for direction in ("上行", "下行", ""):
+            if direction not in directions or start == end:
+                continue
+            for left, right in zip(bounds, bounds[1:]):
+                selected = [r for r in rows if normalize_direction(r.get("direction")) == direction
+                            and left <= r["station"] and (r["station"] < right or r["station"] == right == end)]
+                values = {key: sum(r[key] for r in selected) for key in totals}
+                score = compute_tci(**dict(light=values["light"], heavy=values["heavy"], sign=values["sign"], marking_m=values["marking"]))
+                units.append(dict(county=seg.get("county", ""), route=seg.get("route", "G210"), direction=direction,
+                                  start=left, end=right, mileage=(right-left)/1000, source_segment=idx,
+                                  **values, tci=score, grade=tci_grade(score), count=len(selected)))
+        score = sum(u["tci"] for u in units) / len(units) if units else None
+        stats.append(dict(segment=seg, **totals, units=units, tci=score,
+                          grade=tci_grade(score) if score is not None else "", count=len(rows)))
     return stats
+
+
+def tci_route_stats(segments, tci_stats):
+    """县+路线+方向汇总，保留全部原区段单元以供正文、附表和 Excel 共用。"""
+    groups = {}
+    for stat in tci_stats or []:
+        for unit in stat.get("units", []):
+            key = (unit["county"], unit["route"], unit["direction"])
+            groups.setdefault(key, []).append(unit)
+    result = []
+    for (county, route, direction), units in sorted(groups.items(), key=lambda item: (item[0][0], item[0][1], 0 if item[0][2] == "上行" else 1)):
+        units = sorted(units, key=lambda u: (u["start"], u["end"]))
+        score = sum(u["tci"] for u in units) / len(units)
+        result.append(dict(county=county, route=route, direction=direction, units=units,
+                           mileage=sum(u["mileage"] for u in units), tci=score, grade=tci_grade(score)))
+    return result
+
+
+def route_report_data(segments, height_stats, height_records, bolt_stats, bolt_records):
+    """重庆正文按县、道路编号汇总；原分段仅作为来源，间断里程不补齐。"""
+    groups = {}
+    for index, segment in enumerate(segments):
+        groups.setdefault((segment.get("county", ""), segment.get("route", "G210")), []).append(index)
+    routes, heights, bolts, mapping = [], [], [], {}
+    for route_index, indices in enumerate(groups.values()):
+        source = [segments[i] for i in indices]
+        route = dict(source[0], start=min(min(s["start"], s["end"]) for s in source),
+                     end=max(max(s["start"], s["end"]) for s in source),
+                     mileage=sum(s.get("mileage", 0) for s in source), source_segments=source)
+        routes.append(route)
+        mapping.update({i: route_index for i in indices})
+        if height_stats is not None:
+            types = {}
+            for kind in ("二波", "三波"):
+                data = [height_stats[i]["types"][kind] for i in indices if height_stats[i] is not None]
+                count = sum(d["count"] for d in data)
+                bins = [sum(d["bins"][j] for d in data) for j in range(5)]
+                pcts = [round(n * 100 / count, 2) if count else 0 for n in bins]
+                types[kind] = dict(count=count, bins=bins, pcts=pcts, **{"pass": pcts[2]})
+            heights.append(dict(segment=route, types=types))
+        if bolt_stats is not None:
+            data = [bolt_stats[i] for i in indices if bolt_stats[i] is not None]
+            values = {key: sum(d[key] for d in data) for key in ("splice", "connection", "missing", "points")}
+            bolts.append(dict(segment=route, **values, rate=bolt_missing_rate(values["splice"], values["connection"], values["missing"])))
+    def remap(records):
+        return [dict(r, segment=mapping[r["segment"]]) for r in records or []]
+    return routes, heights if height_stats is not None else None, remap(height_records), bolts if bolt_stats is not None else None, remap(bolt_records)
 
 
 def style_sheet(ws, widths):
@@ -1512,6 +1587,15 @@ def make_excel(
         else:
             style_sheet(ws, [8, 11, 16, 16, 16, 14, 14, 14, 14, 10, 8])
 
+        units_sheet = wb.create_sheet("TCI公里评定明细")
+        units_sheet.append(["序号", "路线编号", "区县", "方向", "起点桩号", "止点桩号", "TCI", "等级"])
+        for group in tci_route_stats(segments, tci_stats):
+            for unit in group["units"]:
+                units_sheet.append([units_sheet.max_row, unit["route"], unit["county"], unit["direction"],
+                                    format_station(unit["start"]), format_station(unit["end"]), unit["tci"], unit["grade"]])
+        for cell in units_sheet["G"][1:]:
+            cell.number_format = "0.00"
+        style_sheet(units_sheet, [8, 12, 14, 12, 18, 18, 12, 10])
         ws = wb.create_sheet("沿线设施明细")
         if has_county:
             ws.append(["序号", "区县", "路线编号", "桩号", "轻", "重", "标志", "标线(m)", "所属分段起点", "所属分段终点"])
@@ -1544,7 +1628,7 @@ def make_excel(
         ])
     if tci_stats is not None:
         notes.extend([
-            ("TCI 统计", "TCI=Σwᵢ(100-GDᵢ)/0.7，w=[0.25,0.25,0.20]，防护轻10/重30、标志20/处、标线每10m1分不足10m计10m，GD封顶100，等级 优≥90 良≥80 中≥70 次≥60 差<60。"),
+            ("TCI 统计", "原区段内按整公里桩号、方向划分，首尾不足公里单独评定；路线和区县按所有评定单元等权平均。TCI=Σwᵢ(100-GDᵢ)/0.7，w=[0.25,0.25,0.20]，防护轻10/重30、标志20/处、标线每10m1分不足10m计10m，GD封顶100，等级 优≥90 良≥80 中≥70 次≥60 差<60。"),
             ("TCI 数据来源", f"TCI 病害明细共{len(tci_records)}条，分段{len(tci_stats)}。"),
         ])
     if bolt_stats is not None:
@@ -1935,39 +2019,31 @@ def report_images(temp_dir, segments, stats, records):
 
 
 def report_tci_images(temp_dir, segments, tci_stats):
-    """逐分段 TCI 病害构成分布图：防护-轻/防护-重/标志缺损/标线缺损(m)柱状图。
-
-    只对有有效记录（count>0）的分段成图；无数据分段由报告写占位句、不挂图。
-    返回 {segment_index: Path}，供 minimal_docx._section_tci 挂图。
-    """
+    """按道路编号的原检测区段、方向分别绘制TCI，样式与高度折线图统一。"""
     images = {}
     plt.rcParams["font.sans-serif"] = ["SimSun", "Microsoft YaHei", "Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
-    for segment_index, item in enumerate(tci_stats or []):
-        if not item or int(item.get("count") or 0) <= 0:
-            continue
-        segment = segments[segment_index] if segment_index < len(segments) else {}
-        route = str(segment.get("route", "G210") if isinstance(segment, dict) else "G210")
-        try:
-            start_text = format_station(segment["start"]) if isinstance(segment, dict) else ""
-            end_text = format_station(segment["end"]) if isinstance(segment, dict) else ""
-        except (KeyError, TypeError, ValueError):
-            start_text, end_text = "", ""
-        labels = ["防护-轻(处)", "防护-重(处)", "标志缺损(处)", "标线缺损(m)"]
-        values = [item.get("light", 0), item.get("heavy", 0), item.get("sign", 0), item.get("marking", 0)]
-        figure, axis = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
-        bars = axis.bar(labels, values, color=["#4472C4", "#ED7D31", "#A5A5A5", "#FFC000"])
-        axis.set_ylabel("数量")
-        axis.set_title(f"{route}线{start_text}～{end_text}段沿线设施病害构成（TCI{item.get('tci', 0):.2f}·{item.get('grade', '')}）", fontsize=10)
-        for bar, value in zip(bars, values):
-            axis.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:g}", ha="center", va="bottom", fontsize=8)
-        figure.subplots_adjust(left=0.10, right=0.98, top=0.88, bottom=0.22)
-        out_path = Path(temp_dir) / f"tci_{segment_index}.png"
-        figure.savefig(out_path, transparent=False)
-        plt.close(figure)
-        images[segment_index] = out_path
+    for seg_idx, stat in enumerate(tci_stats or []):
+        for direction in ("上行", "下行", ""):
+            units = [u for u in stat.get("units", []) if normalize_direction(u.get("direction")) == direction]
+            if not units:
+                continue
+            figure, axis = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
+            x = list(range(len(units)))
+            axis.plot(x, [u["tci"] for u in units], color="#4472C4", linewidth=1,
+                      marker="o", markersize=2, label="TCI")
+            axis.set_ylim(0, 105)
+            axis.grid(True, alpha=0.25)
+            axis.set_ylabel("TCI")
+            axis.set_xticks(x)
+            axis.set_xticklabels([format_station(u["start"]) for u in units], rotation=30, ha="right", fontsize=7)
+            axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=1, frameon=False)
+            figure.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.30)
+            path = Path(temp_dir) / f"tci_{len(images)}.png"
+            figure.savefig(path, transparent=False)
+            plt.close(figure)
+            images[(seg_idx, direction)] = path
     return images
-
 
 def picture_paragraph(rel_id, drawing_id, width_cm=13, height_cm=8):
     cx, cy = int(width_cm * 360000), int(height_cm * 360000)

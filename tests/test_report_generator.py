@@ -19,6 +19,230 @@ from bridge import DesktopBridge
 from backend import markdown_skeleton, minimal_docx, report_engine as engine
 
 
+def test_chongqing_tci_units_keep_original_boundaries_and_equal_weights():
+    import pytest
+    segments = [
+        dict(county="甲县", route="G210", start=2157392., end=2159964., mileage=2.572),
+        dict(county="甲县", route="G210", start=2159964., end=2160200., mileage=.236),
+        dict(county="甲县", route="G210", start=2161500., end=2161700., mileage=.2),
+        dict(county="乙县", route="G210", start=2157392., end=2159964., mileage=2.572),
+    ]
+    records = [dict(segment=0, direction="上行", station=2157500., light=20, heavy=0, sign=0, marking=0),
+               dict(segment=0, direction="下行", station=2158000., light=0, heavy=0, sign=1, marking=11),
+               dict(segment=1, direction="上行", station=2159964., light=1, heavy=0, sign=0, marking=0)]
+    stats = engine.make_tci_stats(segments, records)
+    units = [u for s in stats for u in s.get("units", [])]
+    assert len(units) == 8
+    assert [(u["start"], u["end"]) for u in units if u["direction"] == "上行"] == [
+        (2157392., 2158000.), (2158000., 2159000.), (2159000., 2159964.),
+        (2159964., 2160000.), (2160000., 2160200.)]
+    assert stats[2]["tci"] is None and stats[3]["tci"] is None
+    assert stats[0]["units"][1]["tci"] == 100
+    groups = engine.tci_route_stats(segments, stats)
+    up = next(g for g in groups if g["county"] == "甲县" and g["direction"] == "上行")
+    expected = (engine.compute_tci(20, 0, 0, 0) + 100 + 100 + engine.compute_tci(1, 0, 0, 0) + 100) / 5
+    assert up["tci"] == pytest.approx(expected)
+    assert up["mileage"] == pytest.approx(2.808)
+    assert up["grade"] == engine.tci_grade(expected)
+
+
+def test_chongqing_tci_source_identity_and_boundary_assignment():
+    root = Path(__file__).parent / "artifacts" / "tci-identity"
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county=c, route=r, start=a, end=b, direction=d)
+                for c, r, a, b, d in [("甲县", "G210", 1000, 1964, "上行"),
+                                      ("甲县", "G210", 1964, 3000, "上行"),
+                                      ("甲县", "G210", 1000, 3000, "下行"),
+                                      ("乙县", "G210", 1000, 3000, "上行"),
+                                      ("甲县", "G319", 1000, 3000, "上行")]]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["区域", "路线编号", "方向", "原始桩号", "防护设施缺损", "标志缺损", "标线缺损"])
+    ws.append([None, None, None, None, "轻", None, None])
+    for c, r, d, station in [("甲县", "G210", "上行", "K1+964"), ("甲县", "G210", "下行", "K1+500"),
+                              ("乙县", "G210", "上行", "K1+500"), ("甲县", "G319", "上行", "K1+500")]:
+        ws.append([c, r, d, station, 1, 0, 0])
+    path = root / "identity.xlsx"
+    wb.save(path)
+    records = engine.collect_tci_records(segments, path)
+    assert [r["segment"] for r in records] == [1, 2, 3, 4]
+    assert [r["direction"] for r in records] == ["上行", "下行", "上行", "上行"]
+    assert records[2]["county"] == "乙县"
+    # 市域标签不是区县；单县输入仍应落段。
+    ws.delete_rows(3, 4)
+    ws.append(["重庆市", "G210", "上行", "K1+500", 1, 0, 0])
+    wb.save(path)
+    assert len(engine.collect_tci_records(segments[:2], path)) == 1
+
+
+def test_chongqing_route_report_and_appendix_end_to_end():
+    root = Path(__file__).parent / "artifacts" / "chongqing-route"
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county="甲县", route=route, start=start, end=end, mileage=(end-start)/1000,
+                     grade="二级公路", manager="", route_name="测试路线")
+                for route, start, end in [("G210", 1500, 2500), ("G210", 3964, 5000), ("G319", 6000, 7000)]]
+    h = [dict(segment=i, kind="二波", height=value, direction="上行", station=s["start"]+10,
+              raw_station=s["start"]+10, electronic_station=s["start"]+10, file="test.xlsx", basis="电子修正桩号")
+         for i, s in enumerate(segments) for value in (600, 500)]
+    b = [dict(segment=i, direction="上行", station=s["start"]+10, raw_station=s["start"]+10,
+              file="test.xlsx", basis="电子修正桩号", splice=10, connection=5, splice_missing=1, connection_missing=0)
+         for i, s in enumerate(segments)]
+    t = [dict(segment=i, direction="上行", station=s["start"]+10, light=0, heavy=0, sign=1, marking=0)
+         for i, s in enumerate(segments)]
+    stats = engine.make_tci_stats(segments, t)
+    config = engine.Config(root, root/'summary.xlsx', root, engine.builtin_template_paths()["重庆模板"], root, county="甲县")
+    minimal_docx.make_report(config, segments, engine.make_stats(segments,h), h,
+                            engine.make_bolt_stats(segments,b), b, stats, t, {}, root,
+                            skeleton_md=config.template_docx)
+    engine.make_excel(config, segments, tci_stats=stats, tci_records=t)
+    doc = Document(config.out_docx)
+    headings = [p.text for p in doc.paragraphs if p.style.name == 'Heading 2']
+    assert not any('线K' in text for text in headings)
+    assert sum(text.endswith('G210线') for text in headings) == 3
+    assert sum(text.endswith('G319线') for text in headings) == 3
+    text = '\n'.join(p.text for p in doc.paragraphs)
+    assert '附表1 重庆市甲县交安设施技术状况评定明细' in text
+    assert '评定单元等权' in text
+    assert '共检出拼接螺栓20颗' in text
+    appendix = next(table for table in doc.tables if [c.text for c in table.rows[0].cells] ==
+                    ['序号','路线编号','区县','方向','起点桩号','止点桩号','TCI','等级'])
+    assert len(appendix.rows) == 8  # 5 个单元 + 2 条路线汇总 + 表头
+    assert appendix.rows[0]._tr.xpath('./w:trPr/w:tblHeader')
+    assert not doc._element.xpath('.//w:r/w:r')  # TOC缓存不得生成嵌套run。
+    assert sum("附表1 重庆市甲县交安设施技术状况评定明细" in p.text for p in doc.paragraphs) == 2
+    assert len(doc.inline_shapes) >= 6
+    wb = openpyxl.load_workbook(config.out_xlsx, read_only=True, data_only=True)
+    assert wb['TCI公里评定明细'].max_row == 6
+    wb.close()
+
+
+def test_chongqing_real_tci_workbook_matches_reference_units():
+    import pytest
+    source = Path(os.environ.get("CHONGQING_TCI_TEST_SOURCE", "D:/hermes/attachments/G210上行2159.964--2184.977.xlsx"))
+    if not source.is_file():
+        pytest.skip("未配置真实TCI验算工作簿")
+    root = Path(__file__).parent / "artifacts" / "chongqing-route" / "real-tci"
+    root.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.load_workbook(source, read_only=True, data_only=True)
+    expected = [r for r in wb['技术状况评定表'].iter_rows(min_row=2,values_only=True)
+                if isinstance(r[1], (int,float)) and isinstance(r[2], (int,float)) and isinstance(r[7], (int,float))]
+    wb.close()
+    # 检测范围取真实评定表，不从病害点的最小/最大桩号猜测覆盖范围。
+    start, end = expected[0][1], expected[-1][2]
+    summary = openpyxl.Workbook()
+    sheet = summary.active
+    sheet.title = '各区县项目概况'
+    sheet.append(['区县','路线编号','公路等级','起点桩号','止点桩号','里程（km）'])
+    sheet.append(['两江新区','G210','一级公路',start,end,end-start])
+    summary_path = root/'summary.xlsx'
+    summary.save(summary_path)
+    config = engine.Config(root, summary_path, root, engine.builtin_template_paths()['重庆模板'], root, tci_path=source, county='两江新区')
+    result = engine.generate_statistics_and_report(config, process_height=False, process_tci=True, county_override='两江新区')
+    units = result['tci'][0]['units']
+    assert len(units) == len(expected) == 26
+    for unit, reference in zip(units,expected):
+        assert unit['start'] == pytest.approx(reference[1]*1000)
+        assert unit['end'] == pytest.approx(reference[2]*1000)
+        assert unit['tci'] == pytest.approx(reference[7], abs=.0001)
+        assert unit['grade'] == reference[8]
+    assert result['tci'][0]['tci'] == pytest.approx(87.50549450549453, abs=.0001)
+    doc = Document(config.out_docx)
+    assert any('87.51' in p.text for p in doc.paragraphs)
+    appendix = next(t for t in doc.tables if [c.text for c in t.rows[0].cells] ==
+                    ['序号','路线编号','区县','方向','起点桩号','止点桩号','TCI','等级'])
+    assert len(appendix.rows) == 28
+    assert appendix.rows[1].cells[6].text == '87.51'
+    with zipfile.ZipFile(config.out_docx) as archive:
+        assert archive.testzip() is None
+
+
+def test_tci_charts_split_by_original_segment_and_direction():
+    from PIL import Image
+    root = Path(__file__).parent / 'artifacts' / 'chongqing-refinement'
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county='甲县',route='G210',start=a,end=b,mileage=(b-a)/1000)
+                for a,b in [(1500,3500),(5000,6500)]]
+    rows = [dict(segment=i,direction=d,station=segments[i]['start']+20,light=0,heavy=0,sign=1,marking=0)
+            for i,d in [(0,'上行'),(0,'下行'),(1,'上行')]]
+    stats = engine.make_tci_stats(segments,rows)
+    figures = []
+    subplots = engine.plt.subplots
+    def observe(*args,**kwargs):
+        pair = subplots(*args,**kwargs)
+        figures.append(pair)
+        return pair
+    with patch.object(engine.plt,'subplots',side_effect=observe):
+        images = engine.report_tci_images(root,segments,stats)
+    assert set(images) == {(0,'上行'),(0,'下行'),(1,'上行')}
+    for (figure,axis),path in zip(figures,images.values()):
+        assert tuple(round(v,5) for v in figure.get_size_inches()) == (round(13/2.54,5),round(8/2.54,5))
+        assert figure.dpi == 180
+        assert axis.get_title() == ''
+        assert axis.lines[0].get_color() == '#4472C4'
+        assert axis.lines[0].get_linewidth() == 1
+        assert not axis.get_legend().get_frame_on()
+        assert axis.get_xticklabels()[0].get_rotation() == 30
+        with Image.open(path) as image:
+            assert image.width > image.height
+    doc = Document()
+    minimal_docx._section_tci(doc,segments,stats,images,root)
+    assert len(doc.inline_shapes) == 3
+    assert [p.text for p in doc.paragraphs if p.style.name == 'Heading 2'] == ['甲县整体情况','G210线']
+    captions = [p.text for p in doc.paragraphs if 'TCI情况' in p.text]
+    assert any('上行K1+500～K3+500段TCI情况' in text for text in captions)
+    assert any('下行K1+500～K3+500段TCI情况' in text for text in captions)
+
+
+def test_conclusion_matches_reference_template_structure():
+    root = Path(__file__).parent / 'artifacts' / 'chongqing-refinement'
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county='甲县', route='G210', start=1500, end=2500, mileage=1.0,
+                     grade='一级公路', manager='', route_name='测试')]
+    h = [dict(segment=0, kind='二波', height=500, direction='上行', station=1510,
+              raw_station=1510, electronic_station=1510, file='t.xlsx', basis='电子修正桩号')]
+    b = [dict(segment=0, direction='上行', station=1510, raw_station=1510,
+              file='t.xlsx', basis='电子修正桩号', splice=100, connection=50, splice_missing=5, connection_missing=0)]
+    t = [dict(segment=0, direction='上行', station=1510, light=1, heavy=0, sign=2, marking=10.0),
+         dict(segment=0, direction='下行', station=1520, light=10, heavy=5, sign=10, marking=100.0)]
+    stats = engine.make_tci_stats(segments, t)
+    doc = Document()
+    minimal_docx._section_conclusion(doc, segments, engine.make_stats(segments, h),
+                                     engine.make_bolt_stats(segments, b), stats)
+    text = '\n'.join(p.text for p in doc.paragraphs)
+    headings = [p.text for p in doc.paragraphs if p.style.name.startswith('Heading')]
+    assert '结论' in headings and '建议' in headings
+    assert '沿线设施技术状况' in text
+    assert '合格率' in text and '螺栓' in text and '缺失率' in text
+    assert 'JTG 5110-2023' in text
+    assert '1.沿线设施技术状况检查建议' in text
+    assert '2.波形梁护栏专项检测建议' in text
+    assert '标志遮挡' in text and '标线缺损' in text and '波形梁变形' in text
+    assert '横梁中心高度' in text and '螺栓缺失' in text
+
+
+def test_example_tables_are_borderless():
+    from docx import Document as Doc
+    from docx.oxml.ns import qn as qqn
+    root = Path(__file__).parent / 'artifacts' / 'chongqing-refinement'
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county='甲县', route='G210', start=1500, end=2500, mileage=1.0,
+                     grade='一级公路', manager='', route_name='测试')]
+    h = [dict(segment=0, kind='二波', height=600, direction='上行', station=1510,
+              raw_station=1510, electronic_station=1510, file='t.xlsx', basis='电子修正桩号')]
+    config = engine.Config(root, root/'s.xlsx', root, engine.builtin_template_paths()['重庆模板'], root, county='甲县')
+    minimal_docx.make_report(config, segments, engine.make_stats(segments,h), h,
+                            engine.make_bolt_stats(segments,[]), [], None, None, {}, root,
+                            skeleton_md=config.template_docx)
+    doc = Doc(config.out_docx)
+    for table in doc.tables:
+        if len(table.columns) <= 2:
+            borders = table._tbl.tblPr.find(qqn('w:tblBorders'))
+            if borders is not None:
+                for edge in ('top','left','bottom','right','insideH','insideV'):
+                    el = borders.find(qqn(f'w:{edge}'))
+                    assert el is not None and el.get(qqn('w:val')) == 'none', f'table has visible border {edge}'
+
+
 class FakeWindow:
     def __init__(self) -> None:
         self.scripts: list[str] = []
@@ -1187,7 +1411,7 @@ class MinimalDocxTests(unittest.TestCase):
             self.assertFalse(any("5.1" in h or "5.2" in h for h in headings), headings)
             self.assertNotIn("由程序根据检测统计自动生成", text)
             # D6 联动：第二段螺栓无记录但高度有数据，应为中性表述。
-            self.assertIn("本段螺栓明细无有效记录", text)
+            self.assertIn("G210线共检出拼接螺栓80颗", text)
             self.assertNotIn("本段无波形护栏", text)
 
     def test_overview_table_has_county_column(self) -> None:
@@ -2325,20 +2549,8 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
 
     @staticmethod
     def _demo_tci_stats(segments):
-        stats = []
-        for index, seg in enumerate(segments):
-            if index == 0:
-                tci = engine.compute_tci(1, 0, 2, 10.0)
-                stats.append({
-                    "segment": seg, "light": 1, "heavy": 0, "sign": 2, "marking": 10.0,
-                    "tci": tci, "grade": engine.tci_grade(tci), "count": 2,
-                })
-            else:
-                stats.append({
-                    "segment": seg, "light": 0, "heavy": 0, "sign": 0, "marking": 0.0,
-                    "tci": 100.0, "grade": "优", "count": 0,
-                })
-        return stats
+        return engine.make_tci_stats(segments, [dict(segment=0, direction="上行", station=segments[0]["start"]+10,
+                                                   light=1, heavy=0, sign=2, marking=10.)])
 
     def test_template_has_benchmark_anchor_structure(self) -> None:
         from backend import minimal_docx
@@ -2351,9 +2563,9 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
             ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
         )
         anchors = [block.text for block in template.blocks if block.text and "inject:" in block.text]
-        self.assertEqual(len(anchors), 5)
-        for key in ("overview", "tci", "height", "bolt", "conclusion"):
-            self.assertEqual(sum(1 for text in anchors if f"inject:{key}" in text), 1, key)
+        self.assertEqual(len(anchors), 6)
+        for key in ("overview", "tci", "height", "bolt", "conclusion", "tci_appendix"):
+            self.assertEqual(sum(1 for text in anchors if f"inject:{key} -->" in text), 1, key)
         sub = [
             minimal_docx._strip_section_number(block.text)
             for block in template.blocks
@@ -2414,16 +2626,16 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
             text = "\n".join(p.text for p in document.paragraphs)
             h1 = [p.text for p in document.paragraphs if p.style.name == "Heading 1"]
             self.assertEqual(
-                [minimal_docx._strip_section_number(h) for h in h1],
+                [minimal_docx._strip_section_number(h) for h in h1 if not h.startswith("附表1")],
                 ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
             )
         for required in ("检测依据", "检测设备与评定方法", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测", "波形梁护栏螺栓缺失检测"):
             self.assertTrue(any(required in h for h in headings), f"missing static heading: {required}")
-        # TCI 有一段无数据 → 占位句；高度/螺栓同构小节正常展开。
-        self.assertIn("暂无有效沿线设施检测记录", text)
-        self.assertIn("本段螺栓明细无有效记录", text)
+        # 按路线合并后，部分缺源不再建立独立区段小节。
+        self.assertIn("部分检测区间未提供TCI数据", text)
+        self.assertIn("G210线共检出拼接螺栓80颗", text)
 
-    def test_tci_section_writes_per_segment_subsections_and_placeholders(self) -> None:
+    def test_tci_section_writes_route_subsection_and_excludes_missing_units(self) -> None:
         segments = build_demo_segments()
         tci_stats = self._demo_tci_stats(segments)
         document = Document()
@@ -2435,9 +2647,10 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
         text = "\n".join(p.text for p in document.paragraphs)
         seg0 = f"G210线{engine.format_station(segments[0]['start'])}～{engine.format_station(segments[0]['end'])}段"
         seg1 = f"G210线{engine.format_station(segments[1]['start'])}～{engine.format_station(segments[1]['end'])}段"
-        self.assertIn(seg0, headings)
-        self.assertIn(seg1, headings)
-        self.assertIn(f"本段{seg1}暂无有效沿线设施检测记录", text)
+        self.assertNotIn(seg0, headings)
+        self.assertEqual(headings.count("G210线"), 1)
+        self.assertNotIn(seg1, headings)
+        self.assertIn("部分检测区间未提供TCI数据", text)
         self.assertEqual(len(tci_images), 1)
         self.assertTrue(all(image_files.values()), image_files)
 
