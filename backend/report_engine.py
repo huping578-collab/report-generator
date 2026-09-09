@@ -9,6 +9,7 @@ from threading import Thread
 from zipfile import ZIP_DEFLATED, ZipFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+import hashlib
 import math
 import os
 import posixpath
@@ -2898,8 +2899,9 @@ def _first(row, *aliases, default=None):
 
 def _float(value):
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) and not isinstance(value, bool) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -3080,7 +3082,7 @@ class GuangdongInputScanner:
     def _kind(headers):
         h = {_norm_header(x) for x in headers if x is not None}
         has = lambda prefix: any(value.startswith(_norm_header(prefix)) for value in h)
-        if (has("逆反亮度系数") or has("逆反射亮度系数")) and (has("计算区间") or has("桩号")):
+        if any("逆反亮度系数" in value or "逆反射亮度系数" in value for value in h) and (has("计算区间") or has("桩号")):
             return "marking"
         if has("拼接螺栓数量") and has("连接螺栓缺失数量"):
             return "bolt"
@@ -3139,10 +3141,10 @@ class GuangdongInputScanner:
         return {"city": city, "route": _route(route), "direction": direction,
                 "marking_position": position, "file_segment": segment}
 
-    def _convert(self, kind, row, source, sheet):
+    def _convert(self, kind, row, source, sheet, source_row=None, issues=None):
         city = str(_first(row, "地市", "地区", default="") or "").strip()
         route = _route(_first(row, "路线编号", "路线"))
-        direction = str(_first(row, "方向", default="") or "").strip()
+        direction = str(_first(row, "方向", "检测方向", default="") or "").strip()
         metadata = self._metadata_from_marking_name(source)
         if not city: city = str(metadata.get("city") or "")
         if not route: route = metadata.get("route", "")
@@ -3156,12 +3158,15 @@ class GuangdongInputScanner:
                     city = self.default_city
                 else:
                     raise
-        station_raw = _first(row, "标注修正桩号", "电子修正桩号", "原始桩号", "桩号", "计算区间", "桩号范围")
+        station_raw = _first(row, "标注修正桩号", "电子修正桩号", "原始桩号", "桩号", "桩号范围", "计算区间")
         explicit_segment = _first(row, "检测区段", "统计区段", "区段", "桩号范围")
         base = {"city": city, "route": route, "direction": direction, "station_m": _station_first(station_raw),
-                "segment": str(explicit_segment or metadata.get("file_segment") or station_raw or ""), "source": str(source), "sheet": sheet}
-        if base["station_m"] is None:
-            raise ValueError(f"{Path(source).name}/{sheet}：桩号无法解析：{station_raw}")
+                "segment": str(explicit_segment or metadata.get("file_segment") or station_raw or ""), "manager": str(_first(row, "管养单位", default="") or ""), "interval": str(_first(row, "计算区间", default="") or ""), "source": str(source), "sheet": sheet, "source_row": source_row, "source_range": str(station_raw or "")}
+        location = f"{Path(source).name}/{sheet}/第{source_row}行"
+        if not base["city"] or not base["route"]:
+            raise ValueError(f"{location}：缺少地市或路线元数据")
+        if _float(base["station_m"]) is None:
+            raise ValueError(f"{location}：桩号无法解析：{station_raw}")
         if kind == "height":
             value = _float(_first(row, "梁板中心高度(mm)", "护栏中心高度(mm)", "梁板中心高度", "护栏中心高度", "梁板中心高度毫米", "护栏中心高度mm"))
             remark = str(_first(row, "异常标记", "备注标记", "备注", default="") or "").strip()
@@ -3184,14 +3189,34 @@ class GuangdongInputScanner:
             if remark and ("桥梁" in remark or "隧道" in remark):
                 base["guardrail_note"] = remark
         else:
-            value = _float(_first(row, "逆反亮度系数", "逆反射亮度系数"))
-            if value is None: return None
-            for key in ("city","route","direction"):
-                if not base[key]: base[key] = metadata.get(key, "")
-            base.update(marking_position=str(_first(row,"标线位置","标线名称",default=metadata.get("marking_position", ""))),
-                        value=value, target=_float(_first(row,"逆反亮度系数目标值",default=80)) or 80)
-        if not base["city"] or not base["route"]:
-            raise ValueError(f"{Path(source).name}/{sheet}：缺少地市或路线元数据")
+            side_columns = (("主车道左侧标线逆反亮度系数", "左侧标线", "左侧标线逆反射目标值"), ("主车道右侧标线逆反亮度系数", "右侧标线", "右侧标线逆反射目标值"))
+            wide = any(_norm_header(column) in {_norm_header(k) for k in row} for column, _, _ in side_columns)
+            if not direction or (wide and not base["manager"].strip()):
+                raise ValueError(f"{location}：缺少检测方向或管养单位元数据")
+            if wide:
+                endpoints = re.fullmatch(r"\s*(K?\s*\d+(?:\.\d+)?\s*\+\s*\d+(?:\.\d+)?)\s*[-~～—–－]\s*(K?\s*\d+(?:\.\d+)?\s*\+\s*\d+(?:\.\d+)?)\s*", str(station_raw or ""), re.I)
+                if not endpoints:
+                    raise ValueError(f"{location}：桩号区间无法解析：{station_raw}")
+                base["station_m"], base["end_m"] = map(_station_first, endpoints.groups())
+                if any(_float(base[k]) is None for k in ("station_m", "end_m")):
+                    raise ValueError(f"{location}：桩号区间必须为有限数值")
+                sides = [(_first(row, column), position, _first(row, target)) for column, position, target in side_columns]
+            else:
+                sides = [(_first(row, "逆反亮度系数", "逆反射亮度系数"),
+                          str(_first(row, "标线位置", "标线名称", default=metadata.get("marking_position", ""))),
+                          _first(row, "逆反亮度系数目标值", "逆反射亮度系数目标值", default=80))]
+            records = []
+            for raw_value, position, raw_target in sides:
+                if raw_value is None or str(raw_value).strip() == "":
+                    continue  # 空侧不补值，也不丢弃另一有效侧。
+                value, target = _float(raw_value), _float(raw_target)
+                if value is None or value < 0 or target is None or target < 0:
+                    message = f"{location}/{position}：标线值及目标值必须为非负有限数值（值={raw_value}，目标={raw_target}）"
+                    if issues is None: raise ValueError(message)
+                    issues.append(message)
+                    continue
+                records.append(dict(base, marking_position=position, value=value, target=target))
+            return records if wide else (records[0] if records else None)
         return base
 
     def _process_file(self, path):
@@ -3202,11 +3227,15 @@ class GuangdongInputScanner:
             for sheet, headers, rows in tables:
                 kind = self._kind(headers)
                 if not kind: continue
-                for values in rows:
+                for source_row, values in enumerate(rows, 2):
+                    if not any(value not in (None, "") for value in values): continue
                     row = dict(zip(headers, values))
                     try:
-                        record = self._convert(kind, row, path, sheet)
-                        if record:
+                        record = self._convert(kind, row, path, sheet, source_row, records["issues"])
+                        if isinstance(record, list):
+                            for item in record:
+                                if item: records[kind].append(item)
+                        elif record:
                             if record.get("guardrail_note"):
                                 records["notes"].append(record)
                             else:
@@ -3318,8 +3347,34 @@ def detect_guangdong_data_folders(project_dir):
     return marking_dir, guardrail_dir
 
 
+MARKING_SEGMENT_FIELDS = ("city", "category", "route", "direction", "manager", "segment")
+
+
 class GuangdongStatistics:
     HEIGHT_LIMITS = HEIGHT_LIMITS
+
+    @classmethod
+    def group_marking_ranges(cls, rows):
+        """只归组宽表的相接/重叠输入区间；源方向、行号、两端和旧格式区段不变。"""
+        groups = cls._group([r for r in rows if "end_m" in r], ("city", "route", "direction", "manager"))
+        for selected in groups.values():
+            connected = []
+            start = end = None
+            def flush():
+                if connected:
+                    segment = f"{format_station_one_decimal(start)}～{format_station_one_decimal(end)}"
+                    for row in connected: row["segment"] = segment
+            for row in sorted(selected, key=lambda r: min(r["station_m"], r["end_m"])):
+                low, high = sorted((row["station_m"], row["end_m"]))
+                if end is None or low > end:
+                    flush()
+                    connected = []
+                    start = low
+                    end = high
+                else:
+                    end = max(end, high)
+                connected.append(row)
+            flush()
 
     @classmethod
     def height_summary(cls, rows):
@@ -3360,7 +3415,7 @@ class GuangdongStatistics:
 
     @classmethod
     def marking_segment_summary(cls, rows):
-        fields = ("category", "route", "direction", "segment", "marking_position")
+        fields = (*MARKING_SEGMENT_FIELDS, "marking_position")
         result = []
         for key, selected in cls._group(rows, fields).items():
             summary = cls.marking_summary(selected)
@@ -3369,7 +3424,7 @@ class GuangdongStatistics:
 
     @classmethod
     def marking_segment_pair_summary(cls, rows):
-        fields = ("category", "route", "direction", "segment")
+        fields = MARKING_SEGMENT_FIELDS
         result = []
         for key, selected in cls._group(rows, fields).items():
             item = dict(zip(fields, key))
@@ -3413,21 +3468,24 @@ class GuangdongStatistics:
         weak=[]
         for key, selected in groups.items():
             selected=sorted(selected,key=lambda r:r.get("station_m") if r.get("station_m") is not None else float("inf"))
-            start=previous=None
+            low=high=previous=None
             def flush():
-                if start is not None and previous is not None and abs(previous-start) >= minimum_length_m:
-                    weak.append({"route":key[0],"direction":key[1],"marking_position":key[2],"start_m":start,"end_m":previous})
+                # 止点取最后一条不合格单元的 end_m 高端（旧实现取起点，系统性少一个单元长度，且恰好达阈值的区间被漏报）。
+                if low is not None and high is not None and high-low >= minimum_length_m:
+                    weak.append({"route":key[0],"direction":key[1],"marking_position":key[2],"start_m":low,"end_m":high})
             for row in selected:
                 station=row.get("station_m"); value=_float(row.get("value")); target=_float(row.get("target")) or 80
                 bad=station is not None and value is not None and value < target
                 if not bad:
-                    flush(); start=previous=None; continue
-                if start is None:
-                    start=previous=station
+                    flush(); low=high=previous=None; continue
+                end=_float(row.get("end_m"))
+                cell_low, cell_high=sorted((station, end if end is not None else station))
+                if previous is None:
+                    low, high, previous = cell_low, cell_high, station
                 elif abs(station-previous) <= 50:
-                    previous=station
+                    low, high, previous = min(low, cell_low), max(high, cell_high), station
                 else:
-                    flush(); start=previous=station
+                    flush(); low, high, previous = cell_low, cell_high, station
             flush()
         return weak
 
@@ -3629,6 +3687,12 @@ class GuangdongChapterWriter:
             for row in table.rows:
                 tr_pr = row._tr.get_or_add_trPr()
                 tr_pr.append(OxmlElement("w:cantSplit"))
+        # 参考件 70 表中 21 表设置表头跨页重复；两级表头时两行都重复。
+        header_rows = 2 if merge else 1
+        for index, row in enumerate(table.rows):
+            if index >= header_rows:
+                break
+            row._tr.get_or_add_trPr().append(OxmlElement("w:tblHeader"))
         return table
 
     @classmethod
@@ -3931,7 +3995,7 @@ class GuangdongChapterWriter:
     @classmethod
     def _marking_segment_sentence(cls, row):
         names = row.get("_side_names") or {}
-        ordered = sorted(names)
+        ordered = list(names)
         if not ordered:
             ordered = ["标线2", "标线3"]; names = marking_side_names(ordered)
         parts = []
@@ -4001,8 +4065,15 @@ class GuangdongChapterWriter:
         doc = Document()
         cls._configure_heading_styles(doc)
         blocks = template_data.blocks
-        # 渲染完整骨架：标题/正文/表格/图片，支持 {{地市}} 占位与显式锚点（见 minimal_docx 锚点文档）。
-        # 若模板包含 <!-- inject:* --> 标记，动态章节将在对应位置注入；否则追加末尾（兼容旧模板）。
+        category_titles = (("高速公路", "（一）高速公路交安设施技术状况"), ("普通国省道", "（二）普通国省道交安设施技术状况"))
+        # 道路类别骨架随该类别动态检测内容一起渲染，避免先输出两套同名章节。
+        category_blocks = {title: [] for _, title in category_titles}
+        intro_blocks = []
+        target = intro_blocks
+        for block in blocks:
+            if block.kind == "heading" and block.level <= 2:
+                target = category_blocks.get(block.text, intro_blocks)
+            target.append(block)
         def _skeleton_picture(caption: str):
             try:
                 media_path = (template.parent / caption).resolve()
@@ -4014,16 +4085,18 @@ class GuangdongChapterWriter:
             except Exception:
                 pass
 
-        markdown_skeleton.render_skeleton(
-            doc, blocks,
-            heading=lambda text, level: cls._heading(doc, text, level),
-            body=lambda text: cls._body(doc, text),
-            table=lambda headers, rows, shading: cls._add_table(doc, headers, rows),
-            picture=_skeleton_picture,
-            toc=lambda: minimal_docx.add_toc(doc, template_data.config["toc"]),
-            replace={"{{地市}}": city},
-        )
-        chapter_no = 1
+        def _render(blocks):
+            markdown_skeleton.render_skeleton(
+                doc, blocks,
+                heading=lambda text, level: cls._heading(doc, text, level),
+                body=lambda text: cls._body(doc, text),
+                table=lambda headers, rows, shading: cls._add_table(doc, headers, rows),
+                picture=_skeleton_picture,
+                toc=lambda: minimal_docx.add_toc(doc, template_data.config["toc"]),
+                replace={"{{地市}}": city},
+            )
+        _render(intro_blocks)
+        chapter_no = 5
         caption_counts={"figure":0,"table":0}
 
         def _caption(kind,title):
@@ -4041,7 +4114,7 @@ class GuangdongChapterWriter:
             doc.add_picture(path,width=Pt(440))
             _caption("figure",title)
 
-        for category_number,(category,chapter_title) in enumerate((("高速公路","（一）高速公路交安设施技术状况"),("普通国省道","（二）普通国省道交安设施技术状况")),1):
+        for category,chapter_title in category_titles:
             all_mark=[r for r in bundle.get("marking",[]) if r.get("category")==category]
             all_height=[r for r in bundle.get("height",[]) if r.get("category")==category]
             all_bolt=[r for r in bundle.get("bolt",[]) if r.get("category")==category]
@@ -4051,37 +4124,41 @@ class GuangdongChapterWriter:
             def _images(suffix):
                 return sorted(str(p) for p in base.glob(f"{chart_prefix}*{suffix}*.png")) if base.exists() else []
 
-            cls._heading(doc,chapter_title,2)
-            cls._heading(doc,"1.沿线设施技术状况TCI",3)
+            if category_blocks[chapter_title]:
+                _render(category_blocks[chapter_title])
+            else:
+                cls._heading(doc,chapter_title,2)
+                cls._heading(doc,"1.沿线设施技术状况TCI",3)
 
             cls._heading(doc,"2.标线、护栏自动化检测",3)
-            cls._heading(doc,"（1）标线逆反射亮度系数",4)
+            cls._heading(doc,"（1）标线逆反射亮度系数情况",4)
             segment_sort_key=lambda row: tuple(str(row.get(field) or "") for field in ("route","direction","segment"))
             marking_summary=GuangdongStatistics.marking_summary(all_mark)
             cls._body(doc,f"{category}标线检测共获得{marking_summary['valid_count']:,}个有效计算单元，平均逆反射亮度系数为{cls._fmt(marking_summary['average'])}，合格单元{marking_summary['qualified_count']:,}个，合格率为{cls._pct(marking_summary['qualified_rate'])}。" if all_mark else f"{category}未读取到有效标线逆反射数据。")
             pair_summary=sorted(GuangdongStatistics.marking_segment_pair_summary(all_mark),key=segment_sort_key)
-            def _pair_cells(row, pos):
+            def _pair_cells(row, name):
+                pos = next((p for p, label in row.get("_side_names", {}).items() if label == name), None)
+                if pos is None:
+                    return ["—", "—", "—"]
                 return [row.get(f"{pos}_valid_count"), cls._fmt(row.get(f"{pos}_average")), cls._pct(row.get(f"{pos}_qualified_rate"))]
-            pair_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),*[cell for pos in sorted(row.get("_side_names") or {}) for cell in _pair_cells(row,pos)]] for row in pair_summary]
-            side_labels=sorted({tuple(sorted((row.get("_side_names") or {}).items())) for row in pair_summary})
-            labels=side_labels[0] if len(side_labels)==1 else tuple(sorted(marking_side_names(("标线2","标线3")).items()))
-            pair_header=["路线","方向","检测区段"]+[x for _,name in labels for x in (f"{name}单元数",f"{name}均值",f"{name}合格率")]
+            labels = ["左侧标线", "右侧标线"]
+            labels += sorted({name for row in pair_summary for name in row["_side_names"].values()} - set(labels))
+            pair_rows=[[row.get("route"),row.get("direction"),row.get("manager"),cls._segment_text(row.get("segment")),*[cell for name in labels for cell in _pair_cells(row,name)]] for row in pair_summary]
+            pair_header=["路线","方向","管养单位","检测区段"]+[x for name in labels for x in (f"{name}单元数",f"{name}均值",f"{name}合格率")]
             _table(pair_header,pair_rows,"标线逆反射区段汇总表")
-            marking_images=_images("marking")
             for idx,row in enumerate(pair_summary,1):
                 seg_text=cls._segment_text(row.get("segment"))
-                cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
+                identity_text=" ".join(str(row.get(k) or "") for k in ("route","direction","manager")) + " " + seg_text
+                cls._heading(doc,f"{cls._alpha_label(idx)} {identity_text}",5)
                 cls._body(doc,cls._marking_segment_sentence(row))
                 names=row.get("_side_names") or {}
-                ordered=sorted(names) or ["标线2","标线3"]
-                _table(["检测区段",*[x for pos in ordered for x in (f"{names.get(pos,pos)}单元数",f"{names.get(pos,pos)}均值",f"{names.get(pos,pos)}合格率")]],[[seg_text,*[x for pos in ordered for x in _pair_cells(row,pos)]]],f"{seg_text}标线逆反射统计表")
-                seg=str(row.get("segment") or "")
-                for pos in ordered:
-                    for img in [p for p in marking_images if seg.replace("/","_").replace("\\","_").replace(" ","_") in Path(p).name and pos in Path(p).name]:
-                        try: _figure(img,f"{seg_text}{names.get(pos,pos)}逆反射亮度系数检测结果")
-                        except Exception: pass
+                _table(["检测区段",*[x for name in labels for x in (f"{name}单元数",f"{name}均值",f"{name}合格率")]],[[seg_text,*[x for name in labels for x in _pair_cells(row,name)]]],f"{identity_text}标线逆反射统计表")
+                for pos, name in names.items():
+                    img = _marking_chart_path(base, dict(row, marking_position=pos))
+                    if img.is_file():
+                        _figure(str(img),f"{identity_text}{name}逆反射亮度系数检测结果")
 
-            cls._heading(doc,"（2）护栏中心高度",4)
+            cls._heading(doc,"（2）波形梁护栏中心高度情况",4)
             total_height=len(all_height)
             if total_height:
                 hs=GuangdongStatistics.height_summary(all_height)
@@ -4133,7 +4210,7 @@ class GuangdongChapterWriter:
                             try: _figure(img,f"{seg_text}{kind}护栏中心高度结果分布")
                             except Exception: pass
 
-            cls._heading(doc,"（3）螺栓安装情况",4)
+            cls._heading(doc,"（3）螺栓缺失情况",4)
             bs=GuangdongStatistics.bolt_summary(all_bolt)
             cls._body(doc,f"{category}共识别现有拼接螺栓{int(bs['splice']):,}颗、连接螺栓{int(bs['connection']):,}颗，检出缺失螺栓{int(bs['missing_total']):,}颗，螺栓缺失率为{cls._pct(bs['missing_rate'])}。" if all_bolt else f"{category}未读取到有效波形梁护栏螺栓数据。")
             bolt_summary_rows=sorted(GuangdongStatistics.bolt_segment_summary(all_bolt),key=segment_sort_key)
@@ -4160,16 +4237,18 @@ class GuangdongChapterWriter:
             cls._heading(doc,"（4）人工复核对比情况",4)
             cls._comparison_table(doc,all_detail,thresholds,table_adder=_table)
 
-        cls._heading(doc,"（三）典型路段及成因分析",2)
+        cls._heading(doc,"（三）工作建议",2)
+        cls._heading(doc,"1.重点路段处治建议",3)
         weak=bundle.get("weak_segments",[])
         if not weak: cls._body(doc,"未识别到满足连续3 km标线不合格、护栏中心高度偏差超过10 cm或螺栓缺失率超过5%的典型薄弱路段。")
         else: _table(["类型","路线","方向","检测区段","原因"],[[r.get("type"),r.get("route"),r.get("direction"),r.get("segment"),r.get("reason")] for r in weak],"典型薄弱路段及成因表")
-        cls._heading(doc,"（四）交安工作建议",2)
-        cls._heading(doc,"1.交安薄弱路段处治建议",3)
+
         cls._body(doc,"（1）对标线逆反射性能连续3 km不合格路段开展现场复核，对确认存在磨损、污染或逆反射性能不足的标线进行清理和重新施划，并在完工后复测。")
         cls._body(doc,"（2）对波形梁护栏中心高度偏差超过10 cm的区段核查路面加铺、路缘石、沉陷和立柱埋深等影响因素，结合护栏类型实施抬升、调整或更换。")
         cls._body(doc,"（3）对螺栓缺失率超过5%的区段优先补齐缺失螺栓，同步检查梁板搭接、连接件、防阻块、立柱和端头的牢固性。")
-        cls._heading(doc,"2.交安养护管理建议",3)
+        cls._heading(doc,"2.迎国评工作建议",3)
+        cls._body(doc,"结合检测结果开展迎检路段现场排查，优先整改护栏缺损、螺栓缺失、标志遮挡及标线模糊等问题，完善检测、复核、整改和验收资料。")
+        cls._heading(doc,"3.养护提升建议",3)
         cls._body(doc,"建立日常巡查、定期检测和专项排查相结合的预防性养护机制，统一路线、方向、桩号和区段编码，完善检测、复核、处治、复测和销号闭环。")
         cls._indent_existing_body(doc)
         cls._format_all_run_fonts(doc)
@@ -4285,32 +4364,23 @@ def _gd_bolt_charts(rows, route, direction, chart_dir, prefix=""):
     return images
 
 def _gd_marking_charts(rows, route, direction, chart_dir, prefix=""):
-    """广东标线逆反射：每个区段的标线2/3分别折线图，并同时叠加80、50两条合格线。"""
+    """逐报告区段、逐侧绘制实测值与各行实际目标值，不跨身份混图。"""
     images = {}
-    groups = {}
-    for r in rows:
-        key = (str(r.get("segment", "")), str(r.get("marking_position", "")))
-        groups.setdefault(key, []).append(r)
-
-    for (segment, pos), pos_rows in groups.items():
+    groups = GuangdongStatistics._group(rows, (*MARKING_SEGMENT_FIELDS, "marking_position"))
+    for pos_rows in groups.values():
         pos_rows = sorted(
             [r for r in pos_rows if _float(r.get("value")) is not None and r.get("station_m") is not None],
             key=lambda r: r["station_m"],
         )
-        if len(pos_rows) < 2:
+        if not pos_rows:
             continue
         values = [float(r["value"]) for r in pos_rows]
         x = list(range(len(pos_rows)))
 
-        safe_route = route.replace("/", "_").replace("\\", "_")
-        safe_dir = direction.replace("/", "_")
-        safe_seg = segment.replace("/", "_").replace("\\", "_").replace(" ", "_") or "segment"
-        safe_pos = pos.replace("/", "_").replace(" ", "_") or "all"
-        line_path = chart_dir / f"{prefix}marking_{safe_route}_{safe_dir}_{safe_seg}_{safe_pos}_line.png"
+        line_path = _marking_chart_path(chart_dir, pos_rows[0])
         fig, ax = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
-        ax.plot(x, values, color="#4472C4", linewidth=1, label="逆反射亮度系数")
-        for target, label, color in ((80, "白色标线合格线（80）", "#A5A5A5"), (50, "黄色标线合格线（50）", "#ED7D31")):
-            ax.plot(x, [target] * len(x), color=color, linewidth=2, linestyle="--", label=label)
+        ax.plot(x, values, color="#4472C4", linewidth=1, marker="." if len(x) == 1 else None, label="逆反射亮度系数")
+        ax.plot(x, [r.get("target", 80) for r in pos_rows], color="#ED7D31", linewidth=2, linestyle="--", label="目标值")
         ax.grid(True, alpha=0.25)
         tick_count = min(10, len(x))
         ticks = sorted(set(int(i * (len(x) - 1) / (tick_count - 1)) for i in range(tick_count))) if tick_count > 1 else [0]
@@ -4322,7 +4392,7 @@ def _gd_marking_charts(rows, route, direction, chart_dir, prefix=""):
         fig.savefig(line_path, transparent=False, bbox_inches="tight", pad_inches=0.15)
         plt.close(fig)
 
-        images[f"marking_{safe_route}_{safe_dir}_{safe_seg}_{safe_pos}"] = {"line": line_path}
+        images[line_path.stem] = {"line": line_path}
     return images
 
 def guangdong_report_images(bundle, output_dir, log=lambda _: None):
@@ -4362,12 +4432,22 @@ def guangdong_report_images(bundle, output_dir, log=lambda _: None):
 
 
 def marking_side_names(positions):
-    """区段内两条标线按序号命名：序号小的显示为左侧标线，大的为右侧标线。
+    """显式左右不重命名；旧编号对沿用小号左、大号右，其他名称原样保留。"""
+    positions = {str(p) for p in positions if p not in (None, "")}
+    numbered = sorted((p for p in positions if re.fullmatch(r"标线\d+", p)), key=lambda p: int(p[2:]))
+    names = {p: p for p in positions}
+    if len(numbered) == 1:
+        names[numbered[0]] = "右侧标线" if numbered[0] == "标线3" else "左侧标线"
+    elif len(numbered) == 2:
+        names.update(zip(numbered, ("左侧标线", "右侧标线")))
+    return dict(sorted(names.items(), key=lambda item: ({"左侧标线": 0, "右侧标线": 1}.get(item[1], 2), item[0])))
 
-    兼容「标线2/标线3」「标线1/标线2」等编号形态；仅返回实际出现的最多两条。
-    """
-    ordered = sorted({str(p) for p in positions if str(p)})
-    return {pos: name for pos, name in zip(ordered[:2], ("左侧标线", "右侧标线"))}
+
+def _marking_chart_path(chart_dir, row):
+    # 身份包含路线/方向/管养/区段/侧；摘要防止路径字符清洗碰撞，Word按同一键精确取图。
+    identity = tuple(str(row.get(field, "")) for field in (*MARKING_SEGMENT_FIELDS, "marking_position"))
+    key = hashlib.sha256(repr(identity).encode("utf-8")).hexdigest()
+    return Path(chart_dir) / f"marking_{key}_line.png"
 
 
 def _side_display(pos):
@@ -4521,41 +4601,40 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         ws.add_chart(chart, f"H{bar_slot}")
         counts["螺栓柱状"] += 1; bar_slot += 17
 
-    # ---- 工作表3：标线逆反射（逐20m明细折线图，叠加80/50虚线合格线） ----
+    # ---- 工作表3：标线逆反射；源桩号/行号及实际目标随每个点导出 ----
     ws = wb.create_sheet("标线逆反射")
-    marking_groups = {}
-    for r in bundle.get("marking", []):
-        value = _float(r.get("value"))
-        if value is None or r.get("station_m") is None:
-            continue
-        key = (str(r.get("segment") or ""), str(r.get("marking_position") or ""))
-        marking_groups.setdefault(key, []).append((r["station_m"], value))
+    marking_groups = GuangdongStatistics._group(bundle.get("marking", []), (*MARKING_SEGMENT_FIELDS, "marking_position"))
     slot = 2
-    for (segment, pos), points in sorted(marking_groups.items()):
-        points.sort(key=lambda item: item[0])
-        if len(points) < 2:
+    for key, rows in sorted(marking_groups.items()):
+        points = sorted((r for r in rows if _float(r.get("value")) is not None and r.get("station_m") is not None), key=lambda r: r["station_m"])
+        if not points:
             continue
         header_row = slot
-        header_cells(ws, header_row, ["桩号", "逆反射亮度系数", "白色标线合格线（80）", "黄色标线合格线（50）"])
-        for index, (station, value) in enumerate(points, 1):
-            row = header_row + index
-            ws.cell(row, 1, format_station(station))
-            ws.cell(row, 2, value)
-            ws.cell(row, 3, 80)
-            ws.cell(row, 4, 50)
+        header_cells(ws, header_row, ["桩号", "逆反射亮度系数", "目标值", "地市", "道路类别", "路线", "方向", "管养单位", "检测区段", "标线位置", "源文件", "源工作表", "源行号", "源桩号范围", "起桩米数", "止桩米数"])
+        for index, point in enumerate(points, 1):
+            values = [format_station_one_decimal(point["station_m"]), point["value"], point.get("target", 80),
+                      *[point.get(field) for field in (*MARKING_SEGMENT_FIELDS, "marking_position", "source", "sheet", "source_row", "source_range", "station_m", "end_m")]]
+            for column, value in enumerate(values, 1):
+                ws.cell(header_row + index, column, _safe_excel_value(value))
         last = header_row + len(points)
         chart = LineChart(); chart.visible_cells_only = False
-        chart.add_data(Reference(ws, min_col=2, max_col=4, min_row=header_row, max_row=last), titles_from_data=True)
+        chart.add_data(Reference(ws, min_col=2, max_col=3, min_row=header_row, max_row=last), titles_from_data=True)
         chart.set_categories(Reference(ws, min_col=1, min_row=header_row + 1, max_row=last))
+        chart.title = " ".join(str(x) for x in key[2:])
         chart.height, chart.width = 8, 13
         chart.x_axis.delete = chart.y_axis.delete = False
         chart.y_axis.title = "逆反射亮度系数"
         chart.legend.position = "b"
         line_style(chart.series[0], "4472C4", 12700)
-        line_style(chart.series[1], "A5A5A5", 25400, dash="dash")
-        line_style(chart.series[2], "ED7D31", 25400, dash="dash")
-        ws.add_chart(chart, f"F{slot}")
+        if len(points) == 1: chart.series[0].marker.symbol = "circle"
+        line_style(chart.series[1], "ED7D31", 25400, dash="dash")
+        ws.add_chart(chart, f"R{slot}")
         counts["标线折线"] += 1; slot = max(slot + 17, last + 2)
+
+    summary = wb.create_sheet("标线区段汇总")
+    header_cells(summary, 1, ["地市", "道路类别", "路线", "方向", "管养单位", "检测区段", "标线位置", "有效单元数", "均值", "合格单元数", "合格率"])
+    for item in GuangdongStatistics.marking_segment_summary(bundle.get("marking", [])):
+        summary.append([_safe_excel_value(item.get(field)) for field in (*MARKING_SEGMENT_FIELDS, "marking_position", "valid_count", "average", "qualified_count", "qualified_rate")])
 
     for column, width in (("A", 14), ("B", 18), ("C", 18), ("D", 18), ("E", 16), ("F", 10)):
         ws.column_dimensions[column].width = width
@@ -4607,16 +4686,25 @@ class GuangdongBatchRunner:
 
     @staticmethod
     def build_bundles(scanned,route_index,manual_records=None,thresholds=None):
-        cities=sorted({r["city"] for kind in ("height","bolt","marking","notes") for r in scanned.get(kind,[])})
+        norm=RouteCategoryIndex._norm_city
+        labels={}
+        for kind in ("height","bolt","marking","notes"):
+            for row in scanned.get(kind,[]):
+                labels.setdefault(norm(row["city"]),[]).append(str(row["city"]).strip())
+        cities={key:next((v for v in values if v.endswith("市")),values[0]) for key,values in labels.items()}
         bundles={}
         comparator=ManualAutoComparator(thresholds or {"marking":0,"height":0,"bolt":0})
-        for city in cities:
+        for key in sorted(cities):
+            city=cities[key]
             bundle={"city":city,"route_rows":route_index.rows(city),"issues":list(scanned.get("issues",[])),"weak_segments":[]}
             try:
                 for kind in ("height","bolt","marking","notes"):
-                    bundle[kind]=[dict(r) for r in scanned.get(kind,[]) if r["city"]==city]
-                    for row in bundle[kind]: row["category"]=route_index.category(city,row["route"])
-                detail,summary=comparator.compare([r for r in (manual_records or []) if r.get("city")==city]); bundle["comparison_detail"]=detail; bundle["comparison_summary"]=summary
+                    bundle[kind]=[dict(r) for r in scanned.get(kind,[]) if norm(r["city"])==key]
+                    for row in bundle[kind]:
+                        row["city"]=city
+                        row["category"]=route_index.category(city,row["route"])
+                GuangdongStatistics.group_marking_ranges(bundle["marking"])
+                detail,summary=comparator.compare([r for r in (manual_records or []) if norm(r.get("city"))==key]); bundle["comparison_detail"]=detail; bundle["comparison_summary"]=summary
                 for row in detail: row["category"]=route_index.category_or_none(row.get("city"),row.get("route"))
                 GuangdongBatchRunner.add_weak_segments(bundle)
             except Exception as exc:

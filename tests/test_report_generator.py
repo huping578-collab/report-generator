@@ -35,6 +35,7 @@ def test_chongqing_three_chapters_preserve_sorted_section_direction(tmp_path):
         if chapter == 'height':
             minimal_docx._section_height(doc, segments, hs, heights, images, tmp_path)
             assert len(doc.inline_shapes) == 8
+            assert all('检测里程（km）' not in [c.text for c in t.rows[0].cells] for t in doc.tables)
         elif chapter == 'bolt':
             minimal_docx._section_bolt(doc, segments, bs, bolts, {}, tmp_path, hs)
         else:
@@ -1764,9 +1765,9 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
             height_text = []
             in_height_section = False
             for paragraph in document.paragraphs:
-                if paragraph.text == "（2）护栏中心高度":
+                if paragraph.text == "（2）波形梁护栏中心高度情况":
                     in_height_section = True
-                elif paragraph.text == "（3）螺栓安装情况":
+                elif paragraph.text == "（3）螺栓缺失情况":
                     in_height_section = False
                 elif in_height_section:
                     height_text.append(paragraph.text)
@@ -1817,7 +1818,7 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
 
         self.assertIn("本章为佛山市交通安全设施技术状况检测评价内容。", text)
         self.assertIn("五、交通安全设施技术状况检测评价情况", text)
-        self.assertIn("（2）护栏中心高度", text)
+        self.assertIn("（2）波形梁护栏中心高度情况", text)
         self.assertIn("其中二波护栏", text)
         self.assertNotIn("{{地市}}", text)
 

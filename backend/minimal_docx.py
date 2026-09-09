@@ -1018,14 +1018,14 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                         if not data or not data["count"]:
                             continue
                         rows.append([
-                            len(rows) + 1, direction, engine.format_station(seg["start"]), engine.format_station(seg["end"]), f"{float(seg.get('mileage') or 0):.3f}",
+                            len(rows) + 1, direction, engine.format_station(seg["start"]), engine.format_station(seg["end"]),
                             data["count"], data["bins"][2], f"{data['pass']:.2f}%",
                             *[f"{value:.2f}%" for value in data["pcts"]],
                         ])
                 if not rows:
                     continue
                 _caption(doc, "表", f"4.{route_no}-{table_offset}", f"{route_val}线{kind}形梁护栏横梁中心高度检测结果")
-                _table(doc, ["序号", "方向", "起点桩号", "止点桩号", "检测里程（km）", "有效点数", "合格点数", "合格率（%）", *labels[kind]], rows, True)
+                _table(doc, ["序号", "方向", "起点桩号", "止点桩号", "有效点数", "合格点数", "合格率（%）", *labels[kind]], rows, True)
             figure_no = 0
             for idx, seg, stat in route_items:
                 for direction in engine.DIRECTIONS:
