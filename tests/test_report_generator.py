@@ -19,6 +19,65 @@ from bridge import DesktopBridge
 from backend import markdown_skeleton, minimal_docx, report_engine as engine
 
 
+def test_desktop_apple_style_layout():
+    """Render real HTML/JS in Chrome; no desktop API or report generation is mocked."""
+    import html
+    import re
+    import subprocess
+
+    chrome = Path('C:/Program Files/Google/Chrome/Application/chrome.exe')
+    assert chrome.is_file(), 'Chrome is required for the desktop layout check'
+    frontend = Path(__file__).resolve().parents[1] / 'frontend'
+    artifacts = Path('D:/hermes/tests/report-generator-ui')
+    artifacts.mkdir(parents=True, exist_ok=True)
+    source = (frontend / 'index.html').read_text(encoding='utf-8')
+    script = (frontend / 'app.js').read_text(encoding='utf-8')
+    probe = r'''<script>
+    const errors = [];
+    window.addEventListener('error', e => errors.push(e.message));
+    setTimeout(() => {
+      const results = [];
+      for (const template of ['cq', 'gd']) {
+        document.querySelector(`[data-template="${template}"]`).click();
+        const visible = [...document.querySelectorAll('.path-field')]
+          .filter(e => e.getBoundingClientRect().width > 0);
+        results.push({template, title: document.querySelector('#pageTitle').textContent,
+          overflow: document.documentElement.scrollWidth > innerWidth,
+          narrow: visible.filter(e => e.getBoundingClientRect().width < 30).map(e => e.id),
+          hidden: [...document.querySelectorAll(template === 'cq' ? '.only-gd' : '.only-cq')]
+            .every(e => e.getBoundingClientRect().width === 0)});
+      }
+      document.querySelector('[data-template="cq"]').click();
+      const out = document.createElement('pre'); out.id = 'ui-check'; out.hidden = true;
+      out.textContent = JSON.stringify({results, errors,
+        blur: getComputedStyle(document.querySelector('.app-shell')).backdropFilter,
+        warning: getComputedStyle(document.querySelector('#configStatus')).color});
+      document.body.append(out);
+    }, 1000);
+    </script>'''
+    page = artifacts / 'render-check.html'
+    page.write_text(source.replace('<script src="app.js"></script>',
+                                  '<script>' + script + '</script>' + probe), encoding='utf-8')
+    for width, height in [(1380, 880), (1121, 800), (920, 680), (390, 844)]:
+        with tempfile.TemporaryDirectory(dir=artifacts) as profile:
+            result = subprocess.run([str(chrome), '--headless=new', '--no-first-run',
+                '--no-default-browser-check', '--hide-scrollbars',
+                '--force-device-scale-factor=1', f'--window-size={width},{height}',
+                '--virtual-time-budget=2000', f'--user-data-dir={profile}',
+                f'--screenshot={artifacts / f"layout-{width}.png"}', '--dump-dom', page.as_uri()],
+                capture_output=True, encoding='utf-8', errors='replace', timeout=60)
+        assert result.returncode == 0, result.stderr
+        match = re.search(r'<pre id="ui-check"[^>]*>(.*?)</pre>', result.stdout, re.S)
+        assert match, result.stderr
+        data = json.loads(html.unescape(match.group(1)))
+        (artifacts / f'layout-{width}.json').write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        assert not data['errors'], data
+        assert 'blur(24px)' in data['blur'], data
+        for row in data['results']:
+            assert not row['overflow'] and not row['narrow'] and row['hidden'], (width, row)
+            assert ('重庆' if row['template'] == 'cq' else '广东') in row['title']
+
+
 def test_chongqing_tci_units_keep_original_boundaries_and_equal_weights():
     import pytest
     segments = [
@@ -210,7 +269,7 @@ def test_conclusion_matches_reference_template_structure():
                                      engine.make_bolt_stats(segments, b), stats)
     text = '\n'.join(p.text for p in doc.paragraphs)
     headings = [p.text for p in doc.paragraphs if p.style.name.startswith('Heading')]
-    assert '结论' in headings and '建议' in headings
+    assert '总结' in headings and '建议' in headings
     assert '沿线设施技术状况' in text
     assert '合格率' in text and '螺栓' in text and '缺失率' in text
     assert 'JTG 5110-2023' in text
@@ -218,6 +277,64 @@ def test_conclusion_matches_reference_template_structure():
     assert '2.波形梁护栏专项检测建议' in text
     assert '标志遮挡' in text and '标线缺损' in text and '波形梁变形' in text
     assert '横梁中心高度' in text and '螺栓缺失' in text
+
+
+def test_tci_chart_thins_station_ticks_when_many_points():
+    root = Path(__file__).parent / 'artifacts' / 'chongqing-refinement'
+    root.mkdir(parents=True, exist_ok=True)
+    segments = [dict(county='甲县', route='G210', start=1000, end=27000, mileage=26.0)]
+    rows = [dict(segment=0, direction='上行', station=1000 + i * 1000 + 20, light=0, heavy=0, sign=1, marking=0)
+            for i in range(26)]
+    stats = engine.make_tci_stats(segments, rows)
+    captured = {}
+    subplots = engine.plt.subplots
+    def observe(*args, **kwargs):
+        pair = subplots(*args, **kwargs)
+        captured['axis'] = pair[1]
+        return pair
+    with patch.object(engine.plt, 'subplots', side_effect=observe):
+        engine.report_tci_images(root, segments, stats)
+    labels = captured['axis'].get_xticklabels()
+    assert 2 <= len(labels) <= 10
+    assert labels[0].get_text() == 'K1+000'
+
+
+def test_conclusion_lists_worst_five_weak_segments_per_route():
+    segments = [dict(county='甲县', route='G210', start=1000 + i * 1000, end=2000 + i * 1000,
+                     mileage=1.0, grade='一级公路', manager='', route_name='测试') for i in range(6)]
+    stats = [dict(units=[dict(route='G210', county='甲县', direction='上行',
+                               start=seg['start'], end=seg['end'], tci=60.0 + i)])
+             for i, seg in enumerate(segments)]
+    doc = Document()
+    minimal_docx._section_conclusion(doc, segments, None, None, stats)
+    sentence = next(p.text for p in doc.paragraphs if p.text.startswith('甲县沿线设施技术状况TCI整体状况'))
+    assert sentence == ('甲县沿线设施技术状况TCI整体状况一般，其中G210线K1+000～K2+000段、K2+000～K3+000段、'
+                        'K3+000～K4+000段、K4+000～K5+000段、K5+000～K6+000段等评定为次差，需要特别注意。')
+
+
+def test_conclusion_groups_weak_segments_by_route():
+    segments = [dict(county='甲县', route=route, start=start, end=start + 1000, mileage=1.0,
+                     grade='一级公路', manager='', route_name='测试')
+                for route, start in (('G210', 1000), ('G319', 3000))]
+    stats = [dict(units=[dict(route=route, county='甲县', direction='上行',
+                               start=start, end=start + 1000, tci=tci)])
+             for (route, start), tci in zip((('G210', 1000), ('G319', 3000)), (65.0, 68.0))]
+    doc = Document()
+    minimal_docx._section_conclusion(doc, segments, None, None, stats)
+    sentence = next(p.text for p in doc.paragraphs if p.text.startswith('甲县沿线设施技术状况TCI整体状况'))
+    assert sentence == ('甲县沿线设施技术状况TCI整体状况一般，其中G210线K1+000～K2+000段；'
+                        'G319线K3+000～K4+000段评定为次差，需要特别注意。')
+
+
+def test_conclusion_merges_same_range_from_both_directions():
+    segments = [dict(county='甲县', route='G210', start=1000, end=2000, mileage=1.0,
+                     grade='一级公路', manager='', route_name='测试')]
+    stats = [dict(units=[dict(route='G210', county='甲县', direction=direction, start=1000, end=2000, tci=tci)
+                         for direction, tci in (('上行', 65.0), ('下行', 66.0))])]
+    doc = Document()
+    minimal_docx._section_conclusion(doc, segments, None, None, stats)
+    sentence = next(p.text for p in doc.paragraphs if p.text.startswith('甲县沿线设施技术状况TCI整体状况'))
+    assert sentence == '甲县沿线设施技术状况TCI整体状况一般，其中G210线K1+000～K2+000段评定为次差，需要特别注意。'
 
 
 def test_example_tables_are_borderless():
@@ -1406,7 +1523,7 @@ class MinimalDocxTests(unittest.TestCase):
             document = Document(result)
             headings = [p.text for p in document.paragraphs if p.style.name.startswith("Heading")]
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-            self.assertEqual(headings.count("结论"), 1, headings)
+            self.assertEqual(headings.count("总结"), 1, headings)
             self.assertEqual(headings.count("建议"), 1, headings)
             self.assertFalse(any("5.1" in h or "5.2" in h for h in headings), headings)
             self.assertNotIn("由程序根据检测统计自动生成", text)
@@ -2560,7 +2677,7 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
         h1 = [block.text for block in template.blocks if block.kind == "heading" and block.level == 1]
         self.assertEqual(
             [minimal_docx._strip_section_number(text) for text in h1],
-            ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
+            ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "总结与建议"],
         )
         anchors = [block.text for block in template.blocks if block.text and "inject:" in block.text]
         self.assertEqual(len(anchors), 6)
@@ -2829,6 +2946,190 @@ class T11aDataLayerTests(unittest.TestCase):
             wb.close()
             mapping = engine.build_tci_image_map(path)
         self.assertEqual(set(mapping.keys()), {("xl/worksheets/sheet1.xml", 3)})
+
+    def test_height_collection_selects_height_sheet_and_keeps_route_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "multi-sheet-detail.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "说明"
+            ws.append(["说明", "值"])
+            ws.append(["不是护栏明细", 1])
+            ws = wb.create_sheet("高度明细")
+            ws.append(["备注", "路线编号", "电子修正桩号", "护栏类型", "梁板中心高度(mm)"])
+            ws.append([None, "G210", "K1+100", "二波", 600])
+            ws = wb.create_sheet("螺栓明细")
+            ws.append(["路线编号", "电子修正桩号", "拼接螺栓数量（颗）", "拼接螺栓缺失数量（颗）", "连接螺栓数量（颗）", "连接螺栓缺失数量（颗）"])
+            ws.append(["G210", "K1+100", 10, 1, 10, 0])
+            wb.save(path)
+            wb.close()
+            segments = [{"county": "甲县", "route": "G210", "start": 1000, "end": 2000, "mileage": 1.0}]
+            records, duplicates, excluded = engine.collect_records(segments, root)
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(excluded, {})
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["station"], 1100)
+        self.assertEqual(records[0]["route"], "G210")
+        self.assertEqual(records[0]["county"], "甲县")
+        self.assertEqual(records[0]["source_sheet"], "高度明细")
+        self.assertEqual(records[0]["source_row"], 2)
+
+    def test_bolt_collection_filters_only_blank_or_no_remark_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "bolt-detail.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "螺栓明细"
+            ws.append(["路线编号", "电子修正桩号", "备注标记", "拼接螺栓数量（颗）", "拼接螺栓缺失数量（颗）", "连接螺栓数量（颗）", "连接螺栓缺失数量（颗）"])
+            for index, remark in enumerate([None, "", "   ", "无备注", " 无备注 ", "待复核"], 1):
+                ws.append(["G210", f"K1+{index:03d}", remark, 10, 1, 10, 0])
+            wb.save(path)
+            wb.close()
+            segments = [{"county": "甲县", "route": "G210", "start": 1000, "end": 2000, "mileage": 1.0}]
+            records, duplicates = engine.collect_bolt_records(segments, root)
+            stats = engine.make_bolt_stats(segments, records)
+        self.assertEqual(duplicates, 0)
+        self.assertEqual(len(records), 5)
+        self.assertEqual(stats[0]["splice"], 50)
+        self.assertEqual(stats[0]["missing"], 5)
+        self.assertAlmostEqual(stats[0]["rate"], 5 / 105 * 100)
+
+    def test_photo_column_can_move_and_height_does_not_match_other_route_or_bolt(self) -> None:
+        import io
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "photos.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "无关"
+            ws.append(["说明"])
+            ws = wb.create_sheet("照片明细")
+            ws.append(["路线编号", "方向", "原始桩号", "病害类型", "工程量", "备注", "病害照片"])
+            ws.append(["G210", "上行", "K1+100", "高度异常", 1, None, None])
+            ws.append(["G211", "上行", "K1+100", "高度异常", 1, None, None])
+            ws.append(["G210", "上行", "K1+101", "螺栓缺失", 1, None, None])
+            png = self._tiny_png()
+            ws.add_image(XLImage(io.BytesIO(png)), "G2")
+            ws.add_image(XLImage(io.BytesIO(png)), "G3")
+            ws.add_image(XLImage(io.BytesIO(png)), "G4")
+            wb.save(path)
+            wb.close()
+            image_map = engine.build_disease_image_map(path)
+            index = engine.disease_station_photo_index(path, image_map, role="height")
+            good = {"route": "G210", "county": "甲县", "direction": "上行", "station": 1100, "raw_station": 1100, "electronic_station": 1100}
+            wrong_route = dict(good, route="G212")
+        self.assertEqual(set(image_map), {("xl/worksheets/sheet2.xml", 2), ("xl/worksheets/sheet2.xml", 3), ("xl/worksheets/sheet2.xml", 4)})
+        self.assertTrue(engine.row_has_height_photo(good, index))
+        self.assertFalse(engine.row_has_height_photo(wrong_route, index))
+        self.assertFalse(engine.row_has_height_photo(dict(good, station=1101, raw_station=1101, electronic_station=1101), index))
+
+    def test_disease_image_index_keeps_workbook_identity_when_media_names_repeat(self) -> None:
+        import io
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            disease_dir = root / "disease"
+            disease_dir.mkdir()
+            for name in ("first.xlsx", "second.xlsx"):
+                path = disease_dir / name
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.append(["路线编号", "方向", "原始桩号", "病害类型", "工程量", "病害照片"])
+                ws.append(["G210", "上行", "K1+100", "螺栓缺失", 2, None])
+                ws.add_image(XLImage(io.BytesIO(self._tiny_png())), "F2")
+                wb.save(path)
+                wb.close()
+            image_index = engine.collect_disease_image_index(disease_dir)
+            record = {"route": "G210", "county": "甲县", "direction": "上行", "raw_station": 1100,
+                      "splice_missing": 2, "connection_missing": 0}
+            descriptor = engine.match_disease_image(record, image_index)
+        self.assertIsNotNone(descriptor)
+        self.assertEqual({item["workbook"].name for item in image_index[("上行", 1100.0)]}, {"first.xlsx", "second.xlsx"})
+        self.assertIn(descriptor["workbook"].name, {"first.xlsx", "second.xlsx"})
+
+    def test_disease_image_index_parses_each_sheet_once(self) -> None:
+        """照片行不得触发整表重复解析：真实病害清单 4314 行照片曾导致 4314 次全表解析（约 54 分钟）。"""
+        import io
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            disease_dir = root / "disease"
+            disease_dir.mkdir()
+            path = disease_dir / "many.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["路线编号", "方向", "原始桩号", "病害类型", "工程量", "病害照片"])
+            for index in range(12):
+                ws.append(["G210", "上行", f"K{1 + index}+100", "螺栓缺失", 2, None])
+                ws.add_image(XLImage(io.BytesIO(self._tiny_png())), f"F{index + 2}")
+            wb.save(path)
+            wb.close()
+            calls: list = []
+            original = engine._xlsx_sheet_rows
+
+            def counting(archive, sheet_name, shared_strings):
+                calls.append(sheet_name)
+                return original(archive, sheet_name, shared_strings)
+
+            engine._xlsx_sheet_rows = counting
+            try:
+                engine.collect_disease_image_index(disease_dir)
+            finally:
+                engine._xlsx_sheet_rows = original
+        self.assertEqual(len(calls), len(set(calls)), f"同一 sheet 被重复解析 {len(calls)} 次：{calls}")
+
+    def test_tci_photo_index_reads_nonfirst_sheet_and_keeps_route_filter(self) -> None:
+        import io
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "tci-multi-sheet.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "说明"
+            ws.append(["说明"])
+            ws = wb.create_sheet("TCI数据")
+            headers = ["区域", "路线编号", "方向", "原始桩号", "防护设施缺损（处）", "标志缺损（处）", "标线缺损（m）", "防护设施缺损", "交通标志缺损", "交通标线缺损", "图片"]
+            ws.append(headers)
+            ws.append(["甲县", "G210", "上行", "K1+100", 1, 0, 0, "护栏锈蚀", "", "", None])
+            ws.append(["甲县", "G211", "上行", "K1+200", 0, 1, 0, "", "标志遮挡", "", None])
+            png = self._tiny_png()
+            ws.add_image(XLImage(io.BytesIO(png)), "K2")
+            ws.add_image(XLImage(io.BytesIO(png)), "K3")
+            wb.save(path)
+            wb.close()
+            image_map = engine.build_tci_image_map(path)
+            filtered = engine.tci_type_photo_index(path, image_map, routes=["G210"])
+            segments = [{"county": "甲县", "route": "G210", "start": 1000, "end": 1500, "mileage": .5}]
+            segment_photos = engine.build_segment_tci_photos(path, image_map, segments)
+        self.assertEqual(set(image_map), {("xl/worksheets/sheet2.xml", 2), ("xl/worksheets/sheet2.xml", 3)})
+        self.assertIn("防护设施缺损", filtered)
+        self.assertNotIn("交通标志缺损", filtered)
+        self.assertEqual(set(segment_photos), {0})
+
+    def test_overview_sums_segment_mileage_and_merges_total_by_county_route(self) -> None:
+        segments = [
+            {"county": "甲县", "route": "G210", "route_name": "甲", "grade": "一级", "start": 1000, "end": 1100, "mileage": .1, "total_mileage": 99},
+            {"county": "甲县", "route": "G211", "route_name": "乙", "grade": "一级", "start": 2000, "end": 2200, "mileage": .2, "total_mileage": 88},
+            {"county": "甲县", "route": "G210", "route_name": "甲", "grade": "一级", "start": 1100, "end": 1300, "mileage": .2, "total_mileage": 77},
+            {"county": "乙县", "route": "G210", "route_name": "丙", "grade": "一级", "start": 3000, "end": 3500, "mileage": .5, "total_mileage": 66},
+        ]
+        document = Document()
+        table = minimal_docx._section_overview(document, None, segments)
+        rows = [[cell.text for cell in row.cells] for row in table.rows]
+        total_col = len(rows[0]) - 1
+        xml = table._tbl.xml
+        self.assertEqual([rows[i][0] for i in range(1, 5)], ["1", "3", "2", "4"])
+        self.assertEqual([rows[i][total_col] for i in range(1, 5)], ["0.300", "0.300", "0.200", "0.500"])
+        self.assertEqual(xml.count('w:val="restart"'), 1)
+        self.assertGreaterEqual(xml.count('w:val="continue"'), 1)
 
 
 class T11bPresentationTests(unittest.TestCase):

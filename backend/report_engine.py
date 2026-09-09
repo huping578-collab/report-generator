@@ -389,88 +389,107 @@ def cell_value(cell, shared_strings=None):
         return value.text
 
 
-def iter_height_rows(path):
-    # 源文件工作表范围可能错误标记为A1，直接流式读取sheet1.xml。
-    with ZipFile(path) as archive, archive.open("xl/worksheets/sheet1.xml") as stream:
-        shared_strings = _xlsx_shared_strings(archive)
-        headers = None
+def _xlsx_sheet_files(archive):
+    return sorted(
+        name for name in archive.namelist()
+        if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+    )
+
+
+def _xlsx_sheet_labels(archive):
+    """Map worksheet XML parts to their human-readable workbook sheet names."""
+    workbook_name = "xl/workbook.xml"
+    rels_name = "xl/_rels/workbook.xml.rels"
+    if workbook_name not in archive.namelist() or rels_name not in archive.namelist():
+        return {}
+    workbook = ET.fromstring(archive.read(workbook_name))
+    relationships = ET.fromstring(archive.read(rels_name))
+    targets = {relation.get("Id"): relation.get("Target") for relation in relationships}
+    labels = {}
+    for sheet in workbook.findall(f".//{q(X, 'sheet')}"):
+        target = targets.get(sheet.get(q(R, "id")))
+        if not target:
+            continue
+        part = posixpath.normpath(posixpath.join("xl", target)).lstrip("/")
+        labels[part] = sheet.get("name", part)
+    return labels
+
+
+def _xml_row_values(element, shared_strings):
+    values = {}
+    for cell in element.findall(q(X, "c")):
+        match = re.match(r"[A-Z]+", cell.get("r", ""))
+        if match:
+            values[match.group(0)] = cell_value(cell, shared_strings)
+    return values
+
+
+def _iter_sheet_rows_with_header(archive, sheet_name, shared_strings, header_predicate):
+    """Yield (Excel row number, row) after the first matching header row.
+
+    Unlike the old first-row reader, this keeps blank header columns in every row,
+    which makes an explicitly present remark column distinguishable from an old
+    workbook that has no remark column at all.
+    """
+    headers = None
+    with archive.open(sheet_name) as stream:
         for _, element in ET.iterparse(stream, events=("end",)):
             if element.tag != q(X, "row"):
                 continue
-            values = {}
-            for cell in element.findall(q(X, "c")):
-                match = re.match(r"[A-Z]+", cell.get("r", ""))
-                if match:
-                    values[match.group(0)] = cell_value(cell, shared_strings)
+            row_number = int(element.get("r", "0") or 0)
+            values = _xml_row_values(element, shared_strings)
             if headers is None:
-                headers = {column: str(value) for column, value in values.items()}
-            else:
-                yield {headers.get(column, column): value for column, value in values.items()}
+                labels = {str(value).strip() for value in values.values() if value is not None}
+                if header_predicate(labels):
+                    headers = {column: str(value).strip() for column, value in values.items() if value is not None and str(value).strip()}
+            elif headers:
+                row = {header: None for header in headers.values()}
+                for column, value in values.items():
+                    row[headers.get(column, column)] = value
+                yield row_number, row
             element.clear()
 
 
-def iter_bolt_rows(path):
-    """定位含“拼接螺栓数量”表头的工作表并流式读取。
-
-    表头在 sheet XML 中以共享字符串索引存储，不能按字面量探测；
-    先取共享字符串索引号，再探测各 sheet 头部是否含该索引。
-    """
-    marker_text = "拼接螺栓数量"
+def _iter_source_rows(path, header_predicate):
+    """Read the first worksheet whose actual headers identify the requested source."""
     with ZipFile(path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
-        marker_text_bytes = marker_text.encode("utf-8")
-        shared_index_hits = [
-            ("<v>%d</v>" % index).encode("ascii")
-            for index, value in enumerate(shared_strings)
-            if marker_text in str(value)
-        ]
-        sheet_files = [
-            name for name in archive.namelist()
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-        ]
-        sheet_name = None
-        # 快速路径：共享字符串索引或字面量字节探测
-        for name in sheet_files:
-            with archive.open(name) as probe:
-                head = probe.read(32768)
-                if marker_text_bytes in head or any(hit in head for hit in shared_index_hits):
-                    sheet_name = name
-                    break
-        # 兜底：inlineStr 等其他编码——逐 sheet 解析首行表头判断
-        if sheet_name is None:
-            for name in sheet_files:
-                with archive.open(name) as stream:
-                    for _, element in ET.iterparse(stream, events=("end",)):
-                        if element.tag != q(X, "row"):
-                            continue
-                        values = {}
-                        for cell in element.findall(q(X, "c")):
-                            match = re.match(r"[A-Z]+", cell.get("r", ""))
-                            if match:
-                                values[match.group(0)] = cell_value(cell, shared_strings)
-                        if any(marker_text in str(value or "") for value in values.values()):
-                            sheet_name = name
-                        element.clear()
-                        break
-                if sheet_name:
-                    break
-        if sheet_name is None:
-            return
-        with archive.open(sheet_name) as stream:
-            headers = None
-            for _, element in ET.iterparse(stream, events=("end",)):
-                if element.tag != q(X, "row"):
-                    continue
-                values = {}
-                for cell in element.findall(q(X, "c")):
-                    match = re.match(r"[A-Z]+", cell.get("r", ""))
-                    if match:
-                        values[match.group(0)] = cell_value(cell, shared_strings)
-                if headers is None:
-                    headers = {column: str(value) for column, value in values.items()}
-                else:
-                    yield {headers.get(column, column): value for column, value in values.items()}
-                element.clear()
+        labels = _xlsx_sheet_labels(archive)
+        for sheet_name in _xlsx_sheet_files(archive):
+            rows = _iter_sheet_rows_with_header(archive, sheet_name, shared_strings, header_predicate)
+            found = False
+            for row_number, row in rows:
+                found = True
+                yield labels.get(sheet_name, sheet_name), row_number, row
+            if found:
+                return
+
+
+def _height_header(labels):
+    return "护栏类型" in labels and any("中心高度" in label for label in labels)
+
+
+def _bolt_header(labels):
+    return any("拼接螺栓数量" in label for label in labels) and any("连接螺栓" in label for label in labels)
+
+
+def _iter_height_rows_with_source(path):
+    return _iter_source_rows(path, _height_header)
+
+
+def iter_height_rows(path):
+    for _, _, row in _iter_height_rows_with_source(path):
+        yield row
+
+
+def _iter_bolt_rows_with_source(path):
+    return _iter_source_rows(path, _bolt_header)
+
+
+def iter_bolt_rows(path):
+    """Locate the worksheet by its bolt headers and stream its rows."""
+    for _, _, row in _iter_bolt_rows_with_source(path):
+        yield row
 
 
 def guardrail_type(value):
@@ -480,6 +499,22 @@ def guardrail_type(value):
     if any(word in text for word in ("双", "两", "二")):
         return "二波"
     return None
+
+
+def remark_marker_allowed(row):
+    """Return whether a row is eligible under the 重庆螺栓备注口径.
+
+    New files use ``备注标记``; older files used ``备注`` or had no remark
+    column.  A missing column remains compatible, while present values are
+    normalized before comparison.
+    """
+    if "备注标记" in row:
+        value = row.get("备注标记")
+    elif "备注" in row:
+        value = row.get("备注")
+    else:
+        return True
+    return str(value or "").strip() in {"", "无备注"}
 
 
 HEIGHT_DESIGN = {"二波": 600.0, "三波": 697.0}
@@ -550,7 +585,7 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             continue
         log(format_progress("解析明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
-        for row in iter_height_rows(path):
+        for source_sheet, source_row, row in _iter_height_rows_with_source(path):
             kind = guardrail_type(row.get("护栏类型"))
             height = row.get("梁板中心高度(mm)")
             if kind is None or not isinstance(height, (int, float)) or height <= 0:
@@ -569,9 +604,14 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             segment = _segment_index(segments, station, route)
             if segment is None:
                 continue
+            segment_data = segments[segment]
             records.append({
                 "file": path.name,
+                "source_sheet": source_sheet,
+                "source_row": source_row,
                 "direction": str(row.get("方向") or ""),
+                "route": _route(route or segment_data.get("route", "")),
+                "county": str(segment_data.get("county") or "").strip(),
                 "station": station,
                 "raw_station": raw_station,
                 "electronic_station": electronic_station,
@@ -606,7 +646,9 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
     for index, path in enumerate(files, 1):
         log(format_progress("解析螺栓明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
-        for row in iter_bolt_rows(path):
+        for source_sheet, source_row, row in _iter_bolt_rows_with_source(path):
+            if not remark_marker_allowed(row):
+                continue
             basis = "原始桩号" if use_raw else "电子修正桩号"
             raw_station = station_to_m(row.get("原始桩号"))
             electronic_station = station_to_m(row.get("电子修正桩号"))
@@ -617,6 +659,7 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
             segment = _segment_index(segments, station, route)
             if segment is None:
                 continue
+            segment_data = segments[segment]
             splice = number(row.get("拼接螺栓数量（颗）"))
             splice_missing = number(row.get("拼接螺栓缺失数量（颗）"))
             connection = number(row.get("连接螺栓数量（颗）"))
@@ -625,7 +668,11 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
                 continue
             records.append({
                 "file": path.name,
+                "source_sheet": source_sheet,
+                "source_row": source_row,
                 "direction": str(row.get("方向") or ""),
+                "route": _route(route or segment_data.get("route", "")),
+                "county": str(segment_data.get("county") or "").strip(),
                 "station": station,
                 "raw_station": raw_station,
                 "electronic_station": electronic_station,
@@ -700,16 +747,23 @@ def _xlsx_sheet_rows(archive, sheet_name, shared_strings):
                 match = re.match(r"[A-Z]+", cell.get("r", ""))
                 if match:
                     values[match.group(0)] = cell_value(cell, shared_strings)
-            if headers is None and "原始桩号" in {str(value) for value in values.values()}:
-                headers = {column: str(value) for column, value in values.items() if value is not None}
+            labels = {str(value).strip() for value in values.values() if value is not None}
+            if headers is None and (
+                "原始桩号" in labels
+                or ("路线编号" in labels and any("缺损" in label for label in labels))
+            ):
+                headers = {column: str(value).strip() for column, value in values.items() if value is not None and str(value).strip()}
             elif headers is not None:
-                rows[row_number] = {headers.get(column, column): value for column, value in values.items()}
+                row = {header: None for header in headers.values()}
+                for column, value in values.items():
+                    row[headers.get(column, column)] = value
+                rows[row_number] = row
             element.clear()
     return rows
 
 
 def collect_disease_image_index(disease_dir, log=lambda _: None):
-    """只读取病害清单XML关系，建立原始桩号到嵌入图片的轻量索引。"""
+    """Index only bolt-disease photos, retaining workbook/sheet/row identity."""
     disease_dir = Path(disease_dir)
     files = sorted(path for path in disease_dir.glob("*.xlsx") if not path.name.startswith("~$"))
     if not files:
@@ -720,72 +774,40 @@ def collect_disease_image_index(disease_dir, log=lambda _: None):
         log(format_progress("索引病害图片", file_number, len(files), path.name))
         with ZipFile(path) as archive:
             shared_strings = _xlsx_shared_strings(archive)
-            sheet_names = sorted(
-                name for name in archive.namelist()
-                if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-            )
-            for sheet_name in sheet_names:
-                sheet_rels_name = posixpath.join(
-                    posixpath.dirname(sheet_name), "_rels", posixpath.basename(sheet_name) + ".rels"
-                )
-                if sheet_rels_name not in archive.namelist():
+            # 每个 sheet 只解析一次：旧写法在照片行循环里重复解析整张表，4314 行照片 = 4314 次全表解析。
+            rows_by_sheet = {}
+            for (sheet_name, excel_row), photos in build_disease_image_map(path).items():
+                if sheet_name not in rows_by_sheet:
+                    rows_by_sheet[sheet_name] = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
+                row = rows_by_sheet[sheet_name].get(excel_row, {})
+                if "螺栓缺失" not in str(row.get("病害类型") or ""):
                     continue
-                sheet_relationships = ET.fromstring(archive.read(sheet_rels_name))
-                drawing_relation = next(
-                    (relation for relation in sheet_relationships if relation.get("Type", "").endswith("/drawing")),
-                    None,
-                )
-                if drawing_relation is None:
+                raw_station = station_to_m(row.get("原始桩号"))
+                if raw_station is None:
                     continue
-                drawing_name = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_name), drawing_relation.get("Target"))).lstrip("/")
-                drawing_rels_name = posixpath.join(
-                    posixpath.dirname(drawing_name), "_rels", posixpath.basename(drawing_name) + ".rels"
-                ).lstrip("/")
-                if drawing_name not in archive.namelist() or drawing_rels_name not in archive.namelist():
-                    continue
-                rows = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
-                drawing_relationships = ET.fromstring(archive.read(drawing_rels_name))
-                media_by_rid = {
-                    relation.get("Id"): posixpath.normpath(
-                        posixpath.join(posixpath.dirname(drawing_name), relation.get("Target"))
-                    )
-                    for relation in drawing_relationships
-                    if relation.get("Type", "").endswith("/image")
-                }
-                drawing = ET.fromstring(archive.read(drawing_name))
-                for anchor in list(drawing):
-                    anchor_from = anchor.find(q(XDR, "from"))
-                    if anchor_from is None:
-                        continue
-                    row_node = anchor_from.find(q(XDR, "row"))
-                    blip = anchor.find(f".//{q(A, 'blip')}")
-                    if row_node is None or blip is None:
-                        continue
-                    excel_row = int(row_node.text or 0) + 1
-                    row = rows.get(excel_row, {})
-                    if "螺栓缺失" not in str(row.get("病害类型") or ""):
-                        continue
-                    raw_station = station_to_m(row.get("原始桩号"))
-                    media_name = media_by_rid.get(blip.get(q(R, "embed")))
-                    if raw_station is None or not media_name or media_name not in archive.namelist():
-                        continue
-                    try:
-                        quantity = int(round(float(row.get("工程量") or 0)))
-                    except (TypeError, ValueError):
-                        quantity = 0
+                try:
+                    quantity = int(round(float(row.get("工程量") or 0)))
+                except (TypeError, ValueError):
+                    quantity = 0
+                for media_name, extension in photos:
                     descriptor = {
                         "workbook": path,
                         "media": media_name,
-                        "row": excel_row,
+                        "extension": extension,
+                        "source_sheet": sheet_name,
+                        "source_row": excel_row,
                         "direction": normalize_direction(row.get("方向")),
+                        "route": _route(row.get("路线编号") or row.get("路线") or ""),
+                        "county": str(row.get("区县") or row.get("所属区县") or row.get("区域") or "").strip(),
                         "raw_station": raw_station,
                         "quantity": quantity,
+                        "role": "bolt",
                     }
                     key = (descriptor["direction"], round(raw_station, 1))
                     image_index.setdefault(key, []).append(descriptor)
                     indexed += 1
     for descriptors in image_index.values():
-        descriptors.sort(key=lambda item: (str(item["workbook"]), item["row"]))
+        descriptors.sort(key=lambda item: (str(item["workbook"]), item["source_sheet"], item["source_row"], item["media"]))
     log(f"病害图片索引完成：{len(files)}个文件，{indexed}张螺栓缺失图片。")
     return image_index
 
@@ -795,6 +817,12 @@ def match_disease_image(record, image_index):
         return None
     key = (normalize_direction(record.get("direction")), round(record["raw_station"], 1))
     candidates = image_index.get(key, [])
+    route = _route(record.get("route") or "")
+    county = str(record.get("county") or "").strip()
+    if route:
+        candidates = [item for item in candidates if not item.get("route") or _route(item.get("route")) == route]
+    if county:
+        candidates = [item for item in candidates if not item.get("county") or item.get("county") in county_short_names(county)]
     if not candidates:
         return None
     total_missing = int(round(record["splice_missing"] + record["connection_missing"]))
@@ -812,20 +840,36 @@ def read_disease_image(descriptor):
     return data, extension
 
 
-def _anchored_image_map(path, photo_column, workbook_sheet_names=None):
+def _xlsx_header_columns(archive, sheet_name, shared_strings, names):
+    wanted = tuple(names or ())
+    with archive.open(sheet_name) as stream:
+        for _, element in ET.iterparse(stream, events=("end",)):
+            if element.tag != q(X, "row"):
+                continue
+            values = _xml_row_values(element, shared_strings)
+            if any(any(name in str(value or "") for name in wanted) for value in values.values()):
+                element.clear()
+                return {
+                    column: str(value).strip()
+                    for column, value in values.items()
+                    if value is not None and str(value).strip()
+                }
+            element.clear()
+    return {}
+
+
+def _anchored_image_map(path, photo_column, workbook_sheet_names=None, photo_headers=()):
     """解析工作簿各 sheet 的浮动图片锚点，建立 (sheet名, excel行号) -> [(media部件名, 扩展名)] 映射。
 
-    - 只收锚定在 photo_column 列的图片；跳过表头行（from.row==0，含装饰图/logo）。
+    - 优先按实际图片表头定位图片列；没有可用图片表头时兼容旧的固定列。
+    - 跳过表头行（from.row==0，含装饰图/logo）。
     - 值为媒体部件名（懒读，不加载图片字节），调用方按需从同一工作簿读取。
     - workbook_sheet_names: 可选 {sheet部件名: 显示sheet名}，缺省用 sheetN 部件名。
     """
     path = Path(path)
     result = {}
     with ZipFile(path) as archive:
-        sheet_names = sorted(
-            name for name in archive.namelist()
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-        )
+        sheet_names = _xlsx_sheet_files(archive)
         for sheet_name in sheet_names:
             sheet_rels_name = posixpath.join(
                 posixpath.dirname(sheet_name), "_rels", posixpath.basename(sheet_name) + ".rels"
@@ -853,7 +897,30 @@ def _anchored_image_map(path, photo_column, workbook_sheet_names=None):
                 for relation in drawing_relationships
                 if relation.get("Type", "").endswith("/image")
             }
+            header_columns = _xlsx_header_columns(archive, sheet_name, _xlsx_shared_strings(archive), photo_headers)
+            dynamic_column = next(
+                (
+                    index
+                    for index, label in (
+                        (ord(column) - ord("A"), value)
+                        for column, value in header_columns.items()
+                        if len(column) == 1 and column.isalpha()
+                    )
+                    if any(header in label for header in photo_headers)
+                ),
+                None,
+            )
+            # Column letters can be multi-letter; calculate the zero-based index.
+            if dynamic_column is None:
+                for column, label in header_columns.items():
+                    if any(header in label for header in photo_headers):
+                        dynamic_column = 0
+                        for char in column:
+                            dynamic_column = dynamic_column * 26 + ord(char.upper()) - ord("A") + 1
+                        dynamic_column -= 1
+                        break
             drawing = ET.fromstring(archive.read(drawing_name))
+            anchors = []
             for anchor in list(drawing):
                 anchor_from = anchor.find(q(XDR, "from"))
                 if anchor_from is None:
@@ -865,7 +932,7 @@ def _anchored_image_map(path, photo_column, workbook_sheet_names=None):
                     continue
                 row_index = int(row_node.text or 0)
                 col_index = int(col_node.text or 0)
-                if row_index <= 0 or col_index != photo_column:
+                if row_index <= 0:
                     continue
                 media_name = media_by_rid.get(blip.get(q(R, "embed")))
                 if not media_name:
@@ -879,18 +946,25 @@ def _anchored_image_map(path, photo_column, workbook_sheet_names=None):
                 if workbook_sheet_names:
                     label = workbook_sheet_names.get(sheet_name, sheet_name)
                 excel_row = row_index + 1
-                result.setdefault((label, excel_row), []).append((media_name, extension))
+                anchors.append((row_index, col_index, media_name, extension))
+            columns = {col for _, col, _, _ in anchors if dynamic_column is not None and col == dynamic_column}
+            if not columns and photo_column is not None:
+                columns = {photo_column}
+            for row_index, col_index, media_name, extension in anchors:
+                if col_index not in columns:
+                    continue
+                result.setdefault((label, row_index + 1), []).append((media_name, extension))
     return result
 
 
 def build_disease_image_map(disease_path):
     """建立病害明细工作簿的 (sheet名, excel行号) -> [(媒体部件, 扩展名)] 图片映射（病害照片列）。"""
-    return _anchored_image_map(disease_path, photo_column=12)
+    return _anchored_image_map(disease_path, photo_column=12, photo_headers=("病害照片", "照片", "图片"))
 
 
 def build_tci_image_map(tci_path):
     """建立 TCI 工作簿的 (sheet名, excel行号) -> [(媒体部件, 扩展名)] 图片映射（图片列）。"""
-    return _anchored_image_map(tci_path, photo_column=15)
+    return _anchored_image_map(tci_path, photo_column=15, photo_headers=("图片", "照片", "病害照片"))
 
 
 def read_media(path, media_name):
@@ -904,20 +978,13 @@ def read_media(path, media_name):
     return data, Path(media_name).suffix.lower() or ".png"
 
 
-def disease_station_photo_index(disease_path, image_map):
-    """病害明细：(方向, 桩号≈1m) -> [(媒体部件, 扩展名)]。
-
-    数据行与图片锚点按 (sheet部件名, excel行号) 对齐；同一行可能有多张照片；
-    原始桩号与电子修正桩号双键索引，便于示例点按任一路径命中。
-    """
+def disease_station_photo_index(disease_path, image_map, role=None):
+    """Index disease photos by station, with source and record-role identity."""
     disease_path = Path(disease_path)
     result = {}
     with ZipFile(disease_path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
-        sheet_names = sorted(
-            name for name in archive.namelist()
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-        )
+        sheet_names = _xlsx_sheet_files(archive)
         for sheet_name in sheet_names:
             if not any(key[0] == sheet_name for key in image_map):
                 continue
@@ -926,45 +993,53 @@ def disease_station_photo_index(disease_path, image_map):
                 photos = image_map.get((sheet_name, excel_row))
                 if not photos:
                     continue
+                disease_type = str(row.get("病害类型") or "")
+                if role == "bolt" and "螺栓" not in disease_type:
+                    continue
+                if role == "height" and ("螺栓" in disease_type or "高度" not in disease_type):
+                    continue
                 direction = normalize_direction(row.get("方向"))
+                route = _route(row.get("路线编号") or row.get("路线") or "")
+                county = str(row.get("区县") or row.get("所属区县") or row.get("区域") or "").strip()
                 for column in ("原始桩号", "电子修正桩号"):
                     station = station_to_m(row.get(column))
                     if station is not None:
-                        result.setdefault((direction, round(station, 1)), []).extend(photos)
+                        for media_name, extension in photos:
+                            result.setdefault((direction, round(station, 1)), []).append({
+                                "workbook": disease_path,
+                                "media": media_name,
+                                "extension": extension,
+                                "source_sheet": sheet_name,
+                                "source_row": excel_row,
+                                "direction": direction,
+                                "route": route,
+                                "county": county,
+                                "station": station,
+                                "role": role or "disease",
+                            })
     return result
 
 
 def tci_type_photo_index(tci_path, image_map, routes=None):
-    """TCI 工作簿：{病害类型: [(媒体部件, 扩展名)]}，每类取第一条有图记录。
-
-    routes: 可选路线编号集合；给定后仅取该路线的行（避免串区县/串路线照片）。
-    """
+    """TCI 工作簿：{病害类型: [(媒体部件, 扩展名)]}，每类取第一条有图记录。"""
     tci_path = Path(tci_path)
     with ZipFile(tci_path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
-        sheet_names = sorted(
-            name for name in archive.namelist()
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-        )
-        if not sheet_names:
-            return {}
-        sheet_name = sheet_names[0]
-        rows = _xlsx_sheet_rows(archive, sheet_name, shared_strings)
+        rows_by_sheet = {sheet_name: _xlsx_sheet_rows(archive, sheet_name, shared_strings) for sheet_name in _xlsx_sheet_files(archive)}
     type_columns = [
         ("防护设施缺损（处）", "防护设施缺损"),
         ("标志缺损（处）", "交通标志缺损"),
         ("标线缺损（m）", "交通标线缺损"),
     ]
     result = {}
+    route_names = {_route(route) for route in routes or ()}
     for (sheet, excel_row), photos in image_map.items():
-        if sheet != sheet_name:
-            continue
-        row = rows.get(excel_row)
+        row = rows_by_sheet.get(sheet, {}).get(excel_row)
         if not row:
             continue
         if routes:
             row_route = _route(row.get("路线编号"))
-            if row_route and row_route not in {_route(r) for r in routes}:
+            if row_route not in route_names:
                 continue
         for column, label in type_columns:
             value = row.get(column)
@@ -990,19 +1065,11 @@ def build_segment_tci_photos(tci_path, image_map, segments):
         return {}
     with ZipFile(tci_path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
-        sheet_names = sorted(
-            name for name in archive.namelist()
-            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
-        )
-        if not sheet_names:
-            return {}
-        rows = _xlsx_sheet_rows(archive, sheet_names[0], shared_strings)
+        rows_by_sheet = {sheet_name: _xlsx_sheet_rows(archive, sheet_name, shared_strings) for sheet_name in _xlsx_sheet_files(archive)}
     desc_columns = ("防护设施缺损", "交通标志缺损", "交通标线缺损")
     result = {}
     for (sheet, excel_row), photos in image_map.items():
-        if sheet != sheet_names[0]:
-            continue
-        row = rows.get(excel_row)
+        row = rows_by_sheet.get(sheet, {}).get(excel_row)
         if not row:
             continue
         direction = normalize_direction(row.get("方向"))
@@ -1142,7 +1209,18 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
         except Exception as e:
             log(f"TCI 读取失败 {fpath.name}: {e}")
             continue
-        sheet_name = "病害明细表" if "病害明细表" in wb.sheetnames else wb.sheetnames[0]
+        data_sheet_names = []
+        for candidate_name in wb.sheetnames:
+            candidate_ws = wb[candidate_name]
+            candidate_head = []
+            for candidate_row in candidate_ws.iter_rows(min_row=1, max_row=6, values_only=True):
+                candidate_head.extend(str(value).strip() for value in candidate_row if value is not None)
+            if "路线编号" in candidate_head and any("缺损" in value for value in candidate_head):
+                data_sheet_names.append(candidate_name)
+        sheet_name = (
+            "病害明细表" if "病害明细表" in data_sheet_names
+            else (data_sheet_names[0] if data_sheet_names else wb.sheetnames[0])
+        )
         ws = wb[sheet_name]
         rows = list(ws.iter_rows(values_only=True))
         wb.close()
@@ -1212,7 +1290,7 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
         start = header_row_idx + 1
         if header_row_idx < len(rows) and "轻" in "".join(str(x) for x in rows[header_row_idx] if x is not None):
             start = header_row_idx + 2
-        for row in rows[start-1:]:
+        for excel_row, row in enumerate(rows[start-1:], start):
             vals = list(row)
             if not any(v not in (None, "") for v in vals):
                 continue
@@ -1278,6 +1356,7 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                 raise ValueError(f"{fpath.name}：桩号{format_station(station)}的 TCI 病害数量必须为非负有限数值")
             records.append({"segment": seg_idx, "station": station, "county": segments[seg_idx].get("county", ""),
                             "route": row_route, "direction": direction, "file": str(fpath),
+                            "source_sheet": sheet_name, "source_row": excel_row,
                             "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
         log(f"TCI 病害 {fpath.name}: 落段 {len([r for r in records if True])} 条")
     return records
@@ -1859,7 +1938,7 @@ def order_example_records(records):
 
 
 def row_has_height_photo(row, photo_index):
-    """示例行是否命中病害照片索引（(方向, 桩号≈0.1m) 双键，任一桩号键命中即可）。"""
+    """Whether a height row has a role- and route-matching source photo."""
     if not photo_index:
         return False
     direction = normalize_direction(row.get("direction"))
@@ -1867,7 +1946,19 @@ def row_has_height_photo(row, photo_index):
         station = row.get(station_key)
         if station is None:
             continue
-        if photo_index.get((direction, round(float(station), 1))):
+        candidates = photo_index.get((direction, round(float(station), 1)), [])
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                if candidate.get("role") not in (None, "height", "disease"):
+                    continue
+                row_route = _route(row.get("route") or "")
+                candidate_route = _route(candidate.get("route") or "")
+                if row_route and candidate_route and row_route != candidate_route:
+                    continue
+                row_county = str(row.get("county") or "").strip()
+                candidate_county = str(candidate.get("county") or "").strip()
+                if row_county and candidate_county and candidate_county not in county_short_names(row_county):
+                    continue
             return True
     return False
 
@@ -2035,8 +2126,10 @@ def report_tci_images(temp_dir, segments, tci_stats):
             axis.set_ylim(0, 105)
             axis.grid(True, alpha=0.25)
             axis.set_ylabel("TCI")
-            axis.set_xticks(x)
-            axis.set_xticklabels([format_station(u["start"]) for u in units], rotation=30, ha="right", fontsize=7)
+            # 点位过多时抽样横坐标刻度（与高度折线图一致），避免桩号标签重叠。
+            ticks = sorted(set(int(i * (len(x) - 1) / min(9, max(1, len(x) - 1))) for i in range(min(10, len(x)))))
+            axis.set_xticks(ticks)
+            axis.set_xticklabels([format_station(units[i]["start"]) for i in ticks], rotation=30, ha="right", fontsize=7)
             axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=1, frameon=False)
             figure.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.30)
             path = Path(temp_dir) / f"tci_{len(images)}.png"

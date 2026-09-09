@@ -673,7 +673,7 @@ def _notes_paragraphs(doc, spec: str) -> None:
     doc.paragraphs[-1].add_run().add_break(WD_BREAK.PAGE)
 
 
-def _table(doc, headers, rows, header_shading=False):
+def _table(doc, headers, rows, header_shading=False, vertical_merges=()):
     style_config = _current_format_config()["table"]
     table = doc.add_table(rows=1, cols=len(headers))
     table.alignment = {
@@ -710,6 +710,20 @@ def _table(doc, headers, rows, header_shading=False):
         paragraphs = tc.findall(qn("w:p"))
         for extra in paragraphs[1:]:
             tc.remove(extra)
+
+    for column, start, end in vertical_merges:
+        if 0 <= start < end < len(table.rows) - 1 and 0 <= column < len(headers):
+            _keep_first_paragraph(table.cell(start + 1, column).merge(table.cell(end + 1, column)))
+            for row_index in range(start + 1, end + 2):
+                cells = table.rows[row_index]._tr.findall(qn("w:tc"))
+                if column >= len(cells):
+                    continue
+                tc_pr = cells[column].get_or_add_tcPr()
+                v_merge = tc_pr.find(qn("w:vMerge"))
+                if v_merge is None:
+                    v_merge = OxmlElement("w:vMerge")
+                    tc_pr.append(v_merge)
+                v_merge.set(qn("w:val"), "restart" if row_index == start + 1 else "continue")
 
     if list(headers) == ["姓名", "组别", "职务", "职责"] and len(table.rows) >= 5:
         for column in (1, 3):
@@ -862,6 +876,38 @@ def generate_guangdong_stub(city, bundle, output_dir, log=lambda _x: None):
     raise NotImplementedError("广东报告需要用户提供第五章模板；当前程序不会伪造该模板。")
 
 
+def _overview_segment_rows(segments, has_county):
+    groups = {}
+    for original_index, segment in enumerate(segments):
+        county = str(segment.get("county") or "").strip()
+        route = str(segment.get("route") or "").strip() or "G210"
+        key = (county, route) if has_county else (route,)
+        groups.setdefault(key, []).append((original_index, segment))
+    rows = []
+    merges = []
+    for group in groups.values():
+        total = sum(float(segment.get("mileage") or 0) for _, segment in group)
+        start = len(rows)
+        for offset, (original_index, segment) in enumerate(group):
+            total_text = f"{total:.3f}" if offset == 0 else ""
+            if has_county:
+                rows.append([
+                    original_index + 1, segment.get("county", ""), segment.get("route", "G210"),
+                    segment.get("route_name", ""), segment.get("grade", ""),
+                    engine.format_station(segment["start"]), engine.format_station(segment["end"]),
+                    f"{float(segment.get('mileage') or 0):.3f}", total_text,
+                ])
+            else:
+                rows.append([
+                    original_index + 1, segment.get("route", "G210"), segment.get("route_name", ""),
+                    segment.get("grade", ""), engine.format_station(segment["start"]),
+                    engine.format_station(segment["end"]), f"{float(segment.get('mileage') or 0):.3f}", total_text,
+                ])
+        if len(group) > 1:
+            merges.append((len(rows[0]) - 1, start, len(rows) - 1))
+    return rows, merges
+
+
 def _section_overview(doc, config, segments):
     has_county = bool(segments and any(s.get("county") for s in segments))
     if has_county:
@@ -872,15 +918,15 @@ def _section_overview(doc, config, segments):
         _body(doc, f"本次对{county_text}{route_text}线波形梁护栏{'和'.join(['护栏横梁中心高度', '螺栓缺失'])}进行自动化检测，按采集路段汇总表划分为{len(segments)}个统计分段。{route_text}上行K2264K2325文件按原始桩号统计，其他文件按电子修正桩号统计。")
         _caption(doc, "表", "1.1", f"{county_text}检测路段情况")
         headers = ["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程(km)", "总里程(km)"]
-        rows = [[i, s.get("county", ""), s.get("route", "G210"), s.get("route_name", ""), s.get("grade", ""), engine.format_station(s["start"]), engine.format_station(s["end"]), f"{s['mileage']:.3f}", f"{s.get('total_mileage', s['mileage']):.3f}"] for i, s in enumerate(segments, 1)]
+        rows, vertical_merges = _overview_segment_rows(segments, True)
     else:
         routes = sorted({str(s.get("route", "")).strip() for s in segments if str(s.get("route", "")).strip()}) if segments else []
         route_text = "、".join(routes) if routes else "G210"
         _body(doc, f"本次对重庆市{route_text}线波形梁护栏{'和'.join(['护栏横梁中心高度', '螺栓缺失'])}进行自动化检测，按采集路段汇总表划分为{len(segments)}个统计分段。{route_text}上行K2264K2325文件按原始桩号统计，其他文件按电子修正桩号统计。")
         _caption(doc, "表", "1.1", f"{route_text}检测路段情况")
         headers = ["序号", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程(km)", "总里程(km)"]
-        rows = [[i, s.get("route", "G210"), s.get("route_name", ""), s.get("grade", ""), engine.format_station(s["start"]), engine.format_station(s["end"]), f"{s['mileage']:.3f}", f"{s.get('total_mileage', s['mileage']):.3f}"] for i, s in enumerate(segments, 1)]
-    _table(doc, headers, rows, True)
+        rows, vertical_merges = _overview_segment_rows(segments, False)
+    return _table(doc, headers, rows, True, vertical_merges=vertical_merges)
 
 
 def _section_method(doc, height_stats, bolt_stats):
@@ -987,8 +1033,8 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
 
 
 def _match_station_photos(points, photo_index, workbook=None):
-    """示例点 -> {序号: [(字节, 扩展名)]}：按 (方向, 桩号) 命中病害照片索引（最多 2 张）。"""
-    if not photo_index or workbook is None:
+    """示例点 -> {序号: [(字节, 扩展名)]} with source identity preserved."""
+    if not photo_index:
         return {}
     result = {}
     for index, point in enumerate(points):
@@ -1001,9 +1047,14 @@ def _match_station_photos(points, photo_index, workbook=None):
                 continue
             photos = photo_index.get((direction, round(float(station), 1)))
             if photos:
-                result[index] = [
-                    engine.read_media(workbook, media_name) for media_name, _ in photos[:2]
-                ]
+                data = []
+                for photo in photos[:2]:
+                    if isinstance(photo, dict):
+                        data.append(engine.read_media(photo["workbook"], photo["media"]))
+                    elif workbook is not None:
+                        data.append(engine.read_media(workbook, photo[0]))
+                if data:
+                    result[index] = data
                 break
     return result
 
@@ -1137,6 +1188,21 @@ def _section_tci(doc, segments, tci_stats, tci_images=None, temp_dir=None, tci_p
             _body(doc, f"{county}{route}线检测路段为{ranges}。")
             if any(not tci_stats[i].get("units") for i, _ in source):
                 _body(doc, "部分检测区间未提供TCI数据，未计入均值；详见附表中的实际评定范围。")
+            segment_rows = []
+            for i, seg in source:
+                stat = tci_stats[i] if i < len(tci_stats) else None
+                seg_units = (stat or {}).get("units") or []
+                for direction in ("上行", "下行", ""):
+                    selected = [u for u in seg_units if engine.normalize_direction(u.get("direction")) == direction]
+                    if not selected:
+                        continue
+                    score = sum(u["tci"] for u in selected) / len(selected)
+                    segment_rows.append([len(segment_rows) + 1, direction or "未注明",
+                                         engine.format_station(seg["start"]), engine.format_station(seg["end"]),
+                                         f"{float(seg.get('mileage') or 0):.3f}", f"{score:.2f}", engine.tci_grade(score)])
+            if segment_rows:
+                _caption(doc, "表", f"3.{number}-1", f"{county}{route}线沿线设施检查评定汇总表")
+                _table(doc, ["序号", "方向", "起点桩号", "止点桩号", "里程（km）", "TCI", "等级"], segment_rows, True)
             chart_number = 0
             for i, seg in source:
                 for direction in ("上行", "下行", ""):
@@ -1199,8 +1265,8 @@ def _section_tci_appendix(doc, segments, tci_stats):
 
 
 def _section_conclusion(doc, segments, height_stats, bolt_stats, tci_stats=None):
-    # 6.1 结论 + 6.2 建议，结构参考《报告模板-5.docx》附件模板。
-    _heading(doc, "结论", 2)
+    # 6.1 总结 + 6.2 建议，结构参考《报告模板-5.docx》附件模板。
+    _heading(doc, "总结", 2)
     has_county = bool(segments and any(s.get("county") for s in segments))
     units = [u for stat in tci_stats or [] for u in stat.get("units", [])]
     # —— 沿线设施 TCI 结论 ——
@@ -1210,8 +1276,21 @@ def _section_conclusion(doc, segments, height_stats, bolt_stats, tci_stats=None)
         weak = [u for u in units if u["tci"] < 80]
         weak_text = ""
         if weak:
-            parts = [f"{engine.format_station(u['start'])}～{engine.format_station(u['end'])}段" for u in weak]
-            weak_text = f"其中{('、'.join(parts))}评定为{'中等' if all(u['tci'] >= 70 for u in weak) else '次差'}，需要特别注意。"
+            # 按路线分组列出次差段；同一条线超过5段时只列最差的5段并加“等”。
+            by_route = {}
+            for unit in weak:
+                by_route.setdefault(unit.get("route") or "", []).append(unit)
+            parts = []
+            for route, route_units in by_route.items():
+                # 同一桩号范围的上、下行只列一次，取较差评分参与排序
+                unique = {}
+                for unit in sorted(route_units, key=lambda u: u["tci"]):
+                    unique.setdefault((unit["start"], unit["end"]), unit)
+                worst = sorted(list(unique.values())[:5], key=lambda u: u["start"])
+                listed = "、".join(f"{engine.format_station(u['start'])}～{engine.format_station(u['end'])}段" for u in worst)
+                prefix = f"{route}线" if route else ""
+                parts.append(f"{prefix}{listed}{'等' if len(unique) > 5 else ''}")
+            weak_text = f"其中{('；'.join(parts))}评定为{'中等' if all(u['tci'] >= 70 for u in weak) else '次差'}，需要特别注意。"
         if has_county:
             county = next(s.get("county", "") for s in segments if s.get("county"))
             _body(doc, f"{county}沿线设施技术状况TCI整体状况{'良好' if mean >= 80 else '一般'}，{weak_text or '各路段均达到优良等级。'}")
@@ -1252,7 +1331,7 @@ def _section_conclusion(doc, segments, height_stats, bolt_stats, tci_stats=None)
     _body(doc, "波形梁护栏的螺栓缺失会导致护栏的防护性能下降，应加强养护巡查。当同一处拼接处有缺少3个（含3个）以上螺栓时，需及时修复，在缺少3个以下螺栓时，本着安全第一的原则，也应及时有条件的进行维修，确保波形梁护栏符合设计要求。")
 
 
-_STATIC_CONCLUSION_HEADINGS = frozenset({"结论", "建议", "结论与建议"})
+_STATIC_CONCLUSION_HEADINGS = frozenset({"结论", "建议", "结论与建议", "总结", "总结与建议"})
 _STATIC_CONCLUSION_PARAGRAPHS = ("结论章节由程序根据检测统计自动生成", "建议章节由程序根据检测统计自动生成")
 
 
@@ -1545,11 +1624,26 @@ def make_report(config, segments, height_stats, height_records, bolt_stats, bolt
     # T11：病害照片索引（高度示例表挂真实照片）与 TCI 类型示例图
     height_photo_index = {}
     height_photo_workbook = None
-    if disease_image_index:
-        workbook = next(iter(disease_image_index.values()))[0]["workbook"]
+    height_workbooks = set()
+    if config.disease_dir and Path(config.disease_dir).is_dir():
+        height_workbooks.update(
+            str(path)
+            for path in Path(config.disease_dir).glob("*.xlsx")
+        )
+    height_workbooks.update(
+        item["workbook"]
+        for items in (disease_image_index or {}).values()
+        for item in items
+        if isinstance(item, dict) and item.get("workbook")
+    )
+    for workbook in sorted(height_workbooks, key=str):
         image_map = engine.build_disease_image_map(workbook)
-        if image_map:
-            height_photo_index = engine.disease_station_photo_index(workbook, image_map)
+        if not image_map:
+            continue
+        photo_index = engine.disease_station_photo_index(workbook, image_map, role="height")
+        for key, photos in photo_index.items():
+            height_photo_index.setdefault(key, []).extend(photos)
+        if photo_index:
             height_photo_workbook = workbook
     tci_photos = None
     segment_tci_photos = {}
