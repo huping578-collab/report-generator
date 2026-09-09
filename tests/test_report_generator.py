@@ -1717,9 +1717,10 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
             document = Document(output)
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
 
-        self.assertIn("其中二波护栏", text)
-        self.assertIn("其中三波护栏", text)
-        self.assertEqual(text.count("当前区段为桥梁路段，无有效检测点位。"), 2)
+        self.assertIn("共获得有效检测点2个", text)
+        self.assertIn("二波护栏1个有效点", text)
+        self.assertIn("三波护栏1个有效点", text)
+        self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", text)
         self.assertNotIn("区段内无护栏", text)
         self.assertNotIn("共检测0个有效点，其中。", text)
 
@@ -1761,24 +1762,25 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
                 {"marking": 7, "height": 5, "bolt": 5},
             )
             document = Document(output)
-            headings = []
-            height_text = []
-            in_height_section = False
-            for paragraph in document.paragraphs:
-                if paragraph.text == "（2）波形梁护栏中心高度情况":
-                    in_height_section = True
-                elif paragraph.text == "（3）螺栓缺失情况":
-                    in_height_section = False
-                elif in_height_section:
-                    height_text.append(paragraph.text)
-                    if (
-                        paragraph.style.name == "Heading 5"
-                        and "K1+000～K2+000段" in paragraph.text
-                    ):
-                        headings.append(paragraph.text)
+            paragraphs = document.paragraphs
+            start = next(i for i, p in enumerate(paragraphs) if p.text == "（2）波形梁护栏中心高度情况")
+            end = next(i for i, p in enumerate(paragraphs) if p.text == "（3）螺栓缺失情况")
+            section = paragraphs[start:end]
+            height_headings = [p.text for p in section if p.style.name == "Heading 5"]
+            height_text = "\n".join(p.text for p in section)
 
-        self.assertEqual(headings, ["a. K1+000～K2+000段"])
-        self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", "\n".join(height_text))
+        self.assertEqual(
+            height_headings,
+            [
+                "①总体情况",
+                "②各路线波形梁护栏中心高度情况",
+                "③不同管理单位对比分析",
+                "④典型状况不佳路段及原因分析",
+                "⑤护栏中心高度不佳长连续路段梳理",
+            ],
+        )
+        self.assertIn("共获得有效检测点1个", height_text)
+        self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", height_text)
 
     def test_writer_accepts_markdown_template_with_city_placeholder(self) -> None:
         bundle = {
@@ -1880,6 +1882,123 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         self.assertIn("平均偏差", text)
         self.assertIn("一致性占比", text)
         self.assertNotIn("1.00～3.00", text)
+
+
+class Gd03ManualReviewAdviceTests(unittest.TestCase):
+    """GD03（4）人工复核对比情况与（三）工作建议：对标附件的五级标题与表列名。"""
+
+    @staticmethod
+    def _detail_records():
+        return [
+            {"indicator": "marking", "city": "云浮市", "route": "G2518", "direction": "上行",
+             "segment": "K230+200~K230+100", "category": "高速公路", "source": "正式检测后",
+             "manual": 105.76, "automatic": 101.04},
+            {"indicator": "marking", "city": "云浮市", "route": "S51", "direction": "上行",
+             "segment": "K59+100~K59+200", "category": "高速公路", "source": "正式检测后",
+             "manual": 26.51, "automatic": 27.15},
+            {"indicator": "height", "city": "云浮市", "route": "G2518", "direction": "上行",
+             "segment": "K230+200~K230+100", "category": "高速公路", "source": "正式检测后",
+             "gtype": "三波护栏", "manual": 704.12, "automatic": 708.52},
+            {"indicator": "height", "city": "云浮市", "route": "S51", "direction": "上行",
+             "segment": "K59+200~K59+100", "category": "高速公路", "source": "正式检测后",
+             "gtype": "三波护栏", "manual": 705.90, "automatic": 700.28},
+            {"indicator": "bolt", "city": "云浮市", "route": "G2518", "direction": "上行",
+             "segment": "K231~K230", "category": "高速公路", "source": "正式检测后",
+             "gtype": "三波护栏", "manual": 1, "automatic": 38,
+             "msplice": 1, "mconn": 0, "asplice": 30, "aconn": 8},
+        ]
+
+    def _bundle(self):
+        detail, summary = engine.ManualAutoComparator(
+            {"marking": 7, "height": 5, "bolt": 5}).compare(self._detail_records())
+        return {
+            "city": "云浮市",
+            "marking": [
+                {"city": "云浮市", "route": "G2518", "direction": "下行", "station_m": 343000,
+                 "manager": "广东省路桥建设发展有限公司云梧分公司", "category": "高速公路"},
+                {"city": "云浮市", "route": "G324", "direction": "上行", "station_m": 1182000,
+                 "manager": "云浮市云城区公路事务中心", "category": "普通国省道"},
+            ],
+            "height": [], "bolt": [],
+            "weak_segments": [
+                {"route": "G2518", "direction": "下行", "segment": "G2518下行K0343～K0308",
+                 "type": "护栏高度偏差超10cm", "reason": "三波护栏偏差超10 cm点数120个"},
+                {"route": "G324", "direction": "上行", "segment": "K1182+000~K1186+880",
+                 "type": "标线连续3km不合格", "marking_position": "左侧标线",
+                 "start_m": 1182000, "end_m": 1186880, "reason": "连续不合格长度达4.88 km"},
+            ],
+            "comparison_detail": detail,
+            "comparison_summary": summary,
+        }
+
+    @staticmethod
+    def _collector():
+        tables = []
+
+        def table(headers, rows, title):
+            tables.append({"title": title, "headers": list(headers), "rows": [list(row) for row in rows]})
+
+        return tables, table
+
+    def test_comparison_section_matches_attachment_structure(self):
+        bundle = self._bundle()
+        document = Document()
+        tables, table = self._collector()
+        engine.GuangdongChapterWriter._comparison_gd03_section(
+            document, "高速公路", bundle["comparison_detail"], {"marking": 7, "height": 5, "bolt": 5}, table)
+        headings = [p.text for p in document.paragraphs if p.style.name == "Heading 5"]
+        self.assertEqual(headings, [
+            "①分析方法与判定标准", "②标线逆反射亮度系数对比", "③波形梁护栏中心高度对比",
+            "④波形梁护栏螺栓缺失对比", "⑤偏差与一致性汇总"])
+        body = "\n".join(p.text for p in document.paragraphs)
+        for token in ("1.1 偏差指标", "1.2 判定标准", "1.3 一致性口径",
+                      "2.1 偏差范围", "2.2 一致性", "3.1 偏差范围", "3.2 一致性",
+                      "4.1 偏差范围", "4.2 检出一致性", "小结："):
+            self.assertIn(token, body)
+        titles = [item["title"] for item in tables]
+        for title in ("人工复核对比样本及来源分布表", "人工复核判定标准表",
+                      "人工复核标线逆反射亮度系数偏差范围表（高速公路）",
+                      "人工复核标线逆反射亮度系数对比明细表",
+                      "人工复核波形梁护栏中心高度偏差范围表（高速公路）",
+                      "人工复核波形梁护栏中心高度对比明细表",
+                      "人工复核螺栓缺失数量偏差范围表（高速公路）",
+                      "人工复核波形梁护栏螺栓缺失对比明细表",
+                      "人工复核与自动化检测一致性汇总表（高速公路）",
+                      "人工复核偏差方向与幅度总评表（高速公路）"):
+            self.assertIn(title, titles)
+        by_title = {item["title"]: item for item in tables}
+        self.assertEqual(by_title["人工复核标线逆反射亮度系数对比明细表"]["headers"],
+                         ["路线", "桩号区段", "类别", "人工", "自动化", "绝对偏差", "相对偏差%", "人工判定", "自动判定"])
+        self.assertEqual(by_title["人工复核波形梁护栏中心高度对比明细表"]["headers"],
+                         ["路线", "护栏", "桩号区段", "来源", "人工（mm)", "自动化(mm)", "绝对偏差(mm)", "标准值(mm)", "人工判定", "自动判定"])
+        self.assertEqual(by_title["人工复核波形梁护栏螺栓缺失对比明细表"]["headers"],
+                         ["路线", "护栏", "桩号区段", "类别", "来源", "人工(拼)", "人工(连)", "人工合计", "自动(拼)", "自动(连)", "自动合计"])
+        self.assertEqual(by_title["人工复核与自动化检测一致性汇总表（高速公路）"]["headers"], ["指标", "一致性口径", "高速公路"])
+        self.assertEqual(by_title["人工复核偏差方向与幅度总评表（高速公路）"]["headers"], ["指标", "平均偏差", "偏差方向", "精度评级"])
+        bolt_row = by_title["人工复核波形梁护栏螺栓缺失对比明细表"]["rows"][0]
+        self.assertEqual(bolt_row[-1], "38")
+        self.assertEqual(bolt_row[-4], "1")
+        self.assertIn("正式检测后", bolt_row)
+
+    def test_advice_section_tables_and_headings(self):
+        bundle = self._bundle()
+        document = Document()
+        tables, table = self._collector()
+        engine.GuangdongChapterWriter._advice_gd03_section(document, bundle, table)
+        headings = [p.text for p in document.paragraphs if p.style.name == "Heading 3"]
+        self.assertEqual(headings, ["1.重点路段处治建议（如有）", "2.迎国评工作建议", "3.养护提升建议"])
+        by_title = {item["title"]: item for item in tables}
+        self.assertEqual(set(by_title), {"高速公路优先处治路段表", "普通国省道优先处治路段表"})
+        for title in by_title:
+            self.assertEqual(by_title[title]["headers"], ["路线", "管养单位", "桩号范围", "存在问题"])
+            self.assertTrue(by_title[title]["rows"])
+        self.assertEqual(by_title["高速公路优先处治路段表"]["rows"][0][:2], ["G2518", "云梧分公司"])
+        self.assertEqual(by_title["普通国省道优先处治路段表"]["rows"][0][:2], ["G324", "云城区公路事务中心"])
+        body = "\n".join(p.text for p in document.paragraphs)
+        for token in ("（一）优先处治路段（6个月完成）", "（二）闭环督办管理要求", "建立整改清单", "验收销号",
+                      "考核挂钩", "清除标志遮挡", "高速公路方面", "普通国省道方面",
+                      "（2）做好迎检路段现场排查", "（3）统筹力量，差异化投入"):
+            self.assertIn(token, body)
 
 
 REAL_E2E_ENV = "REPORT_E2E_REAL"

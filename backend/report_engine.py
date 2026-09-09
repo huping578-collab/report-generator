@@ -2888,6 +2888,15 @@ def _norm_header(value):
     return re.sub(r"[\s（）()\[\]【】_:：\-]+", "", str(value or "")).lower()
 
 
+def _filename_k_range(path):
+    """源文件名中的 K 区间（G234上行K3140K3144.xlsx → (3140000, 3144000)）。"""
+    match = re.search(r"K(\d{4})K(\d{4})", Path(str(path)).name)
+    if not match:
+        return None
+    lo, hi = (int(value) * 1000 for value in match.groups())
+    return (min(lo, hi), max(lo, hi))
+
+
 def _first(row, *aliases, default=None):
     normalized = {_norm_header(k): v for k, v in row.items()}
     for alias in aliases:
@@ -3158,7 +3167,10 @@ class GuangdongInputScanner:
                     city = self.default_city
                 else:
                     raise
-        station_raw = _first(row, "标注修正桩号", "电子修正桩号", "原始桩号", "桩号", "桩号范围", "计算区间")
+        if kind in ("height", "bolt"):
+            station_raw = _first(row, "电子修正桩号", "标注修正桩号", "原始桩号", "桩号")
+        else:
+            station_raw = _first(row, "标注修正桩号", "电子修正桩号", "原始桩号", "桩号", "桩号范围", "计算区间")
         explicit_segment = _first(row, "检测区段", "统计区段", "区段", "桩号范围")
         base = {"city": city, "route": route, "direction": direction, "station_m": _station_first(station_raw),
                 "segment": str(explicit_segment or metadata.get("file_segment") or station_raw or ""), "manager": str(_first(row, "管养单位", default="") or ""), "interval": str(_first(row, "计算区间", default="") or ""), "source": str(source), "sheet": sheet, "source_row": source_row, "source_range": str(station_raw or "")}
@@ -3167,25 +3179,27 @@ class GuangdongInputScanner:
             raise ValueError(f"{location}：缺少地市或路线元数据")
         if _float(base["station_m"]) is None:
             raise ValueError(f"{location}：桩号无法解析：{station_raw}")
+        if kind in ("height", "bolt"):
+            bounds = _filename_k_range(source)
+            if bounds and not (bounds[0] <= float(base["station_m"]) <= bounds[1]):
+                return None
         if kind == "height":
             value = _float(_first(row, "梁板中心高度(mm)", "护栏中心高度(mm)", "梁板中心高度", "护栏中心高度", "梁板中心高度毫米", "护栏中心高度mm"))
             remark = str(_first(row, "异常标记", "备注标记", "备注", default="") or "").strip()
-            if remark not in ("", "无备注"):
+            if value is None or value <= 0:
                 # 桥梁/隧道路段标记行：不参与高度统计，但记录供报告生成区段说明
-                if "桥梁" in remark or "隧道" in remark:
+                if remark and ("桥梁" in remark or "隧道" in remark):
                     base.update(guardrail_note=remark)
                     return base
                 return None
-            if value is None or value <= 0: return None
             base.update(guardrail_type=_guardrail_type(_first(row, "护栏类型")), height=value)
+            if remark and ("桥梁" in remark or "隧道" in remark):
+                base["guardrail_note"] = remark
         elif kind == "bolt":
             remark = str(_first(row, "备注标记", "异常标记", "备注", default="") or "").strip()
-            vals = [_float(_first(row, name, name+"颗")) for name in ("拼接螺栓数量","拼接螺栓缺失数量","连接螺栓数量","连接螺栓缺失数量")]
-            if any(v is None for v in vals):
-                if remark and ("桥梁" in remark or "隧道" in remark):
-                    base.update(guardrail_note=remark); return base
-                return None
-            base.update(splice=vals[0], splice_missing=vals[1], connection=vals[2], connection_missing=vals[3])
+            vals = [_float(_first(row, name, name+"颗")) or 0.0 for name in ("拼接螺栓数量","拼接螺栓缺失数量","连接螺栓数量","连接螺栓缺失数量")]
+            outline = _float(_first(row, "轮廓标数量（个）", "轮廓标数量(个)", "轮廓标数量")) or 0.0
+            base.update(splice=vals[0], splice_missing=vals[1], connection=vals[2], connection_missing=vals[3], outline=outline)
             if remark and ("桥梁" in remark or "隧道" in remark):
                 base["guardrail_note"] = remark
         else:
@@ -3238,7 +3252,8 @@ class GuangdongInputScanner:
                         elif record:
                             if record.get("guardrail_note"):
                                 records["notes"].append(record)
-                            else:
+                            if (record.get("height") is not None or record.get("splice") is not None
+                                    or not record.get("guardrail_note")):
                                 records[kind].append(record)
                     except Exception as exc:
                         records["issues"].append(str(exc))
@@ -3291,8 +3306,10 @@ def detect_guangdong_data_folders(project_dir):
     guardrail_candidates = {}
 
     dirs_to_check = [project_dir] + sorted(
-        d for d in project_dir.iterdir()
-        if d.is_dir() and d.name not in GuangdongInputScanner.EXCLUDE_DIRS and not d.name.startswith(".")
+        d for d in project_dir.rglob("*")
+        if d.is_dir() and not d.name.startswith(".")
+        and d.name not in GuangdongInputScanner.EXCLUDE_DIRS
+        and len(d.relative_to(project_dir).parts) <= 3
     )
 
     for subdir in dirs_to_check:
@@ -3342,8 +3359,14 @@ def detect_guangdong_data_folders(project_dir):
         if guardrail_count:
             guardrail_candidates[str(subdir)] = guardrail_count
 
-    marking_dir = max(marking_candidates, key=marking_candidates.get, default=None)
-    guardrail_dir = max(guardrail_candidates, key=guardrail_candidates.get, default=None)
+    def _best(candidates):
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: (
+            candidates[path], len(Path(path).relative_to(project_dir).parts), path))
+
+    marking_dir = _best(marking_candidates)
+    guardrail_dir = _best(guardrail_candidates)
     return marking_dir, guardrail_dir
 
 
@@ -3490,6 +3513,659 @@ class GuangdongStatistics:
         return weak
 
 
+    # ==================== GD03 四段式聚合（brief-gd03 §3） ====================
+
+    MARKING_UNIT_RECORDS = 5
+
+    @staticmethod
+    def _route_key(route):
+        text = str(route or "")
+        prefix = text.rstrip("0123456789")
+        digits = text[len(prefix):]
+        return (prefix, int(digits) if digits.isdigit() else 0, text)
+
+    @staticmethod
+    def _span_km(units):
+        """同一路线跨区段取并集后合计里程（km）。"""
+        spans = {}
+        for unit in units:
+            start, end = unit.get("start_m"), unit.get("end_m")
+            if start is None or end is None:
+                continue
+            key = str(unit.get("route") or "")
+            low, high = spans.get(key, (start, end))
+            spans[key] = (min(low, start), max(high, end))
+        return sum(high - low for low, high in spans.values()) / 1000
+
+    @staticmethod
+    def _side_of(position):
+        return marking_side_names([position]).get(str(position), str(position))
+
+    @classmethod
+    def marking_units(cls, rows):
+        """100 m 平均值基准：每侧每 5 条 20 m 记录（按桩号排序）归为一个计算单元。
+
+        分组口径与附件一致：路线+方向+管养单位+标线位置（不按检测区段拆分，
+        否则跨区段处会把 5 条记录截断，导致合格率偏差）。
+        """
+        fields = ("route", "direction", "manager", "marking_position")
+        units = []
+        for key, selected in cls._group(rows, fields).items():
+            ordered = sorted((r for r in selected if _float(r.get("value")) is not None and r.get("station_m") is not None),
+                             key=lambda r: r["station_m"])
+            for index in range(0, len(ordered), cls.MARKING_UNIT_RECORDS):
+                chunk = ordered[index:index + cls.MARKING_UNIT_RECORDS]
+                values = [float(r["value"]) for r in chunk]
+                targets = [_float(r.get("target")) for r in chunk]
+                target = max((t for t in targets if t is not None), default=80.0)
+                average = sum(values) / len(values)
+                ends = [_float(r.get("end_m")) for r in chunk]
+                ends = [e for e in ends if e is not None]
+                units.append(dict(zip(fields, key), count=len(values), average=average, target=target,
+                                  qualified=average >= target, start_m=min(r["station_m"] for r in chunk),
+                                  end_m=max(ends) if ends else max(r["station_m"] for r in chunk)))
+        return units
+
+    @classmethod
+    def marking_unit_rates(cls, units):
+        """按标线侧汇总 100 m 单元的合格率。"""
+        result = {}
+        for unit in units:
+            side = cls._side_of(unit.get("marking_position"))
+            item = result.setdefault(side, {"unit_count": 0, "qualified_count": 0})
+            item["unit_count"] += 1
+            item["qualified_count"] += 1 if unit.get("qualified") else 0
+        for item in result.values():
+            item["qualified_rate"] = item["qualified_count"] / item["unit_count"] if item["unit_count"] else None
+        return result
+
+    @classmethod
+    @staticmethod
+    def _marking_km(units):
+        """检测里程（km）：每侧 100 m 计算单元数 × 0.1（oracle 口径，跨区段按单元累计）。"""
+        sides = {}
+        for unit in units:
+            side = GuangdongStatistics._side_of(unit.get("marking_position"))
+            sides[side] = sides.get(side, 0) + 1
+        return round(0.1 * max(sides.values()), 1) if sides else 0.0
+
+    @classmethod
+    def marking_overall(cls, units):
+        rates = cls.marking_unit_rates(units)
+        left = rates.get("左侧标线", {}).get("qualified_rate")
+        right = rates.get("右侧标线", {}).get("qualified_rate")
+        return {"left_rate": left, "right_rate": right, "overall_rate": _gd03_overall(left, right),
+                "unit_count": len(units),
+                "qualified_count": sum(1 for unit in units if unit.get("qualified")),
+                "left_units": rates.get("左侧标线", {}).get("unit_count", 0),
+                "right_units": rates.get("右侧标线", {}).get("unit_count", 0)}
+
+    @classmethod
+    def marking_route_units(cls, rows):
+        """②“路线—管养单位”合并（跨检测区段）的 100 m 单元合格率。"""
+        units = cls.marking_units(rows)
+        result = []
+        for key, selected in cls._group(units, ("route", "manager")).items():
+            rates = cls.marking_unit_rates(selected)
+            left = rates.get("左侧标线", {}).get("qualified_rate")
+            right = rates.get("右侧标线", {}).get("qualified_rate")
+            starts = [u["start_m"] for u in selected]
+            ends = [u["end_m"] for u in selected]
+            result.append(dict(zip(("route", "manager"), key), left_rate=left, right_rate=right,
+                                overall_rate=_gd03_overall(left, right), km=cls._marking_km(selected),
+                                unit_count=len(selected), start_m=min(starts), end_m=max(ends)))
+        return sorted(result, key=lambda row: cls._route_key(row["route"]))
+
+    @classmethod
+    def marking_company_units(cls, rows):
+        """③按（母公司，二级公司）合并 100 m 单元。"""
+        grouped = {}
+        for unit in cls.marking_units(rows):
+            grouped.setdefault(split_manager_company(unit.get("manager")), []).append(unit)
+        result = []
+        for (parent, child), selected in grouped.items():
+            rates = cls.marking_unit_rates(selected)
+            left = rates.get("左侧标线", {}).get("qualified_rate")
+            right = rates.get("右侧标线", {}).get("qualified_rate")
+            result.append({"parent": parent or "—", "child": child or "—", "left_rate": left, "right_rate": right,
+                           "overall_rate": _gd03_overall(left, right), "km": cls._marking_km(selected),
+                           "routes": sorted({str(u.get("route") or "") for u in selected}, key=cls._route_key),
+                           "unit_count": len(selected)})
+        return sorted(result, key=lambda row: (row["parent"], row["child"]))
+
+    @classmethod
+    def marking_road_type_units(cls, rows):
+        """普通国省道③：按普通国道/普通省道合并。"""
+        grouped = {}
+        for unit in cls.marking_units(rows):
+            route = str(unit.get("route") or "")
+            key = "普通国道" if route.startswith("G") else ("普通省道" if route.startswith("S") else route)
+            grouped.setdefault(key, []).append(unit)
+        result = []
+        for name, selected in grouped.items():
+            rates = cls.marking_unit_rates(selected)
+            left = rates.get("左侧标线", {}).get("qualified_rate")
+            right = rates.get("右侧标线", {}).get("qualified_rate")
+            result.append({"name": name, "left_rate": left, "right_rate": right,
+                           "overall_rate": _gd03_overall(left, right), "km": cls._marking_km(selected),
+                           "routes": sorted({str(u.get("route") or "") for u in selected}, key=cls._route_key),
+                           "unit_count": len(selected)})
+        return sorted(result, key=lambda row: row["name"])
+
+    @classmethod
+    def marking_manager_units(cls, rows):
+        """④各管养单位比较（跨路线合并 100 m 单元）。"""
+        units = cls.marking_units(rows)
+        result = []
+        for key, selected in cls._group(units, ("manager",)).items():
+            rates = cls.marking_unit_rates(selected)
+            left = rates.get("左侧标线", {}).get("qualified_rate")
+            right = rates.get("右侧标线", {}).get("qualified_rate")
+            result.append({"manager": key[0], "left_rate": left, "right_rate": right,
+                           "overall_rate": _gd03_overall(left, right), "km": cls._marking_km(selected),
+                           "routes": sorted({str(u.get("route") or "") for u in selected}, key=cls._route_key)})
+        return sorted(result, key=lambda row: (row["overall_rate"] is None, row["overall_rate"]))
+
+    @classmethod
+    def marking_per_km(cls, rows):
+        """逐公里 100 m 单元合格率（左侧/右侧/总体）。"""
+        buckets = {}
+        for unit in cls.marking_units(rows):
+            km = int(unit["start_m"] // 1000)
+            entry = buckets.setdefault((unit.get("route"), unit.get("direction"), km), {})
+            side = cls._side_of(unit.get("marking_position"))
+            cell = entry.setdefault(side, [0, 0])
+            cell[0] += 1
+            cell[1] += 1 if unit.get("qualified") else 0
+        result = []
+        for (route, direction, km), sides in buckets.items():
+            rates = {name: (cell[1] / cell[0] if cell[0] else None) for name, cell in sides.items()}
+            result.append({"route": route, "direction": direction, "km": km,
+                           "left_rate": rates.get("左侧标线"), "right_rate": rates.get("右侧标线"),
+                           "overall_rate": _gd03_overall(rates.get("左侧标线"), rates.get("右侧标线")),
+                           "unit_count": sum(cell[0] for cell in sides.values())})
+        return sorted(result, key=lambda row: (cls._route_key(row["route"]), str(row["direction"] or ""), row["km"]))
+
+    @classmethod
+    def _marking_runs(cls, items, threshold=0.8):
+        runs, current = [], []
+        for item in items:
+            if item["overall_rate"] is not None and item["overall_rate"] < threshold:
+                current.append(item)
+            else:
+                if current:
+                    runs.append(current)
+                current = []
+        if current:
+            runs.append(current)
+        return runs
+
+    @classmethod
+    def marking_typical_segments(cls, rows, limit=3, threshold=0.8):
+        """④典型状况不佳路段：按路线/方向取低于阈值的连续公里段。"""
+        grouped = {}
+        for item in cls.marking_per_km(rows):
+            grouped.setdefault((item["route"], item["direction"]), []).append(item)
+        candidates = []
+        for (route, direction), items in grouped.items():
+            items.sort(key=lambda row: row["km"])
+            runs = cls._marking_runs(items, threshold)
+            if not runs:
+                continue
+            run = min(runs, key=lambda block: sum(i["overall_rate"] for i in block) / len(block))
+            rates = [i["overall_rate"] for i in run if i["overall_rate"] is not None]
+            lefts = [i["left_rate"] for i in run if i["left_rate"] is not None]
+            rights = [i["right_rate"] for i in run if i["right_rate"] is not None]
+            candidates.append({"route": route, "direction": direction, "km_items": run,
+                               "start_m": run[0]["km"] * 1000, "end_m": (run[-1]["km"] + 1) * 1000,
+                               "length_km": run[-1]["km"] - run[0]["km"] + 1,
+                               "average": sum(rates) / len(rates), "min_rate": min(rates), "max_rate": max(rates),
+                               "left_rate": sum(lefts) / len(lefts) if lefts else None,
+                               "right_rate": sum(rights) / len(rights) if rights else None})
+        return sorted(candidates, key=lambda row: (row["average"], -row["length_km"]))[:limit]
+
+    @classmethod
+    def marking_long_runs(cls, rows, window=30, threshold=0.8, min_windows=3):
+        """⑤⑥长连续路段（oracle 口径）：按“路线—管养单位—标线侧”取 100 m 单元序列，
+        30 个单元（3 km）滑动窗口不合格率 > 80% 的最长连续窗口段，长度 ≥ 3 km 时输出。"""
+        grouped = {}
+        for unit in cls.marking_units(rows):
+            side = cls._side_of(unit.get("marking_position"))
+            grouped.setdefault((unit.get("route"), unit.get("manager"), side), []).append(unit)
+        output = []
+        for (route, manager, side), items in grouped.items():
+            items.sort(key=lambda u: u["start_m"])
+            flags = [bool(u.get("qualified")) for u in items]
+            n = len(flags)
+            if n < window:
+                continue
+            fails = [0] * (n + 1)
+            for index, ok in enumerate(flags):
+                fails[index + 1] = fails[index] + (0 if ok else 1)
+            bad = [fails[i + window] - fails[i] > threshold * window for i in range(n - window + 1)]
+            best = cur = 0
+            best_end = 0
+            for index, value in enumerate(bad):
+                cur = cur + 1 if value else 0
+                if cur > best:
+                    best, best_end = cur, index
+            if best < min_windows:
+                continue
+            start_index = best_end - best + 1
+            fail_rates = [(fails[i + window] - fails[i]) / window for i in range(start_index, best_end + 1)]
+            output.append({"route": route, "manager": manager, "position": items[0].get("marking_position"),
+                           "position_name": side,
+                           "start_m": items[start_index]["start_m"],
+                           "end_m": items[best_end]["start_m"] + window * 100,
+                           "length_km": round(3 + (best - 1) * 0.1, 1),
+                           "fail_rate": sum(fail_rates) / len(fail_rates)})
+        return sorted(output, key=lambda row: (-row["length_km"], row["fail_rate"]))
+
+    @staticmethod
+    def height_kind_stats(rows, kind):
+        subset = [r for r in rows if _guardrail_type(r.get("guardrail_type")) == kind and _float(r.get("height")) is not None]
+        low, high = HEIGHT_LIMITS[kind]
+        qualified = sum(1 for r in subset if low <= float(r["height"]) <= high)
+        return {"count": len(subset), "qualified": qualified,
+                "rate": qualified / len(subset) if subset else None}
+
+    @classmethod
+    def height_overall(cls, rows):
+        rows = [r for r in rows if _float(r.get("height")) is not None]
+        total = len(rows)
+        qualified = 0
+        for row in rows:
+            kind = _guardrail_type(row.get("guardrail_type"))
+            if kind in HEIGHT_LIMITS:
+                low, high = HEIGHT_LIMITS[kind]
+                qualified += 1 if low <= float(row["height"]) <= high else 0
+        km = {(str(r.get("route") or ""), str(r.get("direction") or ""), int(r["station_m"] // 1000))
+              for r in rows if r.get("station_m") is not None}
+        return {"valid_count": total, "qualified_count": qualified,
+                "rate": qualified / total if total else None, "km_segments": len(km),
+                "二波": cls.height_kind_stats(rows, "二波"), "三波": cls.height_kind_stats(rows, "三波")}
+
+    @classmethod
+    def height_route_units(cls, rows):
+        """②按“路线—管养单位”合并的护栏中心高度合格率。"""
+        result = []
+        for key, selected in cls._group([r for r in rows if _float(r.get("height")) is not None], ("route", "direction", "manager")).items():
+            stats = cls.height_overall(selected)
+            result.append(dict(zip(("route", "direction", "manager"), key), **stats))
+        return sorted(result, key=lambda row: cls._route_key(row["route"]))
+
+    @classmethod
+    def height_company_units(cls, rows):
+        grouped = {}
+        for row in rows:
+            if _float(row.get("height")) is None:
+                continue
+            grouped.setdefault(split_manager_company(row.get("manager")), []).append(row)
+        result = []
+        for (parent, child), selected in grouped.items():
+            stats = cls.height_overall(selected)
+            result.append({"parent": parent or "—", "child": child or "—",
+                           "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key),
+                           "directions": sorted({str(r.get("direction") or "") for r in selected if r.get("direction")}), **stats})
+        return sorted(result, key=lambda row: (row["parent"], row["child"]))
+
+    @classmethod
+    def height_manager_units(cls, rows):
+        result = []
+        for key, selected in cls._group([r for r in rows if _float(r.get("height")) is not None], ("manager",)).items():
+            stats = cls.height_overall(selected)
+            result.append({"manager": key[0],
+                           "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key), **stats})
+        return sorted(result, key=lambda row: (row["rate"] is None, row["rate"]))
+
+    @classmethod
+    def height_road_type_units(cls, rows):
+        grouped = {}
+        for row in rows:
+            if _float(row.get("height")) is None:
+                continue
+            route = str(row.get("route") or "")
+            key = "普通国道" if route.startswith("G") else ("普通省道" if route.startswith("S") else route)
+            grouped.setdefault(key, []).append(row)
+        result = []
+        for name, selected in grouped.items():
+            stats = cls.height_overall(selected)
+            result.append({"name": name, "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key), **stats})
+        return sorted(result, key=lambda row: row["name"])
+
+    @classmethod
+    def height_per_km(cls, rows):
+        buckets = {}
+        for row in rows:
+            kind = _guardrail_type(row.get("guardrail_type"))
+            if kind not in HEIGHT_LIMITS or _float(row.get("height")) is None or row.get("station_m") is None:
+                continue
+            key = (row.get("route"), row.get("direction"), int(row["station_m"] // 1000))
+            entry = buckets.setdefault(key, [0, 0, 0])
+            low, high = HEIGHT_LIMITS[kind]
+            entry[0] += 1
+            entry[1] += 1 if low <= float(row["height"]) <= high else 0
+            entry[2] += 1 if height_deviation_over_10cm(kind, float(row["height"])) else 0
+        return [{"route": key[0], "direction": key[1], "km": key[2], "count": value[0],
+                 "rate": value[1] / value[0] if value[0] else None,
+                 "over_ratio": value[2] / value[0] if value[0] else None, "over_count": value[2]}
+                for key, value in sorted(buckets.items(), key=lambda item: (cls._route_key(item[0][0]), str(item[0][1] or ""), item[0][2]))]
+
+    @classmethod
+    def height_typical_segments(cls, rows, limit=3, threshold=0.8):
+        grouped = {}
+        for item in cls.height_per_km(rows):
+            grouped.setdefault((item["route"], item["direction"]), []).append(item)
+        candidates = []
+        for (route, direction), items in grouped.items():
+            items.sort(key=lambda row: row["km"])
+            runs, current = [], []
+            for item in items:
+                if item["rate"] is not None and item["rate"] < threshold:
+                    current.append(item)
+                else:
+                    if current:
+                        runs.append(current)
+                    current = []
+            if current:
+                runs.append(current)
+            if not runs:
+                continue
+            run = min(runs, key=lambda block: sum(i["rate"] for i in block) / len(block))
+            rates = [i["rate"] for i in run if i["rate"] is not None]
+            candidates.append({"route": route, "direction": direction, "km_items": run,
+                               "start_m": run[0]["km"] * 1000, "end_m": (run[-1]["km"] + 1) * 1000,
+                               "length_km": run[-1]["km"] - run[0]["km"] + 1,
+                               "average": sum(rates) / len(rates), "min_rate": min(rates), "max_rate": max(rates),
+                               "count": sum(i["count"] for i in run)})
+        return sorted(candidates, key=lambda row: (row["average"], -row["length_km"]))[:limit]
+
+    @classmethod
+    def height_over10_runs(cls, rows, threshold=0.05):
+        """⑤⑥整公里内（按波形梁类型）|偏差|>100 mm 占比超过阈值的连续公里段。"""
+        buckets = {}
+        for row in rows:
+            kind = _guardrail_type(row.get("guardrail_type"))
+            if kind not in HEIGHT_LIMITS or _float(row.get("height")) is None or row.get("station_m") is None:
+                continue
+            key = (row.get("route"), row.get("direction"), int(row["station_m"] // 1000), kind)
+            entry = buckets.setdefault(key, [0, 0, 0])
+            low, high = HEIGHT_LIMITS[kind]
+            entry[0] += 1
+            entry[1] += 1 if low <= float(row["height"]) <= high else 0
+            entry[2] += 1 if height_deviation_over_10cm(kind, float(row["height"])) else 0
+        grouped = {}
+        for (route, direction, km, kind), value in buckets.items():
+            grouped.setdefault((route, direction, kind), []).append(
+                {"route": route, "direction": direction, "km": km, "kind": kind, "count": value[0],
+                 "rate": value[1] / value[0] if value[0] else None,
+                 "over_ratio": value[2] / value[0] if value[0] else None, "over_count": value[2]})
+        runs = []
+        for (route, direction, kind), group in grouped.items():
+            group.sort(key=lambda row: row["km"])
+            current = []
+            for item in group:
+                if item["over_ratio"] is not None and item["over_ratio"] > threshold:
+                    current.append(item)
+                else:
+                    if current:
+                        runs.append((route, direction, kind, current))
+                    current = []
+            if current:
+                runs.append((route, direction, kind, current))
+        output = []
+        for route, direction, kind, block in runs:
+            output.append({"route": route, "direction": direction, "kind": kind, "km_items": block,
+                           "start_m": block[0]["km"] * 1000, "end_m": (block[-1]["km"] + 1) * 1000,
+                           "length_km": block[-1]["km"] - block[0]["km"] + 1,
+                           "count": sum(i["count"] for i in block),
+                           "over_count": sum(i["over_count"] for i in block),
+                           "over_ratio": sum(i["over_count"] for i in block) / sum(i["count"] for i in block),
+                           "rate": sum(i["rate"] * i["count"] for i in block if i["rate"] is not None) / sum(i["count"] for i in block)})
+        return sorted(output, key=lambda row: (-row["length_km"], row["rate"]))
+
+    @classmethod
+    def bolt_overall(cls, rows):
+        splice = sum(float(r.get("splice", 0) or 0) for r in rows)
+        splice_missing = sum(float(r.get("splice_missing", 0) or 0) for r in rows)
+        connection = sum(float(r.get("connection", 0) or 0) for r in rows)
+        connection_missing = sum(float(r.get("connection_missing", 0) or 0) for r in rows)
+        outline = sum(float(r.get("outline", 0) or 0) for r in rows)
+        splice_should = splice + splice_missing
+        conn_should = connection + connection_missing + outline
+        missing = splice_missing + connection_missing
+        total = splice_should + conn_should
+        km = {(str(r.get("route") or ""), str(r.get("direction") or ""), int(r["station_m"] // 1000))
+              for r in rows if r.get("station_m") is not None}
+        severe_splice = sum(1 for r in rows if float(r.get("splice_missing", 0) or 0)
+                            and (float(r.get("splice", 0) or 0) + float(r.get("splice_missing", 0) or 0))
+                            and float(r["splice_missing"]) / (float(r["splice"]) + float(r["splice_missing"])) > 0.5)
+        severe_conn = sum(1 for r in rows if float(r.get("connection_missing", 0) or 0)
+                          and (float(r.get("connection", 0) or 0) + float(r.get("connection_missing", 0) or 0) + float(r.get("outline", 0) or 0))
+                          and float(r["connection_missing"]) / (float(r["connection"]) + float(r["connection_missing"]) + float(r.get("outline", 0) or 0)) > 0.5)
+        return {"splice": splice, "splice_missing": splice_missing, "splice_should": splice_should,
+                "connection": connection, "connection_missing": connection_missing, "conn_should": conn_should,
+                "outline": outline, "missing": missing, "total": total,
+                "splice_rate": splice_missing / splice_should if splice_should else None,
+                "conn_rate": connection_missing / conn_should if conn_should else None,
+                "rate": missing / total if total else None, "km_segments": len(km),
+                "severe_splice_points": severe_splice, "severe_conn_points": severe_conn}
+
+    @classmethod
+    def bolt_route_units(cls, rows):
+        grouped = {}
+        for key, selected in cls._group(rows, ("route", "direction", "manager")).items():
+            unit = dict(zip(("route", "direction", "manager"), key), **cls.bolt_overall(selected))
+            sources = frozenset(str(r.get("source") or "") for r in selected)
+            grouped.setdefault(sources, []).append(unit)
+        result = []
+        for group in grouped.values():
+            if len(group) > 1:
+                # 同一检测文件按桩号拆分到多个管养单位时，单处严重缺失按文件级统计（与 oracle 一致）
+                splice_total = sum(int(r["severe_splice_points"]) for r in group)
+                conn_total = sum(int(r["severe_conn_points"]) for r in group)
+                for row in group:
+                    row["severe_splice_points"] = splice_total
+                    row["severe_conn_points"] = conn_total
+            result.extend(group)
+        return sorted(result, key=lambda row: (row["rate"] is None, row["rate"] or 0, cls._route_key(row["route"])))
+
+    @classmethod
+    def bolt_company_units(cls, rows):
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(split_manager_company(row.get("manager")), []).append(row)
+        result = []
+        for (parent, child), selected in grouped.items():
+            result.append({"parent": parent or "—", "child": child or "—",
+                           "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key),
+                           "directions": sorted({str(r.get("direction") or "") for r in selected if r.get("direction")}),
+                           **cls.bolt_overall(selected)})
+        return sorted(result, key=lambda row: (row["parent"], row["child"]))
+
+    @classmethod
+    def bolt_manager_units(cls, rows):
+        result = []
+        for key, selected in cls._group(rows, ("manager",)).items():
+            result.append({"manager": key[0],
+                           "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key),
+                           **cls.bolt_overall(selected)})
+        return sorted(result, key=lambda row: (row["rate"] is None, -(row["rate"] or 0)))
+
+    @classmethod
+    def bolt_road_type_units(cls, rows):
+        grouped = {}
+        for row in rows:
+            route = str(row.get("route") or "")
+            key = "普通国道" if route.startswith("G") else ("普通省道" if route.startswith("S") else route)
+            grouped.setdefault(key, []).append(row)
+        result = []
+        for name, selected in grouped.items():
+            result.append({"name": name, "routes": sorted({str(r.get("route") or "") for r in selected}, key=cls._route_key),
+                           **cls.bolt_overall(selected)})
+        return sorted(result, key=lambda row: row["name"])
+
+    @classmethod
+    def bolt_per_km(cls, rows):
+        buckets = {}
+        for row in rows:
+            if row.get("station_m") is None:
+                continue
+            key = (row.get("route"), row.get("direction"), int(row["station_m"] // 1000))
+            entry = buckets.setdefault(key, {"splice": 0.0, "splice_missing": 0.0, "connection": 0.0, "connection_missing": 0.0, "outline": 0.0, "missing": 0.0, "severe": 0, "count": 0})
+            splice = float(row.get("splice", 0) or 0)
+            splice_missing = float(row.get("splice_missing", 0) or 0)
+            connection = float(row.get("connection", 0) or 0)
+            connection_missing = float(row.get("connection_missing", 0) or 0)
+            outline = float(row.get("outline", 0) or 0)
+            missing = splice_missing + connection_missing
+            entry["splice"] += splice
+            entry["splice_missing"] += splice_missing
+            entry["connection"] += connection
+            entry["connection_missing"] += connection_missing
+            entry["outline"] += outline
+            entry["missing"] += missing
+            entry["count"] += 1
+            denominator = splice + splice_missing + connection + connection_missing + outline
+            if missing and denominator and missing / denominator > 0.5:
+                entry["severe"] += 1
+        result = []
+        for key, entry in buckets.items():
+            denominator = entry["splice"] + entry["splice_missing"] + entry["connection"] + entry["connection_missing"] + entry["outline"]
+            splice_should = entry["splice"] + entry["splice_missing"]
+            conn_should = entry["connection"] + entry["connection_missing"] + entry["outline"]
+            total_should = splice_should + conn_should
+            result.append({"route": key[0], "direction": key[1], "km": key[2], "splice": entry["splice"],
+                           "connection": entry["connection"], "outline": entry["outline"],
+                           "missing": entry["missing"], "severe": entry["severe"],
+                           "splice_should": splice_should, "splice_missing": entry["splice_missing"],
+                           "splice_rate": entry["splice_missing"] / splice_should if splice_should else 0.0,
+                           "conn_should": conn_should, "conn_missing": entry["connection_missing"],
+                           "conn_rate": entry["connection_missing"] / conn_should if conn_should else 0.0,
+                           "total_should": total_should, "total_missing": entry["missing"],
+                           "total_rate": entry["missing"] / total_should if total_should else 0.0,
+                           "rate": entry["missing"] / denominator if denominator else None})
+        return sorted(result, key=lambda row: (cls._route_key(row["route"]), str(row["direction"] or ""), row["km"]))
+
+    @classmethod
+    def bolt_typical_segments(cls, rows, limit=3, threshold=0.05):
+        grouped = {}
+        for item in cls.bolt_per_km(rows):
+            grouped.setdefault((item["route"], item["direction"]), []).append(item)
+        candidates = []
+        for (route, direction), items in grouped.items():
+            items.sort(key=lambda row: row["km"])
+            runs, current = [], []
+            for item in items:
+                if item["rate"] is not None and item["rate"] > threshold:
+                    current.append(item)
+                else:
+                    if current:
+                        runs.append(current)
+                    current = []
+            if current:
+                runs.append(current)
+            if not runs:
+                continue
+            run = max(runs, key=lambda block: sum(i["missing"] for i in block))
+            rates = [i["rate"] for i in run if i["rate"] is not None]
+            candidates.append({"route": route, "direction": direction, "km_items": run,
+                               "start_m": run[0]["km"] * 1000, "end_m": (run[-1]["km"] + 1) * 1000,
+                               "length_km": run[-1]["km"] - run[0]["km"] + 1,
+                               "average": sum(rates) / len(rates), "max_rate": max(rates),
+                               "missing": sum(i["missing"] for i in run),
+                               "severe": sum(i["severe"] for i in run)})
+        return sorted(candidates, key=lambda row: (-row["average"], -row["missing"]))[:limit]
+
+    @classmethod
+    def bolt_over5_runs(cls, rows, threshold=0.05):
+        grouped = {}
+        for item in cls.bolt_per_km(rows):
+            grouped.setdefault((item["route"], item["direction"]), []).append(item)
+        output = []
+        for (route, direction), items in grouped.items():
+            items.sort(key=lambda row: row["km"])
+            current = []
+            for item in items:
+                if item["rate"] is not None and item["rate"] > threshold:
+                    current.append(item)
+                else:
+                    if current:
+                        output.append((route, direction, current))
+                    current = []
+            if current:
+                output.append((route, direction, current))
+        return [{"route": route, "direction": direction, "km_items": block,
+                 "start_m": block[0]["km"] * 1000, "end_m": (block[-1]["km"] + 1) * 1000,
+                 "length_km": block[-1]["km"] - block[0]["km"] + 1,
+                 "missing": sum(i["missing"] for i in block), "severe": sum(i["severe"] for i in block),
+                 "rate": sum(i["missing"] for i in block) / (sum(i["splice"] + i["splice_missing"] + i["connection"] + i["conn_missing"] + i["outline"] for i in block) or 1)}
+                for route, direction, block in output]
+
+    @classmethod
+    def bolt_severe_clusters(cls, rows, min_points=3, gap_m=20):
+        """单处严重缺失（单立柱缺失率>50%）连续出现 ≥3 处的公里段。"""
+        buckets = {}
+        for row in rows:
+            if row.get("station_m") is None:
+                continue
+            splice = float(row.get("splice", 0) or 0)
+            connection = float(row.get("connection", 0) or 0)
+            missing = float(row.get("splice_missing", 0) or 0) + float(row.get("connection_missing", 0) or 0)
+            denominator = splice + connection + missing
+            if not missing or not denominator or missing / denominator <= 0.5:
+                continue
+            key = (row.get("route"), row.get("direction"), int(row["station_m"] // 1000))
+            buckets.setdefault(key, []).append(float(row["station_m"]))
+        output = []
+        for (route, direction, km), stations in buckets.items():
+            stations.sort()
+            current = [stations[0]]
+            for station in stations[1:]:
+                if station - current[-1] <= gap_m:
+                    current.append(station)
+                else:
+                    if len(current) >= min_points:
+                        output.append({"route": route, "direction": direction, "km": km, "points": len(current),
+                                       "start_m": current[0], "end_m": current[-1]})
+                    current = [station]
+            if len(current) >= min_points:
+                output.append({"route": route, "direction": direction, "km": km, "points": len(current),
+                               "start_m": current[0], "end_m": current[-1]})
+        return sorted(output, key=lambda row: (cls._route_key(row["route"]), str(row["direction"] or ""), row["km"]))
+
+    @classmethod
+    def fill_managers(cls, marking_rows, *collections):
+        """用标线数据按（路线、方向、公里）为护栏/螺栓记录补齐管养单位。"""
+        lookup = {}
+        for row in marking_rows:
+            manager = row.get("manager")
+            if not manager or row.get("station_m") is None:
+                continue
+            key = (str(row.get("route") or ""), str(row.get("direction") or ""), int(row["station_m"] // 1000))
+            lookup.setdefault(key, manager)
+        # 标线未覆盖的公里（如文件末行 K3144+000）取同路线同方向最近的公里映射，避免边界行丢失管养单位
+        km_index = {}
+        for route, direction, km in lookup:
+            km_index.setdefault((route, direction), []).append(km)
+        for kms in km_index.values():
+            kms.sort()
+        for rows in collections:
+            for row in rows:
+                if row.get("manager") or row.get("station_m") is None:
+                    continue
+                route = str(row.get("route") or "")
+                direction = str(row.get("direction") or "")
+                km = int(row["station_m"] // 1000)
+                manager = lookup.get((route, direction, km))
+                if not manager:
+                    candidates = km_index.get((route, direction))
+                    if candidates:
+                        manager = lookup[(route, direction, min(candidates, key=lambda item: (abs(item - km), item)))]
+                row["manager"] = manager or ""
+        return lookup
+
+
 class ManualAutoComparator:
     def __init__(self, thresholds): self.thresholds = thresholds
 
@@ -3497,6 +4173,8 @@ class ManualAutoComparator:
     def read_file(path):
         wb=openpyxl.load_workbook(path,read_only=True,data_only=True)
         records=[]; issues=[]
+        name=Path(path).name
+        source="正式检测后" if "进场后" in name else ("进场前" if "进场前" in name else "")
         for ws in wb.worksheets:
             title=ws.title
             rows=list(ws.iter_rows(values_only=True))
@@ -3523,36 +4201,53 @@ class ManualAutoComparator:
                          "position":str(_first(row,"护栏位置","标线位置",default="") or "").strip(),
                          "remark":str(_first(row,"备注",default="") or "").strip()}
                 if indicator=="bolt":
-                    manual=(_float(values[7]) or 0)+(_float(values[8]) or 0) if len(values)>10 else None
-                    automatic=(_float(values[9]) or 0)+(_float(values[10]) or 0) if len(values)>10 else None
-                    display.update(msplice=_float(values[7]),mconn=_float(values[8]),asplice=_float(values[9]),aconn=_float(values[10]))
+                    manual=(_float(values[6]) or 0)+(_float(values[7]) or 0) if len(values)>9 else None
+                    automatic=(_float(values[8]) or 0)+(_float(values[9]) or 0) if len(values)>9 else None
+                    display.update(msplice=_float(values[6]),mconn=_float(values[7]),asplice=_float(values[8]),aconn=_float(values[9]))
                 elif indicator=="height":
-                    manual=_float(_first(row,"人工复核护栏中心平均高度mm","人工护栏中心高度","人工值")); automatic=_float(_first(row,"自动化护栏中心高度mm","自动化护栏中心高度","自动化值"))
+                    manual=_float(_first(row,"人工复核护栏中心平均高度mm","人工护栏中心高度","人工值"))
+                    automatic=_float(_first(row,"自动化护栏中心高度mm标注修正桩号匹配","自动化护栏中心高度标注修正桩号匹配","自动化护栏中心高度mm电子修正桩号匹配","自动化护栏中心高度mm","自动化护栏中心高度","自动化值"))
                 else:
                     manual=_float(_first(row,"人工逆反射亮度系数平均值","人工值")); automatic=_float(_first(row,"自动化逆反射亮度系数平均值","自动化值"))
                 if not city or not route or manual is None or automatic is None:
                     issues.append(f"{Path(path).name}/{title}/第{row_index}行：人工对比记录字段缺失或非数值"); continue
-                records.append({"indicator":indicator,"city":str(city).strip(),"route":_route(route),"direction":str(direction or ""),"segment":str(segment or ""),"manual":manual,"automatic":automatic,**display})
+                records.append({"indicator":indicator,"city":str(city).strip(),"route":_route(route),"direction":str(direction or ""),"segment":str(segment or ""),"source":source,"manual":manual,"automatic":automatic,**display})
         wb.close(); return records,issues
 
     @staticmethod
     def summarize(detail):
         """按指标汇总人工/自动化对比明细（可传入按道路类别过滤后的明细）。
-        标线、螺栓缺失使用相对偏差(%)；护栏中心高度使用绝对偏差(mm)。"""
+        标线、螺栓缺失使用相对偏差(%)；护栏中心高度使用绝对偏差(mm)。
+        除原有 min/max/average/consistency_rate 外，附加带符号偏差、MAE、落控与方向计数。"""
         summary={}
         for indicator in ("marking","height","bolt"):
             selected=[x for x in detail if x.get("indicator")==indicator]
             if indicator=="height":
                 computable=[x for x in selected if x.get("absolute_difference") is not None]
-                metric="absolute_difference"
+                metric="absolute_difference"; signed_metric="signed_difference"
             else:
                 computable=[x for x in selected if x.get("relative_deviation") is not None]
-                metric="relative_deviation"
+                metric="relative_deviation"; signed_metric="signed_relative_deviation"
             deviations=[x[metric] for x in computable]; within=sum(bool(x.get("within_threshold")) for x in computable)
+            signed=[x[signed_metric] for x in computable if x.get(signed_metric) is not None]
+            diffs=[x["signed_difference"] for x in computable if x.get("signed_difference") is not None]
+            rels=[x["signed_relative_deviation"] for x in computable if x.get("signed_relative_deviation") is not None]
+            abs_signed=[abs(value) for value in signed]
             summary[indicator]={"paired_count":len(selected),"computable_count":len(computable),"min":min(deviations) if deviations else None,
                 "max":max(deviations) if deviations else None,"average":sum(deviations)/len(deviations) if deviations else None,
                 "within_count":within,"consistency_rate":within/len(computable) if computable else None,
-                "zero_manual_count":sum(x.get("relative_deviation") is None for x in selected)}
+                "zero_manual_count":sum(x.get("relative_deviation") is None for x in selected),
+                "diff_min":min(diffs) if diffs else None,"diff_max":max(diffs) if diffs else None,
+                "diff_average":sum(diffs)/len(diffs) if diffs else None,
+                "rel_min":min(rels) if rels else None,"rel_max":max(rels) if rels else None,
+                "rel_average":sum(rels)/len(rels) if rels else None,
+                "mae":sum(abs_signed)/len(abs_signed) if abs_signed else (sum(deviations)/len(deviations) if deviations else None),
+                "mae_relative":sum(abs(value) for value in rels)/len(rels) if rels else None,
+                "within5_count":sum(1 for value in abs_signed if value<=5),
+                "within10_count":sum(1 for value in abs_signed if value<=10),
+                "high_count":sum(1 for value in signed if value>0),
+                "low_count":sum(1 for value in signed if value<0),
+                "zero_count":sum(1 for value in signed if value==0)}
         return summary
 
     def compare(self, records):
@@ -3562,6 +4257,8 @@ class ManualAutoComparator:
             if manual is None or automatic is None: continue
             item["absolute_difference"]=abs(automatic-manual)
             item["relative_deviation"]=None if manual == 0 else abs(automatic-manual)/abs(manual)*100
+            item["signed_difference"]=automatic-manual
+            item["signed_relative_deviation"]=None if manual == 0 else (automatic-manual)/abs(manual)*100
             indicator=item["indicator"]; threshold=self.thresholds[indicator]
             if indicator=="height":
                 # 护栏中心高度：使用绝对偏差(mm)判断，不使用百分比
@@ -3853,6 +4550,796 @@ class GuangdongChapterWriter:
         cls._apply_heading_format(paragraph, level)
         return paragraph
 
+    # ==================== GD03 四段式章节渲染（brief-gd03 §1–§2） ====================
+
+    @staticmethod
+    def _g03_rate(value, digits=1):
+        return "—" if value is None else f"{value * 100:.{digits}f}%"
+
+    @staticmethod
+    def _g03_num(value, digits=1):
+        return "—" if value is None else f"{value * 100:.{digits}f}"
+
+    @staticmethod
+    def _g03_int(value):
+        return f"{int(round(float(value or 0))):,}"
+
+    @staticmethod
+    def _gd03_range(start_m, end_m):
+        if start_m is None or end_m is None:
+            return "—"
+        return f"{format_station(start_m)}～{format_station(end_m)}"
+
+    @staticmethod
+    def _marking_route_ranges(rows):
+        """按路线聚合标线桩号范围（供普通国省道③④“检测范围”列）。"""
+        spans = {}
+        for row in rows:
+            station = _float(row.get("station_m"))
+            if station is None:
+                continue
+            key = str(row.get("route") or "")
+            end = _float(row.get("end_m"))
+            high = end if end is not None else station
+            low, top = spans.get(key, (station, station))
+            spans[key] = (min(low, station), max(top, high))
+        return {key: f"{key}：{format_station(low)}～{format_station(high)}" for key, (low, high) in spans.items()}
+
+    @staticmethod
+    def _manager_for_km(rows, run, city=""):
+        """⑤/⑥清单表“管养单位”列：按清单首公里从明细行回查。"""
+        km = int(run["start_m"] // 1000)
+        for row in rows:
+            if (row.get("route") == run["route"] and row.get("direction") == run["direction"]
+                    and row.get("station_m") is not None and int(row["station_m"] // 1000) == km
+                    and row.get("manager")):
+                return manager_display(row.get("manager"), city)
+        return "—"
+
+    @classmethod
+    def _g03_chart(cls, base, prefix, key, categories, series, ylabel="合格率（%）", kind="bar", rotation=0, value_fmt="%.1f", ylim=None, horizontal=False, scale=100.0):
+        path = Path(base) / f"{prefix}gd03_{key}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        builder = gd03_bar_chart if kind == "bar" else gd03_line_chart
+        kwargs = dict(ylabel=ylabel, rotation=rotation, value_fmt=value_fmt)
+        if ylim is not None:
+            kwargs["ylim"] = ylim
+        if horizontal:
+            kwargs["horizontal"] = True
+        # 口径统一：合格率/缺失率传入的是 0–1 比率，默认换算为百分数（与附件图表单位一致）；计数类传 scale=1。
+        percent_series = [(name, [None if value is None else value * scale + 0.0 for value in values], color)
+                          for name, values, color in series]
+        try:
+            builder(str(path), categories, percent_series, **kwargs)
+        except Exception:
+            return None
+        return str(path)
+
+    @classmethod
+    def _marking_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city=""):
+        heading = lambda text: cls._heading(doc, text, 5)
+        units = GuangdongStatistics.marking_units(rows)
+        if not units:
+            heading("①总体情况")
+            cls._body(doc, f"本次未读取到{category}标线逆反射亮度系数有效检测数据，该指标暂不评价。")
+            return
+        overall = GuangdongStatistics.marking_overall(units)
+        route_units = GuangdongStatistics.marking_route_units(rows)
+        km_total = sum(row["km"] for row in route_units)
+
+        heading("①总体情况")
+        cls._body(doc, f"本次对{category}{len(route_units)}个“路线—管养单位”检测单元、共{km_total:.2f}公里标线逆反射亮度系数开展检测，"
+                       f"按每侧每5条20米记录取平均值形成100米计算单元，共获得左侧{overall['left_units']:,}个、右侧{overall['right_units']:,}个有效计算单元。"
+                       f"检测结果显示，左侧标线合格率{cls._g03_rate(overall['left_rate'])}，右侧标线合格率{cls._g03_rate(overall['right_rate'])}，"
+                       f"总体合格率{cls._g03_rate(overall['overall_rate'])}。")
+
+        heading("②各路线标线状况")
+        if category == "高速公路":
+            headers = ["路线编号", "二级公司", "管养公司", "检测范围", "检测里程(km)", "左侧合格率(%)", "右侧合格率(%)", "总体合格率(%)"]
+            body = [[row["route"], split_manager_company(row.get("manager"))[0] or "—", manager_display(row.get("manager"), city),
+                     cls._gd03_range(row.get("start_m"), row.get("end_m")), f"{row['km']:.2f}",
+                     cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"]), cls._g03_num(row["overall_rate"])]
+                    for row in route_units]
+        else:
+            headers = ["路线编号", "管养单位", "检测范围", "检测里程(km)", "左侧合格率(%)", "右侧合格率(%)", "总体合格率(%)"]
+            body = [[row["route"], manager_display(row.get("manager"), city),
+                     cls._gd03_range(row.get("start_m"), row.get("end_m")), f"{row['km']:.2f}",
+                     cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"]), cls._g03_num(row["overall_rate"])]
+                    for row in route_units]
+        table(headers, body, f"{category}各路线—管养单位标线逆反射亮度系数合格率汇总表")
+        categories = [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units]
+        chart = cls._g03_chart(base, chart_prefix, f"marking_route_{category}",
+                               categories,
+                               [("左侧标线", [row["left_rate"] for row in route_units], GD03_COLORS[0]),
+                                ("右侧标线", [row["right_rate"] for row in route_units], GD03_COLORS[1]),
+                                ("总体", [row["overall_rate"] for row in route_units], GD03_COLORS[2])])
+        if chart:
+            figure(chart, f"高速公路各路线（管养单位）标线逆反射亮度系数合格率对比图" if category == "高速公路"
+                   else "普通国省道各路线标线逆反射亮度系数合格率对比图")
+
+        if category == "高速公路":
+            heading("③不同管理单位对比分析")
+            companies = GuangdongStatistics.marking_company_units(rows)
+            table(["母公司", "二级管养公司", "管辖路线", "检测里程(km)", "左侧合格率(%)", "右侧合格率(%)", "总体合格率(%)"],
+                  [[row["parent"], row["child"], "、".join(row["routes"]), f"{row['km']:.2f}",
+                    cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"]), cls._g03_num(row["overall_rate"])]
+                   for row in companies],
+                  "高速公路各母公司标线逆反射亮度系数合格率汇总表")
+            table(["排名", "母公司", "路段公司", "管辖路线", "总体合格率(%)"],
+                  [[index, row["parent"], row["child"], "、".join(row["routes"]), cls._g03_num(row["overall_rate"])]
+                   for index, row in enumerate(sorted(companies, key=lambda item: -(item["overall_rate"] or 0)), 1)],
+                  "高速公路各路段公司总体合格率排名表")
+            heading("④典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.marking_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到标线合格率明显偏低的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段标线100米计算单元总体合格率均值{cls._g03_rate(item['average'])}，"
+                               f"其中左侧{cls._g03_rate(item['left_rate'])}、右侧{cls._g03_rate(item['right_rate'])}，"
+                               f"最低单公里合格率{cls._g03_rate(item['min_rate'])}，最高{cls._g03_rate(item['max_rate'])}。")
+                cls._body(doc, "原因分析：该路段标线逆反射亮度系数偏低，主要受路面标线自然磨耗、车辆轮迹带污染、"
+                               "重载交通渠化作用及标线施划年限较长等因素影响，需现场复核标线磨损与污染状况。")
+                chart = cls._g03_chart(base, chart_prefix, f"marking_km_{item['route']}_{item['direction']}",
+                                       [f"{row['km']}" for row in item["km_items"]],
+                                       [("左侧标线", [row["left_rate"] for row in item["km_items"]], GD03_COLORS[0]),
+                                        ("右侧标线", [row["right_rate"] for row in item["km_items"]], GD03_COLORS[1]),
+                                        ("总体", [row["overall_rate"] for row in item["km_items"]], GD03_COLORS[2])],
+                                       kind="line")
+                if chart:
+                    figure(chart, f"{item['route']}{item['direction']}典型状况不佳路段标线合格率分布图")
+            heading("⑤逆反射系数性能不佳长连续路段梳理")
+            runs = GuangdongStatistics.marking_long_runs(rows)
+            if runs:
+                table(["路线", "管养单位", "标线侧", "起止桩号", "长度（km）", "3 km窗口不合格率（%）"],
+                      [[row["route"], manager_display(row.get("manager"), city), row["position_name"],
+                        cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.2f}", cls._g03_num(row["fail_rate"])]
+                       for row in runs],
+                      "高速公路标线长连续不合格路段清单")
+                cls._body(doc, f"共识别长连续不合格路段{len(runs)}处，最长{max(row['length_km'] for row in runs):.2f}公里，"
+                               "建议纳入现场复核与处治计划。")
+            else:
+                cls._body(doc, "未识别到100米基准下3公里窗口不合格率超过80%的长连续路段。")
+            if runs:
+                chart = cls._g03_chart(base, chart_prefix, "marking_runs",
+                                       [f"{row['route']}{row['position_name']}" for row in runs],
+                                       [("3 km窗口不合格率", [row["fail_rate"] for row in runs], GD03_COLORS[0])],
+                                       ylabel="不合格率（%）")
+                if chart:
+                    figure(chart, "高速公路逆反射系数性能不佳长连续路段分布图")
+        else:
+            heading("③普通国道与普通省道对比分析")
+            road_types = GuangdongStatistics.marking_road_type_units(rows)
+            ranges = cls._marking_route_ranges(rows)
+            table(["路线类型", "左侧合格率(%)", "右侧合格率(%)", "总体合格率(%)", "检测范围", "检测里程(km)"],
+                  [[row["name"], cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"]),
+                    cls._g03_num(row["overall_rate"]), "；".join(ranges.get(r, r) for r in row["routes"]),
+                    f"{row['km']:.2f}"] for row in road_types],
+                  "普通国道与普通省道标线逆反射亮度系数合格率对比表")
+            heading("④各管养单位比较")
+            managers = GuangdongStatistics.marking_manager_units(rows)
+            table(["管养单位", "管辖路线", "检测范围", "检测里程(km)", "左侧合格率(%)", "右侧合格率(%)", "总体合格率(%)"],
+                  [[manager_display(row.get("manager"), city), "、".join(row["routes"]),
+                    "；".join(ranges.get(r, r) for r in row["routes"]), f"{row['km']:.2f}",
+                    cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"]), cls._g03_num(row["overall_rate"])]
+                   for row in managers],
+                  "普通国省道各管养单位标线逆反射亮度系数合格率比较表")
+            heading("⑤典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.marking_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到标线合格率明显偏低的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段标线100米计算单元总体合格率均值{cls._g03_rate(item['average'])}，"
+                               f"其中左侧{cls._g03_rate(item['left_rate'])}、右侧{cls._g03_rate(item['right_rate'])}。")
+                cls._body(doc, "原因分析：标线逆反射亮度系数偏低主要与标线磨耗、污染及施划年限有关，建议现场复核。")
+            heading("⑥逆反射系数性能不佳长连续路段梳理")
+            runs = GuangdongStatistics.marking_long_runs(rows)
+            if runs:
+                table(["路线", "管养单位", "标线侧", "起止桩号", "长度（km）", "3 km窗口不合格率（%）"],
+                      [[row["route"], manager_display(row.get("manager"), city), row["position_name"],
+                        cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.2f}", cls._g03_num(row["fail_rate"])]
+                       for row in runs],
+                      "普通国省道标线长连续不合格路段清单")
+            else:
+                cls._body(doc, "未识别到100米基准下3公里窗口不合格率超过80%的长连续路段。")
+            if runs:
+                chart = cls._g03_chart(base, chart_prefix, "marking_runs",
+                                       [f"{row['route']}{row['position_name']}" for row in runs],
+                                       [("3 km窗口不合格率", [row["fail_rate"] for row in runs], GD03_COLORS[0])],
+                                       ylabel="不合格率（%）")
+                if chart:
+                    figure(chart, "普通国省道逆反射系数性能不佳长连续路段分布图")
+
+    @classmethod
+    def _height_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city=""):
+        heading = lambda text: cls._heading(doc, text, 5)
+        if not [row for row in rows if _float(row.get("height")) is not None]:
+            heading("①总体情况")
+            cls._body(doc, f"本次未读取到{category}波形梁护栏中心高度有效检测数据，该指标暂不评价。")
+            return
+        stats = GuangdongStatistics.height_overall(rows)
+        route_units = GuangdongStatistics.height_route_units(rows)
+        heading("①总体情况")
+        cls._body(doc, f"本次对{category}波形梁护栏中心高度开展检测，共获得有效检测点{stats['valid_count']:,}个，"
+                       f"覆盖整公里检测段{stats['km_segments']:,}个。其中二波护栏{stats['二波']['count']:,}个有效点、合格率{cls._g03_rate(stats['二波']['rate'])}，"
+                       f"三波护栏{stats['三波']['count']:,}个有效点、合格率{cls._g03_rate(stats['三波']['rate'])}，"
+                       f"总体合格率{cls._g03_rate(stats['rate'])}。合格判定标准为中心高度位于标准值±20 mm范围内（二波580～620 mm、三波677～717 mm）。")
+
+        heading("②各路线波形梁护栏中心高度情况")
+        headers = ["路线编号", "方向", "管养单位", "公里段数", "两波检测点", "两波合格率", "三波检测点", "三波合格率", "总检测点", "总体合格率"]
+        table(headers,
+              [[row["route"], row.get("direction") or "—", manager_display(row.get("manager"), city), f"{row['km_segments']:,}",
+                f"{row['二波']['count']:,}" if row["二波"]["count"] else "—", cls._g03_rate(row["二波"]["rate"]),
+                f"{row['三波']['count']:,}" if row["三波"]["count"] else "—", cls._g03_rate(row["三波"]["rate"]),
+                f"{row['valid_count']:,}", cls._g03_rate(row["rate"])] for row in route_units],
+              f"{category}各路线—管养单位波形梁护栏中心高度合格率汇总表")
+        chart = cls._g03_chart(base, chart_prefix, f"height_route_{category}",
+                               [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units],
+                               [("二波护栏", [row["二波"]["rate"] for row in route_units], GD03_COLORS[0]),
+                                ("三波护栏", [row["三波"]["rate"] for row in route_units], GD03_COLORS[1]),
+                                ("总体", [row["rate"] for row in route_units], GD03_COLORS[2])])
+        if chart:
+            figure(chart, f"{category}各路线波形梁护栏中心高度合格率对比图")
+
+        if category == "高速公路":
+            heading("③不同管理单位对比分析")
+            companies = GuangdongStatistics.height_company_units(rows)
+            table(["母公司", "二级管养公司", "管辖路线", "公里段数", "两波检测点", "两波合格率", "三波检测点", "三波合格率", "总检测点", "总体合格率"],
+                  [[row["parent"], row["child"], "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    f"{row['二波']['count']:,}" if row["二波"]["count"] else "—", cls._g03_rate(row["二波"]["rate"]),
+                    f"{row['三波']['count']:,}" if row["三波"]["count"] else "—", cls._g03_rate(row["三波"]["rate"]),
+                    f"{row['valid_count']:,}", cls._g03_rate(row["rate"])]
+                   for row in companies],
+                  "高速公路各二级管养公司波形梁护栏中心高度合格率汇总表")
+            table(["排名", "母公司", "路段公司", "路线", "方向", "公里段数", "总体合格率"],
+                  [[index, row["parent"], row["child"], "、".join(row["routes"]), "、".join(row.get("directions") or []),
+                    f"{row['km_segments']:,}", cls._g03_rate(row["rate"])]
+                   for index, row in enumerate(sorted(companies, key=lambda item: -(item["rate"] or 0)), 1)],
+                  "高速公路各路段公司波形梁护栏中心高度合格率排名表")
+            heading("④典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.height_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到波形梁护栏中心高度合格率明显偏低的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段波形梁护栏中心高度合格率均值{cls._g03_rate(item['average'])}，"
+                               f"最低单公里合格率{cls._g03_rate(item['min_rate'])}，有效检测点{item['count']:,}个。")
+                cls._body(doc, "原因分析：护栏中心高度偏差主要受路面加铺、路缘石抬高、路基沉陷及立柱埋深不足等因素影响，"
+                               "建议结合路面结构与立柱埋深现场核查后实施抬升、调整或更换。")
+            heading("⑤护栏中心高度不佳长连续路段梳理")
+            runs = GuangdongStatistics.height_over10_runs(rows)
+            if runs:
+                table(["序号", "路线", "方向", "管养单位", "公里区间", "长度（km）", "波形梁类型", "检测点数（个）", "超10cm占比（%）"],
+                      [[index, row["route"], row["direction"], cls._manager_for_km(rows, row, city),
+                        cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.0f}",
+                        row["kind"], f"{row['count']:,}", cls._g03_num(row["over_ratio"])]
+                       for index, row in enumerate(runs, 1)],
+                      "高速公路波形梁护栏中心高度偏差超过10 cm长连续路段清单")
+            else:
+                cls._body(doc, "未识别到整公里偏差超过10 cm占比大于5%的长连续路段。")
+            per_km = [row for row in GuangdongStatistics.height_per_km(rows) if row["rate"] is not None]
+            lowest = sorted(per_km, key=lambda row: row["rate"])[:10]
+            if lowest:
+                chart = cls._g03_chart(base, chart_prefix, f"height_km_lowest_{category}",
+                                       [f"{row['route']}{row['direction']} K{row['km']:04d}" for row in lowest],
+                                       [("总体合格率", [row["rate"] for row in lowest], GD03_COLORS[0])],
+                                       horizontal=True)
+                if chart:
+                    figure(chart, "高速公路波形梁护栏中心高度合格率最低公里段分布图")
+        else:
+            heading("③各地市、普通国道与普通省道对比分析")
+            road_types = GuangdongStatistics.height_road_type_units(rows)
+            table(["道路类别", "涉及路线", "公里段数", "两波检测点", "两波合格率", "三波检测点", "三波合格率", "总检测点", "总体合格率"],
+                  [[row["name"], "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    f"{row['二波']['count']:,}" if row["二波"]["count"] else "—", cls._g03_rate(row["二波"]["rate"]),
+                    f"{row['三波']['count']:,}" if row["三波"]["count"] else "—", cls._g03_rate(row["三波"]["rate"]),
+                    f"{row['valid_count']:,}", cls._g03_rate(row["rate"])] for row in road_types],
+                  "普通国道与普通省道波形梁护栏中心高度合格率对比表")
+            heading("④各管养单位比较")
+            managers = GuangdongStatistics.height_manager_units(rows)
+            table(["管养单位", "管辖路线", "公里段数", "两波检测点", "两波合格率", "三波检测点", "三波合格率", "总检测点", "总体合格率"],
+                  [[manager_display(row.get("manager"), city), "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    f"{row['二波']['count']:,}" if row["二波"]["count"] else "—", cls._g03_rate(row["二波"]["rate"]),
+                    f"{row['三波']['count']:,}" if row["三波"]["count"] else "—", cls._g03_rate(row["三波"]["rate"]),
+                    f"{row['valid_count']:,}", cls._g03_rate(row["rate"])] for row in managers],
+                  "普通国省道各管养单位波形梁护栏中心高度合格率比较表")
+            heading("⑤典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.height_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到波形梁护栏中心高度合格率明显偏低的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段波形梁护栏中心高度合格率均值{cls._g03_rate(item['average'])}，"
+                               f"最低单公里合格率{cls._g03_rate(item['min_rate'])}。")
+                cls._body(doc, "原因分析：护栏中心高度偏差与路面加铺、路缘石及立柱埋深等因素有关，建议现场核查。")
+            heading("⑥波形梁护栏中心高度不佳长连续路段梳理")
+            runs = GuangdongStatistics.height_over10_runs(rows)
+            if runs:
+                table(["序号", "路线", "方向", "管养单位", "公里区间", "长度（km）", "波形梁类型", "检测点数（个）", "超10cm占比（%）"],
+                      [[index, row["route"], row["direction"], cls._manager_for_km(rows, row, city),
+                        cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.0f}",
+                        row["kind"], f"{row['count']:,}", cls._g03_num(row["over_ratio"])]
+                       for index, row in enumerate(runs, 1)],
+                      "普通国省道波形梁护栏中心高度偏差超过10 cm长连续路段清单")
+            else:
+                cls._body(doc, "未识别到整公里偏差超过10 cm占比大于5%的长连续路段。")
+            per_km = [row for row in GuangdongStatistics.height_per_km(rows) if row["rate"] is not None]
+            lowest = sorted(per_km, key=lambda row: row["rate"])[:10]
+            if lowest:
+                chart = cls._g03_chart(base, chart_prefix, f"height_km_lowest_{category}",
+                                       [f"{row['route']}{row['direction']} K{row['km']:04d}" for row in lowest],
+                                       [("总体合格率", [row["rate"] for row in lowest], GD03_COLORS[0])],
+                                       horizontal=True)
+                if chart:
+                    figure(chart, "普通国省道波形梁护栏中心高度合格率最低公里段分布图")
+
+    @classmethod
+    def _bolt_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city=""):
+        heading = lambda text: cls._heading(doc, text, 5)
+        if not rows:
+            heading("①总体情况")
+            cls._body(doc, f"本次未读取到{category}波形梁护栏螺栓有效检测数据，该指标暂不评价。")
+            return
+        stats = GuangdongStatistics.bolt_overall(rows)
+        route_units = GuangdongStatistics.bolt_route_units(rows)
+        heading("①总体情况")
+        cls._body(doc, f"本次对{category}波形梁护栏螺栓缺失情况开展检测，共检测螺栓{cls._g03_int(stats['total'])}颗（应安装数量），"
+                       f"其中拼接螺栓{cls._g03_int(stats['splice_should'])}颗、连接螺栓{cls._g03_int(stats['conn_should'])}颗"
+                       f"（连接应安装数量含轮廓标{cls._g03_int(stats['outline'])}个），"
+                       f"检出缺失螺栓{cls._g03_int(stats['missing'])}颗，缺失率为{cls._g03_rate(stats['rate'], 2)}。"
+                       f"缺失率按缺失数量占应安装数量（现有数量与缺失数量之和）的比例计算。")
+
+        heading("②各路线—管养单位螺栓缺失情况" if category == "高速公路" else "②各路线螺栓缺失情况")
+        table(["路线编号", "方向", "管养单位", "公里段数", "拼接应安装", "拼接缺失", "拼接缺失率", "连接应安装", "连接缺失", "连接缺失率", "螺栓应安装总数", "螺栓缺失总数", "总体缺失率"],
+              [[row["route"], row.get("direction") or "—", manager_display(row.get("manager"), city), f"{row['km_segments']:,}",
+                cls._g03_int(row["splice_should"]), cls._g03_int(row["splice_missing"]), cls._g03_rate(row["splice_rate"], 2),
+                cls._g03_int(row["conn_should"]), cls._g03_int(row["connection_missing"]), cls._g03_rate(row["conn_rate"], 2),
+                cls._g03_int(row["total"]), cls._g03_int(row["missing"]), cls._g03_rate(row["rate"], 2)] for row in route_units],
+              f"{category}各路线—管养单位螺栓缺失率汇总表")
+        chart = cls._g03_chart(base, chart_prefix, f"bolt_route_{category}",
+                               [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units],
+                               [("拼接", [row["splice_rate"] for row in route_units], GD03_COLORS[0]),
+                                ("连接", [row["conn_rate"] for row in route_units], GD03_COLORS[1]),
+                                ("总体", [row["rate"] for row in route_units], GD03_COLORS[2])],
+                               ylabel="螺栓缺失率（%）", ylim=(0, max(10.0, max((row["rate"] or 0) * 100 * 1.1 for row in route_units))), value_fmt="%.2f")
+        if chart:
+            figure(chart, f"{category}各路线波形梁护栏螺栓缺失率对比图")
+
+        if category == "高速公路":
+            heading("③不同管理单位对比分析")
+            companies = GuangdongStatistics.bolt_company_units(rows)
+            table(["母公司", "二级管养公司", "管辖路线", "公里段数", "拼接应安装", "拼接缺失", "拼接缺失率", "连接应安装", "连接缺失", "连接缺失率", "螺栓应安装总数", "螺栓缺失总数", "总体缺失率"],
+                  [[row["parent"], row["child"], "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    cls._g03_int(row["splice_should"]), cls._g03_int(row["splice_missing"]), cls._g03_rate(row["splice_rate"], 2),
+                    cls._g03_int(row["conn_should"]), cls._g03_int(row["connection_missing"]), cls._g03_rate(row["conn_rate"], 2),
+                    cls._g03_int(row["total"]), cls._g03_int(row["missing"]), cls._g03_rate(row["rate"], 2)] for row in companies],
+                  "高速公路各二级管养公司螺栓缺失率汇总表")
+            table(["排名", "母公司", "路段公司", "路线", "方向", "公里段数", "总体缺失率"],
+                  [[index, row["parent"], row["child"], "、".join(row["routes"]), "、".join(row.get("directions") or []),
+                    f"{row['km_segments']:,}", cls._g03_rate(row["rate"], 2)]
+                   for index, row in enumerate(sorted(companies, key=lambda item: -(item["rate"] or 0)), 1)],
+                  "高速公路各路段公司螺栓缺失率排名表")
+            heading("④典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.bolt_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到螺栓缺失率明显偏高的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段螺栓缺失率均值{cls._g03_rate(item['average'], 2)}，最高单公里缺失率{cls._g03_rate(item['max_rate'], 2)}，"
+                               f"缺失螺栓{cls._g03_int(item['missing'])}颗，单处严重缺失{cls._g03_int(item['severe'])}处。")
+                cls._body(doc, "原因分析：螺栓缺失多与交通荷载振动、施工遗留、养护更换不及时及连接件锈蚀有关，"
+                               "缺失会削弱护栏整体连接强度，建议优先补齐并检查梁板搭接与连接件状态。")
+            heading("⑤螺栓缺失不佳长连续路段梳理")
+            clusters = GuangdongStatistics.bolt_severe_clusters(rows)
+            runs = GuangdongStatistics.bolt_over5_runs(rows)
+            if clusters:
+                table(["路线", "方向", "公里段", "连续严重缺失处数", "起止桩号"],
+                      [[row["route"], row["direction"], f"K{row['km']:04d}", row["points"],
+                        cls._gd03_range(row["start_m"], row["end_m"])] for row in clusters],
+                      "高速公路单处严重缺失连续出现路段清单")
+            if runs:
+                table(["路线", "方向", "起止桩号", "长度（km）", "缺失数量（颗）", "单处严重缺失（处）", "缺失率（%）"],
+                      [[row["route"], row["direction"], cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.0f}",
+                        cls._g03_int(row["missing"]), row["severe"], cls._g03_num(row["rate"], 2)] for row in runs],
+                      "高速公路整公里螺栓缺失率超过5%路段清单")
+            if not clusters and not runs:
+                cls._body(doc, "未识别到连续严重缺失或整公里缺失率超过5%的长连续路段。")
+            per_km = [row for row in GuangdongStatistics.bolt_per_km(rows) if row["severe"]]
+            worst = sorted(per_km, key=lambda row: (-row["severe"], -(row["rate"] or 0)))[:10]
+            if worst:
+                chart = cls._g03_chart(base, chart_prefix, f"bolt_km_severe_{category}",
+                                       [f"{row['route']}{row['direction']} K{row['km']:04d}" for row in worst],
+                                       [("单处严重缺失（处）", [float(row["severe"]) for row in worst], GD03_COLORS[0])],
+                                       ylabel="单处严重缺失（处）", horizontal=True, scale=1.0, value_fmt="%.0f")
+                if chart:
+                    figure(chart, "高速公路单处严重缺失公里段分布图")
+        else:
+            heading("③普通国道与普通省道对比分析")
+            road_types = GuangdongStatistics.bolt_road_type_units(rows)
+            table(["道路类别", "涉及路线", "公里段数", "拼接应安装", "拼接缺失", "拼接缺失率", "连接应安装", "连接缺失", "连接缺失率", "螺栓应安装总数", "螺栓缺失总数", "总体缺失率"],
+                  [[row["name"], "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    cls._g03_int(row["splice_should"]), cls._g03_int(row["splice_missing"]), cls._g03_rate(row["splice_rate"], 2),
+                    cls._g03_int(row["conn_should"]), cls._g03_int(row["connection_missing"]), cls._g03_rate(row["conn_rate"], 2),
+                    cls._g03_int(row["total"]), cls._g03_int(row["missing"]), cls._g03_rate(row["rate"], 2)] for row in road_types],
+                  "普通国道与普通省道波形梁护栏螺栓缺失率对比表")
+            heading("④各管养单位比较")
+            managers = GuangdongStatistics.bolt_manager_units(rows)
+            table(["管养单位", "管辖路线", "公里段数", "拼接应安装", "拼接缺失", "拼接缺失率", "连接应安装", "连接缺失", "连接缺失率", "螺栓应安装总数", "螺栓缺失总数", "总体缺失率"],
+                  [[manager_display(row.get("manager"), city), "、".join(row["routes"]), f"{row['km_segments']:,}",
+                    cls._g03_int(row["splice_should"]), cls._g03_int(row["splice_missing"]), cls._g03_rate(row["splice_rate"], 2),
+                    cls._g03_int(row["conn_should"]), cls._g03_int(row["connection_missing"]), cls._g03_rate(row["conn_rate"], 2),
+                    cls._g03_int(row["total"]), cls._g03_int(row["missing"]), cls._g03_rate(row["rate"], 2)] for row in managers],
+                  "普通国省道各管养单位波形梁护栏螺栓缺失率比较表")
+            heading("⑤典型状况不佳路段及原因分析")
+            typical = GuangdongStatistics.bolt_typical_segments(rows, limit=3)
+            if not typical:
+                cls._body(doc, "未识别到螺栓缺失率明显偏高的典型路段。")
+            for index, item in enumerate(typical, 1):
+                seg = f"{item['route']}{item['direction']} {cls._gd03_range(item['start_m'], item['end_m'])}（约{item['length_km']:.0f}公里）"
+                cls._heading(doc, f"{index}）{seg}", 5)
+                cls._body(doc, f"数据特征：该路段螺栓缺失率均值{cls._g03_rate(item['average'], 2)}，缺失螺栓{cls._g03_int(item['missing'])}颗。")
+                cls._body(doc, "原因分析：螺栓缺失与交通荷载、施工遗留及养护更换不及时有关，建议优先补齐。")
+            heading("⑥螺栓缺失不佳长连续路段梳理")
+            runs = GuangdongStatistics.bolt_over5_runs(rows)
+            if runs:
+                table(["路线", "方向", "起止桩号", "长度（km）", "缺失数量（颗）", "缺失率（%）"],
+                      [[row["route"], row["direction"], cls._gd03_range(row["start_m"], row["end_m"]), f"{row['length_km']:.0f}",
+                        cls._g03_int(row["missing"]), cls._g03_num(row["rate"], 2)] for row in runs],
+                      "普通国省道整公里螺栓缺失率超过5%路段清单")
+            else:
+                cls._body(doc, "未识别到整公里缺失率超过5%的长连续路段。")
+            per_km = [row for row in GuangdongStatistics.bolt_per_km(rows) if row["severe"]]
+            worst = sorted(per_km, key=lambda row: (-row["severe"], -(row["rate"] or 0)))[:10]
+            if worst:
+                chart = cls._g03_chart(base, chart_prefix, f"bolt_km_severe_{category}",
+                                       [f"{row['route']}{row['direction']} K{row['km']:04d}" for row in worst],
+                                       [("单处严重缺失（处）", [float(row["severe"]) for row in worst], GD03_COLORS[0])],
+                                       ylabel="单处严重缺失（处）", horizontal=True, scale=1.0, value_fmt="%.0f")
+                if chart:
+                    figure(chart, "普通国省道单处严重缺失公里段分布图")
+
+    @classmethod
+    def _comparison_gd03_section(cls, doc, category, detail, thresholds, table):
+        """人工复核对比情况（对标附件）：①分析方法与判定标准 → ②③④分项对比 → ⑤偏差与一致性汇总。"""
+        heading = lambda text: cls._heading(doc, text, 5)
+        summary = ManualAutoComparator.summarize(detail)
+        groups = {key: [row for row in detail if row.get("indicator") == key] for key in ("marking", "height", "bolt")}
+
+        def _num(value, digits=2, sign=False):
+            if value is None: return "—"
+            return f"{value:+.{digits}f}" if sign else f"{value:.{digits}f}"
+
+        def _int(value):
+            return "—" if value is None else f"{int(value)}"
+
+        def _unit(value, digits, unit, sign=True):
+            return "—" if value is None else _num(value, digits, sign) + unit
+
+        def _range(low, high, digits=2):
+            return "—" if low is None or high is None else f"{low:+.{digits}f} ~ {high:+.{digits}f}"
+
+        def _ratio(count, total):
+            return "—" if not total else f"{count / total:.1%}({count}/{total})"
+
+        def _sources(rows):
+            counts = {}
+            for row in rows:
+                key = str(row.get("source") or "—")
+                counts[key] = counts.get(key, 0) + 1
+            return " / ".join(f"{key} {value}" for key, value in counts.items()) or "—"
+
+        def _gtype_short(value):
+            text = str(value or "").strip()
+            return (text[:-2] if text.endswith("护栏") else text) or "—"
+
+        def _height_standard(gtype):
+            text = str(gtype or "")
+            if "三波" in text: return 694.0
+            if "两波" in text or "双波" in text: return 600.0
+            return None
+
+        def _marking_judge(value):
+            return None if value is None else ("合格" if value >= 80 else "不合格")
+
+        def _height_judge(value, gtype):
+            standard = _height_standard(gtype)
+            if value is None or standard is None: return None
+            return "合格" if abs(value - standard) <= 20 else "不合格"
+
+        def _judge_pairs(rows, judge):
+            pairs = [pair for pair in (judge(row) for row in rows) if pair[0] and pair[1]]
+            return sum(1 for left, right in pairs if left == right), len(pairs)
+
+        marking_judge = lambda row: (_marking_judge(row.get("manual")), _marking_judge(row.get("automatic")))
+        height_judge = lambda row: (_height_judge(row.get("manual"), row.get("gtype")), _height_judge(row.get("automatic"), row.get("gtype")))
+        stats = {key: _judge_pairs(groups[key], judge) for key, judge in (("marking", marking_judge), ("height", height_judge))}
+
+        if not detail:
+            cls._body(doc, "本次未提供人工复核对比记录。")
+            return
+
+        routes = sorted({str(row.get("route") or "") for row in detail if row.get("route")})
+        sources = "、".join(sorted({str(row.get("source")) for row in detail if row.get("source")})) or "人工复核"
+        heading("①分析方法与判定标准")
+        cls._body(doc, f"对比{sources}的人工检测与自动化检测成对记录（覆盖{'、'.join(routes)}共{len(routes)}条路线），三类指标的有效成对样本量及路线分布如下。")
+        table(["检测指标", f"{category}({'/'.join(routes)})", "来源分布"],
+              [["标线逆反射亮度系数", len(groups["marking"]), _sources(groups["marking"])],
+               ["波形梁护栏中心高度", len(groups["height"]), _sources(groups["height"])],
+               ["波形梁护栏螺栓缺失", len(groups["bolt"]), _sources(groups["bolt"])]],
+              "人工复核对比样本及来源分布表")
+        cls._body(doc, "1.1 偏差指标")
+        cls._body(doc, "绝对偏差 Δ = 自动化检测值 − 人工复核值；相对偏差 = Δ ÷ 人工复核值 × 100%（用于量纲不一致的标线逆反射系数与螺栓缺失数量）。")
+        cls._body(doc, "MAE（平均绝对偏差）为各样本绝对偏差的平均值，用于衡量整体偏差幅度；同时给出偏差极值范围（最小~最大）与平均偏差（保留正负方向）。")
+        cls._body(doc, "1.2 判定标准")
+        table(["指标", "判据", category],
+              [["标线逆反射亮度系数", "合格/不合格", "≥ 80 mcd·m⁻²·lx⁻¹"],
+               ["护栏中心高度", "实测 ± 公差内为合格", "双波 600/三波 694mm，±20mm"],
+               ["护栏螺栓缺失", "缺失数量统计(个)", ""]],
+              "人工复核判定标准表")
+        cls._body(doc, "1.3 一致性口径")
+        cls._body(doc, "合格判定一致率：自动化判定与人工判定（合格/不合格）完全一致的样本占比。")
+        cls._body(doc, "偏差落控占比：相对偏差落在 ±5%（标线）或绝对偏差落在 ±5mm（护栏中心高度）的样本占比。")
+        cls._body(doc, "检出判定一致率：螺栓缺失“是否检出缺失”结论一致的样本占比（区分于缺失数量的口径差异）。")
+
+        heading("②标线逆反射亮度系数对比")
+        marking = groups["marking"]
+        if marking:
+            item = summary.get("marking", {})
+            agree, total = stats["marking"]
+            count = len(marking)
+            cls._body(doc, "2.1 偏差范围")
+            table(["统计量", "相对偏差(%)", "绝对偏差"],
+                  [["偏差范围", _range(item.get("rel_min"), item.get("rel_max")), _range(item.get("diff_min"), item.get("diff_max"))],
+                   ["平均偏差", _num(item.get("rel_average"), 2, True), "—"],
+                   ["MAE", _num(item.get("mae"), 2), "—"],
+                   ["|Δ|≤5% 占比", _ratio(item.get("within5_count"), count), "—"],
+                   ["|Δ|≤10% 占比", _ratio(item.get("within10_count"), count), "—"],
+                   ["方向偏置(偏高)", _ratio(item.get("high_count"), count), "—"]],
+                  f"人工复核标线逆反射亮度系数偏差范围表（{category}）")
+            cls._body(doc, "2.2 一致性")
+            cls._body(doc, f"按阈值判定（白色≥80 mcd·m⁻²·lx⁻¹），人工与自动判定合格性 {_ratio(agree, total)} 一致。"
+                           + (f"全部样本相对偏差均落在 ±10% 内，其中 {_ratio(item.get('within5_count'), count)} 落在 ±5% 高精度带内。"
+                              if item.get("within10_count") == count else
+                              f"其中 {_ratio(item.get('within10_count'), count)} 落在 ±10% 内、{_ratio(item.get('within5_count'), count)} 落在 ±5% 内。"))
+            table(["路线", "桩号区段", "类别", "人工", "自动化", "绝对偏差", "相对偏差%", "人工判定", "自动判定"],
+                  [[row.get("route"), row.get("segment"), row.get("category"), _num(row.get("manual")), _num(row.get("automatic")),
+                    _num(row.get("signed_difference")), _num(row.get("signed_relative_deviation")),
+                    _marking_judge(row.get("manual")) or "—", _marking_judge(row.get("automatic")) or "—"]
+                   for row in marking],
+                  "人工复核标线逆反射亮度系数对比明细表")
+            cls._body(doc, f"小结：标线逆反射亮度系数合格判定一致率 {_ratio(agree, total)}，平均偏差 {_num(item.get('rel_average'), 2, True)}%，"
+                           f"MAE {_num(item.get('mae'), 2)}%，"
+                           + ("偏差全部落在 ±10% 内，自动化检测结果可用于技术状况评价。" if item.get("within10_count") == count
+                              else "个别样本偏差较大，建议现场复核后再用于处治决策。"))
+        else:
+            cls._body(doc, "本次未提供标线逆反射亮度系数人工复核对比记录。")
+
+        heading("③波形梁护栏中心高度对比")
+        height = groups["height"]
+        if height:
+            item = summary.get("height", {})
+            agree, total = stats["height"]
+            count = len(height)
+            low = item.get("low_count") or 0
+            high = item.get("high_count") or 0
+            within20 = sum(1 for row in height if (row.get("absolute_difference") or 0) <= 20)
+            cls._body(doc, f"护栏中心高度在 {count} 个区段上逐段比对（来源：{_sources(height)}）。双波高度 600mm、三波 694mm，允许公差 ±20mm。")
+            cls._body(doc, "3.1 偏差范围")
+            table(["统计量", "绝对偏差(mm)", "相对偏差(%)"],
+                  [["偏差范围", _range(item.get("diff_min"), item.get("diff_max")), _range(item.get("rel_min"), item.get("rel_max"), 3)],
+                   ["平均偏差", _num(item.get("diff_average"), 2, True), _num(item.get("rel_average"), 3, True)],
+                   ["MAE", _num(item.get("mae"), 2), _num(item.get("mae_relative"), 3)],
+                   ["|Δ|≤5mm", _ratio(item.get("within5_count"), count), "—"],
+                   ["|Δ|≤10mm", _ratio(item.get("within10_count"), count), "—"],
+                   [f"方向偏置({'偏小' if low >= high else '偏高'})", _ratio(max(low, high), count), "—"]],
+                  f"人工复核波形梁护栏中心高度偏差范围表（{category}）")
+            cls._body(doc, "3.2 一致性")
+            cls._body(doc, (f"合格判定与人工 {_ratio(agree, total)} 一致。" if total else "本次未提供护栏类型信息，无法统计合格判定一致率。")
+                            + (f"全部 {count} 个测点人工与自动化测值差均不超过 20mm。" if within20 == count
+                               else f"其中 {_ratio(within20, count)} 的测点人工与自动化测值差不超过 20mm。"))
+            diff_average = item.get("diff_average")
+            if diff_average is not None and abs(diff_average) >= 1:
+                cls._body(doc, f"{category}波形梁护栏存在 {diff_average:+.2f}mm 的系统性平均偏差（自动化{'偏小' if diff_average < 0 else '偏大'}）。")
+            table(["路线", "护栏", "桩号区段", "来源", "人工（mm)", "自动化(mm)", "绝对偏差(mm)", "标准值(mm)", "人工判定", "自动判定"],
+                  [[row.get("route"), _gtype_short(row.get("gtype")), row.get("segment"), row.get("source") or "—",
+                    _num(row.get("manual")), _num(row.get("automatic")), _num(row.get("signed_difference")),
+                    _num(_height_standard(row.get("gtype")), 0),
+                    _height_judge(row.get("manual"), row.get("gtype")) or "—", _height_judge(row.get("automatic"), row.get("gtype")) or "—"]
+                   for row in height],
+                  "人工复核波形梁护栏中心高度对比明细表")
+            cls._body(doc, f"小结：护栏中心高度合格判定一致率 {_ratio(agree, total)}，MAE {_num(item.get('mae'), 2)}mm，"
+                           + ("各测点人工与自动化测值差均在 20mm 以内，可用于处治决策。" if within20 == count
+                              else "建议对偏差较大的区段现场复核后再处治。"))
+        else:
+            cls._body(doc, "本次未提供波形梁护栏中心高度人工复核对比记录。")
+
+        heading("④波形梁护栏螺栓缺失对比")
+        bolt = groups["bolt"]
+        if bolt:
+            item = summary.get("bolt", {})
+            count = len(bolt)
+            manual_values = [row.get("manual") or 0 for row in bolt]
+            auto_values = [row.get("automatic") or 0 for row in bolt]
+            detect_agree = sum(1 for manual, automatic in zip(manual_values, auto_values) if (manual > 0) == (automatic > 0))
+            missed = sum(1 for manual, automatic in zip(manual_values, auto_values) if manual > 0 and automatic == 0)
+            diff_average = item.get("diff_average")
+            cls._body(doc, f"螺栓缺失在 {count} 个区段上对比人工与自动统计的缺失数量（拼接螺栓+连接螺栓）。"
+                           f"此类指标的核心问题是数量口径而非检出有无，两组数据在“是否检出螺栓缺失”上 {_ratio(detect_agree, count)} 一致。")
+            cls._body(doc, "4.1 偏差范围")
+            table(["统计量", f"{category}(n={count})"],
+                  [["偏差范围", _range(item.get("diff_min"), item.get("diff_max"), 0)],
+                   ["平均偏差", _num(diff_average, 1, True)],
+                   ["MAE", _num(item.get("mae"), 1)],
+                   ["自动偏多样本占比", _ratio(item.get("high_count"), count)],
+                   ["自动=人工", _ratio(item.get("zero_count"), count)]],
+                  f"人工复核螺栓缺失数量偏差范围表（{category}）")
+            cls._body(doc, "4.2 检出一致性")
+            detects = ["只要人工检出有缺失，自动化亦能检出（未出现漏报）" if missed == 0 else f"存在 {missed} 处人工检出缺失而自动化未检出的情况"]
+            if diff_average is None: detects.append("两者缺失数量无可比记录")
+            elif diff_average > 0: detects.append("自动化统计数量整体多于人工")
+            elif diff_average < 0: detects.append("自动化统计数量整体少于人工")
+            else: detects.append("两者统计数量总体相当")
+            cls._body(doc, "；".join(detects) + f"（检出判定一致率 {_ratio(detect_agree, count)}）。")
+            table(["路线", "护栏", "桩号区段", "类别", "来源", "人工(拼)", "人工(连)", "人工合计", "自动(拼)", "自动(连)", "自动合计"],
+                  [[row.get("route"), _gtype_short(row.get("gtype")), row.get("segment"), row.get("category"), row.get("source") or "—",
+                    _int(row.get("msplice")), _int(row.get("mconn")), _int(row.get("manual")),
+                    _int(row.get("asplice")), _int(row.get("aconn")), _int(row.get("automatic"))]
+                   for row in bolt],
+                  "人工复核波形梁护栏螺栓缺失对比明细表")
+            cls._body(doc, "4.3 偏差归因")
+            cls._body(doc, "自动化与人工的数量差异主要源于统计口径不同：自动化按电子桩号逐处统计缺失数量，人工按区段现场核对；"
+                           "若人工复核前管养单位已对相关区段开展整改作业，现场实际缺失数量将少于自动化检测时的统计结果，需结合养护台账进一步核实。")
+            cls._body(doc, f"小结：螺栓缺失检出一致率 {_ratio(detect_agree, count)}，平均偏差 {_num(diff_average, 1, True)} 个，"
+                           "数量口径差异需结合养护台账核实后再用于处治决策。")
+        else:
+            cls._body(doc, "本次未提供波形梁护栏螺栓缺失人工复核对比记录。")
+
+        heading("⑤偏差与一致性汇总")
+        rows = []
+        if groups["marking"]:
+            agree, total = stats["marking"]; count = len(groups["marking"])
+            rows.append(["标线逆反射亮度系数", "合格判定一致率", _ratio(agree, total)])
+            rows.append(["标线逆反射亮度系数", "|Δ|≤5% 落控率", _ratio(summary["marking"].get("within5_count"), count)])
+        if groups["height"]:
+            agree, total = stats["height"]; count = len(groups["height"])
+            rows.append(["波形梁护栏中心高度", "合格判定一致率", _ratio(agree, total)])
+            rows.append(["波形梁护栏中心高度", "|Δ|≤5mm 落控率", _ratio(summary["height"].get("within5_count"), count)])
+        if bolt:
+            rows.append(["波形梁护栏螺栓缺失", "检出一致率", _ratio(detect_agree, len(bolt))])
+            rows.append(["波形梁护栏螺栓缺失", "|Δ|≤2 个 落控率", _ratio(sum(1 for row in bolt if abs(row.get("signed_difference") or 0) <= 2), len(bolt))])
+        table(["指标", "一致性口径", category], rows, f"人工复核与自动化检测一致性汇总表（{category}）")
+        cls._body(doc, "偏差方向与幅度总评：")
+        review = []
+        if groups["marking"]:
+            average = summary["marking"].get("rel_average"); mae = summary["marking"].get("mae")
+            centered = average is not None and abs(average) < 0.3 * (mae or 0)
+            review.append(["标线逆反射系数", _unit(average, 2, "%") + ("(居中)" if centered else ""),
+                           "双向略散" if centered else ("自动化偏高" if (average or 0) > 0 else "自动化偏低"),
+                           f"优(MAE {_num(mae, 2)}%)" if (mae or 99) <= 5 else f"良(MAE {_num(mae, 2)}%)" if (mae or 99) <= 10 else f"需关注(MAE {_num(mae, 2)}%)"])
+        if groups["height"]:
+            average = summary["height"].get("diff_average"); mae = summary["height"].get("mae")
+            review.append(["护栏中心高度", _unit(average, 2, "mm"),
+                           "基本居中" if abs(average or 0) < 1 else ("系统性偏小" if (average or 0) < 0 else "系统性偏大"),
+                           f"优(MAE {_num(mae, 2)}mm)" if (mae or 99) <= 5 else f"中(MAE {_num(mae, 2)}mm)" if (mae or 99) <= 10 else f"差(MAE {_num(mae, 2)}mm)"])
+        if bolt:
+            average = summary["bolt"].get("diff_average")
+            within2 = sum(1 for row in bolt if abs(row.get("signed_difference") or 0) <= 2)
+            review.append(["螺栓缺失", _unit(average, 0, "个"),
+                           "自动化偏多" if (average or 0) > 0 else ("自动化偏少" if (average or 0) < 0 else "基本一致"),
+                           "数据基本一致" if within2 == len(bolt) else "数量口径差异，以检出一致性为准"])
+        table(["指标", "平均偏差", "偏差方向", "精度评级"], review, f"人工复核偏差方向与幅度总评表（{category}）")
+
+    @classmethod
+    def _advice_gd03_section(cls, doc, bundle, table):
+        """工作建议（对标附件）：1.重点路段处治建议（高速/普通优先处治路段表+闭环督办）→ 2.迎国评 → 3.养护提升。"""
+        weak = bundle.get("weak_segments", [])
+        city = ""
+        for key in ("marking", "height", "bolt", "comparison_detail"):
+            for row in bundle.get(key, []):
+                if row.get("city"):
+                    city = str(row["city"]).strip()
+                    break
+            if city:
+                break
+        route_category = {}
+        for key in ("marking", "height", "bolt"):
+            for row in bundle.get(key, []):
+                if row.get("route") and row.get("category"):
+                    route_category.setdefault(str(row["route"]), str(row["category"]))
+        by_km = {}
+        by_route = {}
+        for row in bundle.get("marking", []):
+            manager = row.get("manager")
+            if not manager or row.get("station_m") is None:
+                continue
+            key = (str(row.get("route") or ""), str(row.get("direction") or ""))
+            by_km.setdefault(key + (int(row["station_m"] // 1000),), manager)
+            counts = by_route.setdefault(key, {})
+            counts[manager] = counts.get(manager, 0) + 1
+
+        def _manager(row):
+            route, direction = str(row.get("route") or ""), str(row.get("direction") or "")
+            km = int(row["start_m"] // 1000) if row.get("start_m") is not None else None
+            if km is None:
+                match = re.search(r"K(\d+)", str(row.get("segment") or ""))
+                if match:
+                    km = int(match.group(1))
+            manager = by_km.get((route, direction, km)) if km is not None else None
+            if not manager:
+                counts = by_route.get((route, direction))
+                if counts:
+                    manager = max(counts, key=lambda name: (counts[name], name))
+            return manager_display(manager, city) if manager else "—"
+
+        def _segment(row):
+            text = str(row.get("segment") or "—")
+            prefix = f"{row.get('route') or ''}{row.get('direction') or ''}"
+            return text[len(prefix):] if prefix and text.startswith(prefix) else text
+
+        def _problem(row):
+            kind = str(row.get("type") or "")
+            if "标线" in kind and row.get("start_m") is not None and row.get("end_m") is not None:
+                length = (float(row["end_m"]) - float(row["start_m"])) / 1000
+                return f"{row.get('direction') or ''}{row.get('marking_position') or ''}连续不合格长度达 {length:g} km"
+            return str(row.get("reason") or "—")
+
+        cls._body(doc, "结合本次检测评估的结果，针对不同类型问题提出分层分类的改进意见与措施，有效推动整体效能提升与可持续发展。")
+        cls._heading(doc, "1.重点路段处治建议（如有）", 3)
+        cls._body(doc, "针对检测中发现的问题突出、合格率低的长连续路段，按照优先处治（6个月）、清单化督办的要求，明确责任单位、整改内容、完成时限，实行销号闭环管理。")
+        if weak:
+            grouped = {}
+            order = []
+            for row in weak:
+                route = str(row.get("route") or "")
+                key = (route_category.get(route, "普通国省道"), route, str(row.get("direction") or ""), _segment(row))
+                if key not in grouped:
+                    grouped[key] = {"manager": _manager(row), "problems": []}
+                    order.append(key)
+                grouped[key]["problems"].append(_problem(row))
+            rows = {"高速公路": [], "普通国省道": []}
+            for key in order:
+                category, route, direction, segment = key
+                entry = grouped[key]
+                rows.setdefault(category, []).append([route, entry["manager"], segment, "；".join(entry["problems"])])
+            cls._body(doc, "（一）优先处治路段（6个月完成）")
+            cls._body(doc, "高速公路")
+            if rows.get("高速公路"):
+                table(["路线", "管养单位", "桩号范围", "存在问题"], rows["高速公路"], "高速公路优先处治路段表")
+            else:
+                cls._body(doc, "本次未识别到高速公路优先处治路段。")
+            cls._body(doc, "普通国省道")
+            if rows.get("普通国省道"):
+                table(["路线", "管养单位", "桩号范围", "存在问题"], rows["普通国省道"], "普通国省道优先处治路段表")
+            else:
+                cls._body(doc, "本次未识别到普通国省道优先处治路段。")
+            cls._body(doc, "（二）闭环督办管理要求")
+            cls._body(doc, f"建立整改清单：建立《{city or '本项目'}交安设施重点问题整改清单》，逐处明确管养单位、病害类型、桩号范围、风险分级与整改时限，定期调度通报进展。")
+            cls._body(doc, "验收销号：整改完成后，结合自动化检测与现场人工复核开展验收，指标不达标的不得销号，并纳入下一轮重点监测。")
+            cls._body(doc, "考核挂钩：对到期未完成整改的单位进行通报，并与养护绩效考核挂钩，确保问题闭环。")
+        else:
+            cls._body(doc, "本次未识别到满足连续3 km标线不合格、护栏中心高度偏差超过10 cm或螺栓缺失率超过5%的典型薄弱路段，建议保持既有养护节奏并加强日常巡查。")
+        cls._heading(doc, "2.迎国评工作建议", 3)
+        cls._body(doc, "结合2026年国评交安专项要求，提出简易可行、行之有效的迎检攻坚建议。")
+        cls._body(doc, "围绕国评交通安全设施TCI指标、护栏防护能力两大核心评分项，抓重点、补短板，高效开展迎检攻坚。")
+        cls._body(doc, "分类开展显性问题突击整治。")
+        cls._body(doc, "清除标志遮挡：全面排查并修剪遮挡标志、标线的路树，拆除违规广告牌，恢复标志视认距离。")
+        cls._body(doc, "高速公路方面：以护栏螺栓缺失、护栏中心高度为重点，优先补齐缺失螺栓，对高度偏差超限路段实施抬升或更换。")
+        cls._body(doc, "普通国省道方面：以标线逆反射亮度系数为重点，对不合格路段集中复划；同步排查临水临崖、急弯陡坡路段护栏缺口。")
+        cls._body(doc, "（2）做好迎检路段现场排查。")
+        cls._body(doc, "国评前组织管养单位开展徒步+车载快速巡检，消除护栏缺口、标志缺失、标线模糊等一眼可见问题。")
+        cls._body(doc, "（3）统筹力量，差异化投入。")
+        cls._body(doc, "高速公路以管养分公司落实主体责任；普通国省道以区县公路事务中心为责任主体，市级统筹协调养护资金、技术力量，对薄弱区县予以帮扶，避免普通国省道拖整体后腿。")
+        cls._heading(doc, "3.养护提升建议", 3)
+        cls._body(doc, "建立日常巡查、定期检测和专项排查相结合的预防性养护机制，统一路线、方向、桩号和区段编码，完善标线逆反射性能、护栏中心高度和螺栓缺失率的年度对比分析。")
+        cls._body(doc, "结合本次人工复核与自动化检测对比结果，固化“自动化普查+人工抽查复核”的检测模式，对偏差较大的指标加密复核频次，逐步提升自动化检测数据的可信度。")
+        cls._body(doc, "将检测、复核、处治、复测、销号纳入闭环管理，同步完善养护台账与原始记录，确保检测数据、复核记录与处治结果相互印证。")
+
     @classmethod
     def _comparison_table(cls, doc, detail, thresholds, table_adder=None):
         """人工复核对比：先给判断标准说明，再按 护栏中心高度/螺栓缺失/标线逆反射 生成三张分项对比表。"""
@@ -3928,7 +5415,7 @@ class GuangdongChapterWriter:
         format_config = cls._format_config()["caption"]
         minimal_docx._apply_paragraph(paragraph, format_config, clear_indent=True)
         for run in paragraph.runs:
-            minimal_docx._apply_run(run, format_config, bold=False)
+            minimal_docx._apply_run(run, format_config)
 
     @classmethod
     def _format_all_run_fonts(cls, doc):
@@ -4133,123 +5620,19 @@ class GuangdongChapterWriter:
             cls._heading(doc,"2.标线、护栏自动化检测",3)
             cls._heading(doc,"（1）标线逆反射亮度系数情况",4)
             segment_sort_key=lambda row: tuple(str(row.get(field) or "") for field in ("route","direction","segment"))
-            marking_summary=GuangdongStatistics.marking_summary(all_mark)
-            cls._body(doc,f"{category}标线检测共获得{marking_summary['valid_count']:,}个有效计算单元，平均逆反射亮度系数为{cls._fmt(marking_summary['average'])}，合格单元{marking_summary['qualified_count']:,}个，合格率为{cls._pct(marking_summary['qualified_rate'])}。" if all_mark else f"{category}未读取到有效标线逆反射数据。")
-            pair_summary=sorted(GuangdongStatistics.marking_segment_pair_summary(all_mark),key=segment_sort_key)
-            def _pair_cells(row, name):
-                pos = next((p for p, label in row.get("_side_names", {}).items() if label == name), None)
-                if pos is None:
-                    return ["—", "—", "—"]
-                return [row.get(f"{pos}_valid_count"), cls._fmt(row.get(f"{pos}_average")), cls._pct(row.get(f"{pos}_qualified_rate"))]
-            labels = ["左侧标线", "右侧标线"]
-            labels += sorted({name for row in pair_summary for name in row["_side_names"].values()} - set(labels))
-            pair_rows=[[row.get("route"),row.get("direction"),row.get("manager"),cls._segment_text(row.get("segment")),*[cell for name in labels for cell in _pair_cells(row,name)]] for row in pair_summary]
-            pair_header=["路线","方向","管养单位","检测区段"]+[x for name in labels for x in (f"{name}单元数",f"{name}均值",f"{name}合格率")]
-            _table(pair_header,pair_rows,"标线逆反射区段汇总表")
-            for idx,row in enumerate(pair_summary,1):
-                seg_text=cls._segment_text(row.get("segment"))
-                identity_text=" ".join(str(row.get(k) or "") for k in ("route","direction","manager")) + " " + seg_text
-                cls._heading(doc,f"{cls._alpha_label(idx)} {identity_text}",5)
-                cls._body(doc,cls._marking_segment_sentence(row))
-                names=row.get("_side_names") or {}
-                _table(["检测区段",*[x for name in labels for x in (f"{name}单元数",f"{name}均值",f"{name}合格率")]],[[seg_text,*[x for name in labels for x in _pair_cells(row,name)]]],f"{identity_text}标线逆反射统计表")
-                for pos, name in names.items():
-                    img = _marking_chart_path(base, dict(row, marking_position=pos))
-                    if img.is_file():
-                        _figure(str(img),f"{identity_text}{name}逆反射亮度系数检测结果")
+            GuangdongStatistics.fill_managers(all_mark,all_height,all_bolt)
+            cls._marking_gd03_section(doc,category,all_mark,_table,_figure,base,chart_prefix,city)
 
             cls._heading(doc,"（2）波形梁护栏中心高度情况",4)
-            total_height=len(all_height)
-            if total_height:
-                hs=GuangdongStatistics.height_summary(all_height)
-                parts=[]
-                for kind in ("二波","三波"):
-                    item=hs[kind]
-                    if item["valid_count"]: parts.append(f"{kind}护栏{item['valid_count']:,}个有效点，平均高度{cls._fmt(item['average'])} mm，合格率{cls._pct(item['qualified_rate'])}")
-                cls._body(doc,f"{category}波形梁护栏中心高度有效检测点共{total_height:,}个，其中"+"；".join(parts)+"。")
-            else: cls._body(doc,f"{category}未读取到有效护栏中心高度数据。")
-            height_summary_rows=sorted(GuangdongStatistics.height_segment_summary(all_height),key=lambda row:(*segment_sort_key(row),str(row.get("guardrail_type") or "")))
-            note_counts=cls._guardrail_note_counts([r for r in bundle.get("notes",[]) if r.get("category")==category])
-            def _note_counts_for(route_name,direction_name,segment_name):
-                segment_name=str(segment_name)
-                for key in ((route_name,direction_name,segment_name),(route_name,direction_name,segment_name.removesuffix("段")),(route_name,direction_name,segment_name+"段")):
-                    if key in note_counts: return note_counts[key]
-                return None
-            def _note_for(route_name,direction_name,segment_name):
-                return cls._guardrail_note_sentence(_note_counts_for(route_name,direction_name,segment_name))
-            height_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in height_summary_rows]
-            _table(["路线","方向","检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],height_rows,"护栏中心高度区段汇总表")
-            height_images=_images("height")
-            segment_key=lambda key:(key[0],key[1],str(key[2]).removesuffix("段"))
-            height_groups={}
-            for row in height_summary_rows:
-                height_groups.setdefault(segment_key((row.get("route"),row.get("direction"),row.get("segment"))),[]).append(row)
-            for note_key,counts in sorted(note_counts.items()):
-                height_groups.setdefault(segment_key(note_key),[])
-            for idx,(key,rows) in enumerate(sorted(height_groups.items(),key=lambda item:tuple(str(x) for x in item[0])),1):
-                route_name,direction_name,segment_name=key
-                seg_text=cls._segment_text(segment_name)
-                note_sentence=_note_for(route_name,direction_name,segment_name)
-                cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
-                total=sum(int(row.get("valid_count") or 0) for row in rows)
-                if total > 0:
-                    cls._body(doc,cls._height_segment_sentence(rows))
-                elif note_sentence:
-                    cls._body(doc,cls._guardrail_no_valid_point_sentence(_note_counts_for(*key)))
-                else:
-                    cls._body(doc,cls._height_segment_sentence(rows))
-                if rows:
-                    _table(["检测区段","护栏类型","有效点数","平均高度（mm）","合格点数","合格率","偏差超10cm点数"],[[seg_text,_guardrail_type(row.get("guardrail_type")),row.get("valid_count"),cls._fmt(row.get("average")),row.get("qualified_count"),cls._pct(row.get("qualified_rate")),row.get("over_10cm_count")] for row in rows],f"{seg_text}护栏中心高度统计表")
-                safe_seg=str(segment_name).replace("/","_").replace("\\","_").replace(" ","_")
-                if not note_sentence or rows:
-                    for kind in ("二波","三波"):
-                        for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_line." in p]:
-                            try: _figure(img,f"{seg_text}{kind}护栏中心高度检测结果")
-                            except Exception: pass
-                        for img in [p for p in height_images if safe_seg in Path(p).name and kind in Path(p).name and "_pie." in p]:
-                            try: _figure(img,f"{seg_text}{kind}护栏中心高度结果分布")
-                            except Exception: pass
+            cls._height_gd03_section(doc,category,all_height,_table,_figure,base,chart_prefix,city)
 
             cls._heading(doc,"（3）螺栓缺失情况",4)
-            bs=GuangdongStatistics.bolt_summary(all_bolt)
-            cls._body(doc,f"{category}共识别现有拼接螺栓{int(bs['splice']):,}颗、连接螺栓{int(bs['connection']):,}颗，检出缺失螺栓{int(bs['missing_total']):,}颗，螺栓缺失率为{cls._pct(bs['missing_rate'])}。" if all_bolt else f"{category}未读取到有效波形梁护栏螺栓数据。")
-            bolt_summary_rows=sorted(GuangdongStatistics.bolt_segment_summary(all_bolt),key=segment_sort_key)
-            bolt_existing={(r.get("route"),r.get("direction"),str(r.get("segment") or "").removesuffix("段")) for r in bolt_summary_rows}
-            bolt_note_keys={(k[0],k[1],str(k[2]).removesuffix("段")) for k in note_counts if (k[0],k[1],str(k[2]).removesuffix("段")) not in bolt_existing}
-            bolt_rows=[[row.get("route"),row.get("direction"),cls._segment_text(row.get("segment")),int(row.get("splice",0) or 0),int(row.get("connection",0) or 0),int(row.get("missing_total",0) or 0),cls._pct(row.get("missing_rate"))] for row in bolt_summary_rows]
-            _table(["路线","方向","检测区段","拼接螺栓（颗）","连接螺栓（颗）","缺失数量（颗）","缺失率"],bolt_rows,"护栏螺栓缺失区段汇总表")
-            bolt_images=_images("bolt")
-            bolt_groups={(row.get("route"),row.get("direction"),str(row.get("segment") or "").removesuffix("段")):row for row in bolt_summary_rows}
-            for note_key in bolt_note_keys: bolt_groups[note_key]=None
-            for idx,(bolt_key,row) in enumerate(sorted(bolt_groups.items(),key=lambda item:tuple(str(x or "") for x in item[0])),1):
-                if row is None:
-                    seg_text=cls._segment_text(bolt_key[2])
-                    cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
-                    cls._body(doc,cls._guardrail_no_valid_point_sentence(_note_counts_for(*bolt_key)))
-                    continue
-                seg_text=cls._segment_text(row.get("segment"))
-                cls._heading(doc,f"{cls._alpha_label(idx)} {seg_text}",5)
-                cls._body(doc,cls._bolt_segment_sentence(row))
-                _table(["路线","方向","检测区段","拼接螺栓（颗）","连接螺栓（颗）","缺失数量（颗）","缺失率"],[[row.get("route"),row.get("direction"),seg_text,int(row.get("splice",0) or 0),int(row.get("connection",0) or 0),int(row.get("missing_total",0) or 0),cls._pct(row.get("missing_rate"))]],f"{seg_text}护栏螺栓缺失统计表")
-                for img in [p for p in bolt_images if str(row.get("segment") or "").replace("/","_").replace("\\","_").replace(" ","_") in Path(p).name and "_bar." in p]:
-                    try: _figure(img,f"{seg_text}护栏螺栓缺失检测结果")
-                    except Exception: pass
+            cls._bolt_gd03_section(doc,category,all_bolt,_table,_figure,base,chart_prefix,city)
             cls._heading(doc,"（4）人工复核对比情况",4)
-            cls._comparison_table(doc,all_detail,thresholds,table_adder=_table)
+            cls._comparison_gd03_section(doc,category,all_detail,thresholds,_table)
 
         cls._heading(doc,"（三）工作建议",2)
-        cls._heading(doc,"1.重点路段处治建议",3)
-        weak=bundle.get("weak_segments",[])
-        if not weak: cls._body(doc,"未识别到满足连续3 km标线不合格、护栏中心高度偏差超过10 cm或螺栓缺失率超过5%的典型薄弱路段。")
-        else: _table(["类型","路线","方向","检测区段","原因"],[[r.get("type"),r.get("route"),r.get("direction"),r.get("segment"),r.get("reason")] for r in weak],"典型薄弱路段及成因表")
-
-        cls._body(doc,"（1）对标线逆反射性能连续3 km不合格路段开展现场复核，对确认存在磨损、污染或逆反射性能不足的标线进行清理和重新施划，并在完工后复测。")
-        cls._body(doc,"（2）对波形梁护栏中心高度偏差超过10 cm的区段核查路面加铺、路缘石、沉陷和立柱埋深等影响因素，结合护栏类型实施抬升、调整或更换。")
-        cls._body(doc,"（3）对螺栓缺失率超过5%的区段优先补齐缺失螺栓，同步检查梁板搭接、连接件、防阻块、立柱和端头的牢固性。")
-        cls._heading(doc,"2.迎国评工作建议",3)
-        cls._body(doc,"结合检测结果开展迎检路段现场排查，优先整改护栏缺损、螺栓缺失、标志遮挡及标线模糊等问题，完善检测、复核、整改和验收资料。")
-        cls._heading(doc,"3.养护提升建议",3)
-        cls._body(doc,"建立日常巡查、定期检测和专项排查相结合的预防性养护机制，统一路线、方向、桩号和区段编码，完善检测、复核、处治、复测和销号闭环。")
+        cls._advice_gd03_section(doc,bundle,_table)
         cls._indent_existing_body(doc)
         cls._format_all_run_fonts(doc)
         folder=Path(output_dir)/city; folder.mkdir(parents=True,exist_ok=True); path=folder/f"{city}在役公路技术状况检测评价报告第五部分.docx"
@@ -4443,6 +5826,124 @@ def marking_side_names(positions):
     return dict(sorted(names.items(), key=lambda item: ({"左侧标线": 0, "右侧标线": 1}.get(item[1], 2), item[0])))
 
 
+GD03_COLORS = ("#4472C4", "#ED7D31", "#A5A5A5")
+
+COMPANY_PARENTS = (
+    "广东省公路建设有限公司",
+    "广东省路桥建设发展有限公司",
+    "广东省高速公路有限公司",
+    "广东交通实业投资有限公司",
+    "广东省南粤交通投资建设有限公司",
+    "广东省交通集团有限公司",
+)
+
+
+def split_manager_company(manager):
+    """管养单位 →（母公司，二级/路段公司）；非公司制单位返回（None，原值）。"""
+    text = str(manager or "").strip()
+    for parent in COMPANY_PARENTS:
+        if text.startswith(parent):
+            return parent, text[len(parent):].strip() or text
+    return None, text
+
+
+def manager_display(manager, city=""):
+    """正文/表格显示名：公司制取二级公司，普通国省道去掉地市前缀。"""
+    parent, child = split_manager_company(manager)
+    if parent:
+        return child or "—"
+    text = child
+    prefix = city if city.endswith("市") else (f"{city}市" if city else "")
+    if prefix and text.startswith(prefix):
+        text = text[len(prefix):]
+    return text or "—"
+
+
+def _gd03_overall(left, right):
+    """总体合格率 =（左侧合格率 + 右侧合格率）/2，两侧均先按 1 位小数取整（oracle 口径）。"""
+    if left is not None and right is not None:
+        return (round(left * 100, 1) + round(right * 100, 1)) / 200.0
+    return left if left is not None else right
+
+
+def _gd03_axes():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return plt
+
+
+def gd03_bar_chart(path, categories, series, ylabel="合格率（%）", ylim=(0, 100), rotation=0, value_fmt="%.1f", horizontal=False):
+    """GD03 分组柱状图（附件样式）：柱顶数据标签、水平网格线、图例右上带框、纵轴 0–100。"""
+    plt = _gd03_axes()
+    if horizontal:
+        figure, axes = plt.subplots(figsize=(max(6.4, 3.2), max(3.0, 0.42 * len(categories) + 1.4)), dpi=160)
+        height = 0.8 / max(len(series), 1)
+        for index, (name, values, color) in enumerate(series):
+            offsets = [position + (index - (len(series) - 1) / 2) * height for position in range(len(categories))]
+            bars = axes.barh(offsets, [float("nan") if value is None else float(value) for value in values],
+                             height=height * 0.9, label=name, color=color)
+            axes.bar_label(bars, fmt=value_fmt, fontsize=7, padding=1)
+        axes.set_yticks(range(len(categories)))
+        axes.set_yticklabels(categories, fontsize=8)
+        axes.invert_yaxis()
+        axes.set_xlim(*ylim)
+        axes.set_xlabel(ylabel, fontsize=9)
+        axes.grid(axis="x", color="#D9D9D9", linewidth=0.8)
+        axes.set_axisbelow(True)
+        axes.legend(loc="lower right", frameon=True, fontsize=8)
+        for side in ("top", "right"):
+            axes.spines[side].set_visible(False)
+        figure.tight_layout()
+        figure.savefig(path)
+        plt.close(figure)
+        return str(path)
+    figure, axes = plt.subplots(figsize=(max(6.4, 1.15 * len(categories) + 2.2), 3.8), dpi=160)
+    width = 0.8 / max(len(series), 1)
+    for index, (name, values, color) in enumerate(series):
+        offsets = [position + (index - (len(series) - 1) / 2) * width for position in range(len(categories))]
+        bars = axes.bar(offsets, [float("nan") if value is None else float(value) for value in values],
+                        width=width * 0.9, label=name, color=color)
+        axes.bar_label(bars, fmt=value_fmt, fontsize=7, padding=1)
+    axes.set_xticks(range(len(categories)))
+    axes.set_xticklabels(categories, rotation=rotation, fontsize=8, ha="right" if rotation else "center")
+    axes.set_ylim(*ylim)
+    axes.set_ylabel(ylabel, fontsize=9)
+    axes.grid(axis="y", color="#D9D9D9", linewidth=0.8)
+    axes.set_axisbelow(True)
+    axes.legend(loc="upper right", frameon=True, fontsize=8)
+    for side in ("top", "right"):
+        axes.spines[side].set_visible(False)
+    figure.tight_layout()
+    figure.savefig(path)
+    plt.close(figure)
+    return str(path)
+
+
+def gd03_line_chart(path, categories, series, ylabel="合格率（%）", ylim=(0, 100), rotation=45, value_fmt="%.1f"):
+    """GD03 折线图（附件样式）：圆点标记、水平网格线、图例右上带框、x 轴标签旋转 45°。"""
+    plt = _gd03_axes()
+    figure, axes = plt.subplots(figsize=(max(6.4, 0.6 * len(categories) + 2.2), 3.8), dpi=160)
+    for name, values, color in series:
+        axes.plot(range(len(categories)), [float("nan") if value is None else float(value) for value in values],
+                  marker="o", markersize=4, linewidth=1.6, label=name, color=color)
+    axes.set_xticks(range(len(categories)))
+    axes.set_xticklabels(categories, rotation=rotation, fontsize=7, ha="right" if rotation else "center")
+    axes.set_ylim(*ylim)
+    axes.set_ylabel(ylabel, fontsize=9)
+    axes.grid(axis="y", color="#D9D9D9", linewidth=0.8)
+    axes.set_axisbelow(True)
+    axes.legend(loc="upper right", frameon=True, fontsize=8)
+    for side in ("top", "right"):
+        axes.spines[side].set_visible(False)
+    figure.tight_layout()
+    figure.savefig(path)
+    plt.close(figure)
+    return str(path)
+
+
 def _marking_chart_path(chart_dir, row):
     # 身份包含路线/方向/管养/区段/侧；摘要防止路径字符清洗碰撞，Word按同一键精确取图。
     identity = tuple(str(row.get(field, "")) for field in (*MARKING_SEGMENT_FIELDS, "marking_position"))
@@ -4493,7 +5994,7 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         return str(segment) + ("" if str(segment).endswith("段") or not str(segment) else "段")
 
     wb = Workbook(); wb.remove(wb.active)
-    counts = {"高度折线": 0, "高度分布": 0, "螺栓柱状": 0, "标线折线": 0}
+    counts = {"高度折线": 0, "高度分布": 0, "螺栓柱状": 0, "标线折线": 0, "四段式柱状": 0, "逐公里折线": 0}
 
     # ---- 工作表1：护栏中心高度（逐区段、逐类型折线图+分布饼图，与Word插图同款） ----
     ws = wb.create_sheet("护栏中心高度")
@@ -4630,6 +6131,85 @@ def write_guangdong_chart_workbook(bundle, output_dir, log=lambda _: None):
         line_style(chart.series[1], "ED7D31", 25400, dash="dash")
         ws.add_chart(chart, f"R{slot}")
         counts["标线折线"] += 1; slot = max(slot + 17, last + 2)
+
+    # ---- 工作表4：GD03 四段式分组柱状图与逐公里折线图（与Word插图同款数据/配色） ----
+    ws = wb.create_sheet("四段式图表")
+
+    def add_grouped(ws, slot, headers, rows, colors, ylabel="合格率（%）", ymax=100):
+        if not rows:
+            return slot
+        header_cells(ws, slot, headers)
+        for index, row in enumerate(rows, 1):
+            for column, value in enumerate(row, 1):
+                ws.cell(slot + index, column, value)
+        last = slot + len(rows)
+        chart = BarChart(); chart.type = "col"; chart.grouping = "clustered"
+        chart.add_data(Reference(ws, min_col=2, max_col=len(headers), min_row=slot, max_row=last), titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=1, min_row=slot + 1, max_row=last))
+        chart.height, chart.width = 8, 13
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = 0, ymax
+        chart.x_axis.delete = chart.y_axis.delete = False
+        chart.legend.position = "tr"
+        chart.y_axis.title = ylabel
+        chart.dataLabels = DataLabelList(); chart.dataLabels.showVal = True
+        chart.dataLabels.numFmt = "0.0"; chart.dataLabels.dLblPos = "outEnd"
+        for series, color in zip(chart.series, colors):
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+        ws.add_chart(chart, f"H{slot}")
+        counts["四段式柱状"] += 1
+        return max(slot + 17, last + 2)
+
+    def add_line(ws, slot, headers, rows, colors, ylabel="合格率（%）", ymax=100):
+        if not rows:
+            return slot
+        header_cells(ws, slot, headers)
+        for index, row in enumerate(rows, 1):
+            for column, value in enumerate(row, 1):
+                ws.cell(slot + index, column, value)
+        last = slot + len(rows)
+        chart = LineChart(); chart.visible_cells_only = False
+        chart.add_data(Reference(ws, min_col=2, max_col=len(headers), min_row=slot, max_row=last), titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=1, min_row=slot + 1, max_row=last))
+        chart.height, chart.width = 8, 13
+        chart.y_axis.scaling.min, chart.y_axis.scaling.max = 0, ymax
+        chart.x_axis.delete = chart.y_axis.delete = False
+        chart.legend.position = "tr"
+        chart.y_axis.title = ylabel
+        for series, color in zip(chart.series, colors):
+            line_style(series, color, 12700)
+            series.marker.symbol = "circle"
+        ws.add_chart(chart, f"H{slot}")
+        counts["逐公里折线"] += 1
+        return max(slot + 17, last + 2)
+
+    slot = 2
+    for category in ("高速公路", "普通国省道"):
+        mark = [r for r in bundle.get("marking", []) if r.get("category") == category]
+        slot = add_grouped(ws, slot, ["路线（管养单位）", "左侧标线", "右侧标线", "总体"],
+                           [[f"{r['route']}{manager_display(r.get('manager'), city)}", (r["left_rate"] or 0) * 100,
+                             (r["right_rate"] or 0) * 100, (r["overall_rate"] or 0) * 100]
+                            for r in GuangdongStatistics.marking_route_units(mark)],
+                           ("4472C4", "ED7D31", "A5A5A5"))
+        for item in GuangdongStatistics.marking_typical_segments(mark, limit=3):
+            slot = add_line(ws, slot, ["公里", "左侧标线", "右侧标线", "总体"],
+                            [[str(r["km"]), (r["left_rate"] or 0) * 100, (r["right_rate"] or 0) * 100,
+                              (r["overall_rate"] or 0) * 100] for r in item["km_items"]],
+                            ("4472C4", "ED7D31", "A5A5A5"))
+        height = [r for r in bundle.get("height", []) if r.get("category") == category]
+        slot = add_grouped(ws, slot, ["路线（管养单位）", "二波护栏", "三波护栏", "总体"],
+                           [[f"{r['route']}{manager_display(r.get('manager'), city)}", (r["二波"]["rate"] or 0) * 100,
+                             (r["三波"]["rate"] or 0) * 100, (r["rate"] or 0) * 100]
+                            for r in GuangdongStatistics.height_route_units(height)],
+                           ("4472C4", "ED7D31", "A5A5A5"))
+        bolt = [r for r in bundle.get("bolt", []) if r.get("category") == category]
+        bolt_rows = GuangdongStatistics.bolt_route_units(bolt)
+        bolt_max = max([(r["rate"] or 0) * 100 for r in bolt_rows] or [5]) * 1.2
+        slot = add_grouped(ws, slot, ["路线（管养单位）", "缺失率"],
+                           [[f"{r['route']}{manager_display(r.get('manager'), city)}", (r["rate"] or 0) * 100] for r in bolt_rows],
+                           ("4472C4",), ylabel="螺栓缺失率（%）", ymax=max(5.0, bolt_max))
+    for column, width in zip("ABCD", (24, 12, 12, 12)):
+        ws.column_dimensions[column].width = width
 
     summary = wb.create_sheet("标线区段汇总")
     header_cells(summary, 1, ["地市", "道路类别", "路线", "方向", "管养单位", "检测区段", "标线位置", "有效单元数", "均值", "合格单元数", "合格率"])

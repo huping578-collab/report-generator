@@ -133,7 +133,7 @@ class YunfuMarkingTest(unittest.TestCase):
         self.assertEqual(engine.marking_side_names(["标线1", "标线2"]),
                          {"标线1": "左侧标线", "标线2": "右侧标线"})
 
-    def test_word_excel_charts_use_the_same_isolated_groups_and_sides(self):
+    def test_word_charts_use_gd03_charts_and_excel_export_keeps_groups_isolated(self):
         rows = []
         for changes in ({}, {"管养单位": "乙管养单位"}, {"路线编号": "S265"}, {"检测方向": "下行"}):
             rows.extend([wide_row(**changes), wide_row("1000+020.0-1000+040.0", **changes)])
@@ -143,23 +143,25 @@ class YunfuMarkingTest(unittest.TestCase):
         bundle = engine.GuangdongBatchRunner.build_bundles(scanned, route_index)["云浮"]
         with TemporaryDirectory() as tmp:
             images = engine.guangdong_report_images(bundle, tmp)
-            self.assertEqual(len(images), 9)  # 4 identities x 2 sides + right-only gap
-            expected_images = Counter(hashlib.sha256(Path(image["line"]).read_bytes()).hexdigest() for image in images.values())
+            self.assertEqual(len(images), 9)  # 4 identities x 2 sides + right-only gap（Excel 逐区段图不变）
             doc = Document(engine.GuangdongChapterWriter.write("云浮", bundle, tmp, TEMPLATE, {"marking": 5, "height": 5, "bolt": 5}))
-            actual_images = Counter(hashlib.sha256(doc.part.related_parts[shape._inline.graphic.graphicData.pic.blipFill.blip.embed].blob).hexdigest() for shape in doc.inline_shapes)
-            self.assertEqual(actual_images, expected_images)
-            table = max((t for t in doc.tables if "管养单位" in [c.text for c in t.rows[0].cells]
-                         and "左侧标线均值" in [c.text for c in t.rows[0].cells]), key=lambda t: len(t.rows))
+            chart_dir = Path(tmp) / "云浮" / "charts"
+            generated = {hashlib.sha256(p.read_bytes()).hexdigest() for p in chart_dir.glob("*gd03_*.png")}
+            embedded = {hashlib.sha256(doc.part.related_parts[shape._inline.graphic.graphicData.pic.blipFill.blip.embed].blob).hexdigest()
+                        for shape in doc.inline_shapes}
+            self.assertTrue(generated, "未生成 GD03 统计图")
+            self.assertTrue(embedded and embedded <= generated, "docx 内嵌图必须来自本次生成的 GD03 统计图")
+            table = next(t for t in doc.tables if "检测范围" in [c.text for c in t.rows[0].cells])
             headers = [c.text for c in table.rows[0].cells]
             self.assertIn("管养单位", headers)
-            self.assertLess(headers.index("左侧标线均值"), headers.index("右侧标线均值"))
-            self.assertEqual(len(table.rows), 6)
+            self.assertLess(headers.index("左侧合格率(%)"), headers.index("右侧合格率(%)"))
+            self.assertEqual(len(table.rows), 4)  # 表头 + 3 个“路线—管养单位”100m 单元
             for cells in table.rows[1:]:
                 record = dict(zip(headers, (c.text for c in cells.cells)))
                 self.assertNotIn("None", [c.text for c in cells.cells])
-                self.assertEqual(record["右侧标线均值"], "90.00")
-                self.assertEqual(record["右侧标线合格率"], "100.00%")
-                self.assertIn(record["左侧标线均值"], ("40.00", "—"))
+                self.assertEqual(record["左侧合格率(%)"], "0.0")
+                self.assertEqual(record["右侧合格率(%)"], "100.0")
+                self.assertEqual(record["总体合格率(%)"], "50.0")
             wb = openpyxl.load_workbook(engine.write_guangdong_chart_workbook(bundle, tmp))
             ws = wb["标线逆反射"]
             self.assertEqual(len(ws._charts), 9)
@@ -209,6 +211,34 @@ class YunfuMarkingTest(unittest.TestCase):
                     "value": 10.0, "target": 80.0} for i in range(6)]
         weak = engine.GuangdongStatistics.continuous_marking_weak(reverse, minimum_length_m=120)
         self.assertEqual([(w["start_m"], w["end_m"]) for w in weak], [(1880.0, 2000.0)])
+
+    def test_bolt_over5_runs_uses_per_km_keys(self):
+        def bolt(km, splice_missing, connection_missing):
+            return {"route": "G999", "direction": "上行", "manager": "甲管养单位",
+                    "station_m": km * 1000.0, "splice": 100.0, "splice_missing": float(splice_missing),
+                    "connection": 100.0, "connection_missing": float(connection_missing), "outline": 0.0}
+
+        rows = [bolt(1000, 10, 5), bolt(1001, 8, 4), bolt(1002, 0, 0)]
+        runs = engine.GuangdongStatistics.bolt_over5_runs(rows)
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual((run["start_m"], run["end_m"], run["length_km"]), (1000000.0, 1002000.0, 2))
+        self.assertEqual(run["missing"], 27.0)
+        self.assertAlmostEqual(run["rate"], 27.0 / (215.0 + 212.0), places=12)
+
+    def test_height_over10_runs_buckets_per_kind(self):
+        """R-02：同公里内两波与三波分别判定，不得因混合稀释而漏报（S51 K37 口径）。"""
+        rows = [{"route": "S51", "direction": "下行", "manager": "甲管养单位", "station_m": 37000.0 + index,
+                 "guardrail_type": "二波", "height": 600.0} for index in range(131)]
+        rows += [{"route": "S51", "direction": "下行", "manager": "甲管养单位", "station_m": 37000.0 + index,
+                  "guardrail_type": "三波", "height": 850.0 if index < 5 else 700.0} for index in range(20)]
+        runs = engine.GuangdongStatistics.height_over10_runs(rows)
+        self.assertEqual(len(runs), 1)
+        run = runs[0]
+        self.assertEqual((run["route"], run["direction"], run["kind"]), ("S51", "下行", "三波"))
+        self.assertEqual((run["count"], run["over_count"]), (20, 5))
+        self.assertAlmostEqual(run["over_ratio"], 0.25)
+        self.assertEqual((run["start_m"], run["end_m"]), (37000.0, 38000.0))
 
 
 if __name__ == "__main__":
