@@ -55,25 +55,31 @@ jobs:
           generate_release_notes: true
           files: dist/report-generator-Setup.exe
 
-      - name: Ensure legacy Chinese asset via API (correct UTF8 name)
+      # GitHub may normalize non-ASCII filenames; keep the updater filename
+      # stable and use the asset label for the Chinese display name.
+      - name: Label and verify installer asset
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $headers = @{"Authorization"="Bearer $env:GH_TOKEN"; "Accept"="application/vnd.github+json"; "User-Agent"="release-legacy-fix"}
-          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tag" -Headers $headers -TimeoutSec 20
-          $hasLegacy = $false
-          foreach ($a in $rel.assets) { if ($a.name -eq "报告生成工具-Setup.exe") { $hasLegacy = $true; break } }
-          if ($hasLegacy) {
-            Write-Host "Legacy asset already present"
-            exit 0
+          $ErrorActionPreference = 'Stop'
+          $tag = [System.Uri]::EscapeDataString($env:RELEASE_TAG)
+          $headers = @{"Authorization"="Bearer $env:GH_TOKEN"; "Accept"="application/vnd.github+json"; "User-Agent"="release-verify"}
+          $api = "https://api.github.com/repos/$env:GITHUB_REPOSITORY"
+          $rel = Invoke-RestMethod -Uri "$api/releases/tags/$tag" -Headers $headers -TimeoutSec 30
+          $name = 'report-generator-Setup.exe'
+          $label = '报告生成工具-Setup.exe'
+          $assets = @(Invoke-RestMethod -Uri "$api/releases/$($rel.id)/assets?per_page=100" -Headers $headers -TimeoutSec 30)
+          $matches = @($assets | Where-Object { $_.name -eq $name })
+          if ($matches.Count -ne 1) { throw "Expected exactly one $name asset" }
+          $asset = $matches[0]
+          $body = [System.Text.Encoding]::UTF8.GetBytes((@{name=$name; label=$label} | ConvertTo-Json -Compress))
+          $null = Invoke-RestMethod -Uri "$api/releases/assets/$($asset.id)" -Method Patch -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $body -TimeoutSec 30
+          $verified = Invoke-RestMethod -Uri "$api/releases/assets/$($asset.id)" -Headers $headers -TimeoutSec 30
+          $file = Get-Item "dist/$name"
+          $digest = 'sha256:' + (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($verified.name -ne $name -or $verified.label -ne $label -or $verified.state -ne 'uploaded' -or $verified.size -ne $file.Length -or $verified.digest -ne $digest) {
+            throw 'Release asset verification failed (name, label, state, size or digest)'
           }
-          Write-Host "Legacy asset missing, uploading via API with UTF8 name..."
-          $uploadUrl = ($rel.upload_url -replace "\{\?name,label\}", "")
-          $encodedName = [System.Uri]::EscapeDataString("报告生成工具-Setup.exe")
-          $uri = "${uploadUrl}?name=${encodedName}"
-          $filePath = "dist/报告生成工具-Setup.exe"
-          $bytes = [System.IO.File]::ReadAllBytes($filePath)
-          $resp = Invoke-RestMethod -Uri $uri -Method Post -Headers @{"Authorization"="Bearer $env:GH_TOKEN"; "Content-Type"="application/octet-stream"; "User-Agent"="release-legacy-fix"} -Body $bytes -TimeoutSec 120
-          Write-Host "Legacy upload done: $($resp.name) id $($resp.id)"
+          Write-Host "Verified $($verified.name) id=$($verified.id) size=$($verified.size) digest=$($verified.digest)"

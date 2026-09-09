@@ -576,6 +576,7 @@ def bin_index(kind, height):
 
 def collect_records(segments, detail_dir, log=lambda _: None):
     records, excluded = [], Counter()
+    conflicts = Counter()
     files = sorted(Path(detail_dir).glob("*.xlsx"))
     files = [p for p in files if not p.name.startswith("~$")]
     if not files:
@@ -585,6 +586,7 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             continue
         log(format_progress("解析明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
+        file_dir = file_direction(path)
         for source_sheet, source_row, row in _iter_height_rows_with_source(path):
             kind = guardrail_type(row.get("护栏类型"))
             height = row.get("梁板中心高度(mm)")
@@ -594,6 +596,7 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             if remark not in {"", "无备注"}:
                 excluded[remark] += 1
                 continue
+            _count_direction_conflict(conflicts, path, row.get("方向"), file_dir)
             basis = "原始桩号" if use_raw else "电子修正桩号"
             raw_station = station_to_m(row.get("原始桩号"))
             electronic_station = station_to_m(row.get("电子修正桩号"))
@@ -609,7 +612,7 @@ def collect_records(segments, detail_dir, log=lambda _: None):
                 "file": path.name,
                 "source_sheet": source_sheet,
                 "source_row": source_row,
-                "direction": str(row.get("方向") or ""),
+                "direction": file_dir,
                 "route": _route(route or segment_data.get("route", "")),
                 "county": str(segment_data.get("county") or "").strip(),
                 "station": station,
@@ -627,11 +630,13 @@ def collect_records(segments, detail_dir, log=lambda _: None):
             record["kind"], round(record["height"], 3),
         )
         unique.setdefault(key, record)
+    _log_direction_conflicts(conflicts, log)
     return list(unique.values()), len(records) - len(unique), excluded
 
 
 def collect_bolt_records(segments, detail_dir, log=lambda _: None):
     records = []
+    conflicts = Counter()
     files = sorted(Path(detail_dir).glob("*.xlsx"))
     files = [p for p in files if not p.name.startswith("~$")]
     if not files:
@@ -646,9 +651,11 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
     for index, path in enumerate(files, 1):
         log(format_progress("解析螺栓明细", index, len(files), path.name))
         use_raw = path.name.startswith("G210上行K2264K2325-")
+        file_dir = file_direction(path)
         for source_sheet, source_row, row in _iter_bolt_rows_with_source(path):
             if not remark_marker_allowed(row):
                 continue
+            _count_direction_conflict(conflicts, path, row.get("方向"), file_dir)
             basis = "原始桩号" if use_raw else "电子修正桩号"
             raw_station = station_to_m(row.get("原始桩号"))
             electronic_station = station_to_m(row.get("电子修正桩号"))
@@ -670,7 +677,7 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
                 "file": path.name,
                 "source_sheet": source_sheet,
                 "source_row": source_row,
-                "direction": str(row.get("方向") or ""),
+                "direction": file_dir,
                 "route": _route(route or segment_data.get("route", "")),
                 "county": str(segment_data.get("county") or "").strip(),
                 "station": station,
@@ -691,6 +698,7 @@ def collect_bolt_records(segments, detail_dir, log=lambda _: None):
             record["connection"], record["connection_missing"],
         )
         unique.setdefault(key, record)
+    _log_direction_conflicts(conflicts, log)
     return list(unique.values()), len(records) - len(unique)
 
 
@@ -701,6 +709,23 @@ def normalize_direction(value):
     if "下" in text:
         return "下行"
     return text.strip()
+
+
+def file_direction(path):
+    """重庆口径：源文件名含“下行”判为下行，否则上行；不采用表内方向字段。"""
+    return "下行" if "下行" in Path(path).name else "上行"
+
+
+def _count_direction_conflict(conflicts, path, row_direction, file_dir):
+    """表内方向字段与文件名判定不一致时计数，统计仍按文件名口径。"""
+    row_dir = normalize_direction(row_direction)
+    if row_dir in ("上行", "下行") and row_dir != file_dir:
+        conflicts[(path.name, file_dir, row_dir)] += 1
+
+
+def _log_direction_conflicts(conflicts, log):
+    for (name, file_dir, row_dir), count in sorted(conflicts.items()):
+        log(f"方向冲突提示：{name} 按文件名判为{file_dir}，表内{count}条记为{row_dir}，统计以文件名口径为准。")
 
 
 def _segment_index(segments, station, route="", county="", direction=""):
@@ -796,7 +821,7 @@ def collect_disease_image_index(disease_dir, log=lambda _: None):
                         "extension": extension,
                         "source_sheet": sheet_name,
                         "source_row": excel_row,
-                        "direction": normalize_direction(row.get("方向")),
+                        "direction": file_direction(path),
                         "route": _route(row.get("路线编号") or row.get("路线") or ""),
                         "county": str(row.get("区县") or row.get("所属区县") or row.get("区域") or "").strip(),
                         "raw_station": raw_station,
@@ -816,7 +841,7 @@ def match_disease_image(record, image_index):
     if not image_index or record.get("raw_station") is None:
         return None
     key = (normalize_direction(record.get("direction")), round(record["raw_station"], 1))
-    candidates = image_index.get(key, [])
+    candidates = [item for item in image_index.get(key, []) if item.get("role") in (None, "bolt")]
     route = _route(record.get("route") or "")
     county = str(record.get("county") or "").strip()
     if route:
@@ -998,7 +1023,7 @@ def disease_station_photo_index(disease_path, image_map, role=None):
                     continue
                 if role == "height" and ("螺栓" in disease_type or "高度" not in disease_type):
                     continue
-                direction = normalize_direction(row.get("方向"))
+                direction = file_direction(disease_path)
                 route = _route(row.get("路线编号") or row.get("路线") or "")
                 county = str(row.get("区县") or row.get("所属区县") or row.get("区域") or "").strip()
                 for column in ("原始桩号", "电子修正桩号"):
@@ -1072,7 +1097,7 @@ def build_segment_tci_photos(tci_path, image_map, segments):
         row = rows_by_sheet.get(sheet, {}).get(excel_row)
         if not row:
             continue
-        direction = normalize_direction(row.get("方向"))
+        direction = file_direction(tci_path)
         station = None
         for column in ("电子修正桩号", "原始桩号"):
             station = station_to_m(row.get(column))
@@ -1091,7 +1116,7 @@ def build_segment_tci_photos(tci_path, image_map, segments):
         index = _segment_index(segments, station, route, county, direction)
         if index is not None:
             for media_name, extension in photos:
-                result.setdefault(index, []).append((description or "病害", media_name, extension))
+                result.setdefault((index, direction), []).append((description or "病害", media_name, extension))
     return result
 
 
@@ -1101,43 +1126,98 @@ def bolt_missing_rate(splice, connection, missing):
     return ratio * 100 if ratio is not None else None
 
 
+DIRECTIONS = ("上行", "下行")
+
+
+def _group_by_segment(records):
+    """按区段一次性归组，避免每个区段重复扫描全部记录。"""
+    grouped = {}
+    for record in records:
+        grouped.setdefault(record["segment"], []).append(record)
+    return grouped
+
+
+def _bolt_totals(rows):
+    splice = sum(record["splice"] for record in rows)
+    connection = sum(record["connection"] for record in rows)
+    missing = sum(record["splice_missing"] + record["connection_missing"] for record in rows)
+    return {
+        "splice": int(round(splice)),
+        "connection": int(round(connection)),
+        "missing": int(round(missing)),
+        "rate": bolt_missing_rate(splice, connection, missing),
+        "points": len(rows),
+    }
+
+
+def merge_bolt_totals(items):
+    """合并若干螺栓统计（按数量求和后重算缺失率）。"""
+    splice = sum(item["splice"] for item in items)
+    connection = sum(item["connection"] for item in items)
+    missing = sum(item["missing"] for item in items)
+    return {
+        "splice": splice, "connection": connection, "missing": missing,
+        "rate": bolt_missing_rate(splice, connection, missing),
+        "points": sum(item["points"] for item in items),
+    }
+
+
 def make_bolt_stats(segments, records):
+    grouped = _group_by_segment(records)
     stats = []
     for index, segment in enumerate(segments):
-        rows = [record for record in records if record["segment"] == index]
-        splice = sum(record["splice"] for record in rows)
-        connection = sum(record["connection"] for record in rows)
-        missing = sum(record["splice_missing"] + record["connection_missing"] for record in rows)
-        stats.append({
-            "segment": segment,
-            "splice": int(round(splice)),
-            "connection": int(round(connection)),
-            "missing": int(round(missing)),
-            "rate": bolt_missing_rate(splice, connection, missing),
-            "points": len(rows),
-        })
+        rows = grouped.get(index, [])
+        by_direction = {
+            direction: _bolt_totals([record for record in rows if record["direction"] == direction])
+            for direction in DIRECTIONS
+        }
+        stats.append({"segment": segment, "by_direction": by_direction, **_bolt_totals(rows)})
     return stats
 
 
+def _height_type_bins(rows, kind):
+    heights = [record["height"] for record in rows if record["kind"] == kind]
+    bins = [0] * 5
+    for height in heights:
+        bins[bin_index(kind, height)] += 1
+    percentages = [round(value * 100 / len(heights), 2) if heights else 0 for value in bins]
+    return {
+        "count": len(heights), "bins": bins,
+        "pcts": percentages, "pass": percentages[2] if heights else 0,
+    }
+
+
+def merge_height_types(items):
+    """合并若干 {kind: 分档} 统计（按点数求和后重算占比/合格率）。"""
+    merged = {}
+    for kind in ("二波", "三波"):
+        count = sum(item[kind]["count"] for item in items)
+        bins = [sum(item[kind]["bins"][index] for item in items) for index in range(5)]
+        percentages = [round(bins[index] * 100 / count, 2) if count else 0 for index in range(5)]
+        merged[kind] = {
+            "count": count, "bins": bins,
+            "pcts": percentages, "pass": percentages[2] if count else 0,
+        }
+    return merged
+
+
 def make_stats(segments, records):
+    grouped = _group_by_segment(records)
     stats = []
     for segment_index, segment in enumerate(segments):
-        types = {}
-        for kind in ("二波", "三波"):
-            heights = [
-                record["height"] for record in records
-                if record["segment"] == segment_index and record["kind"] == kind
-            ]
-            bins = [0] * 5
-            for height in heights:
-                bins[bin_index(kind, height)] += 1
-            percentages = [round(value * 100 / len(heights), 2) if heights else 0 for value in bins]
-            types[kind] = {
-                "count": len(heights), "bins": bins,
-                "pcts": percentages, "pass": percentages[2] if heights else 0,
+        rows = grouped.get(segment_index, [])
+        by_direction = {
+            direction: {
+                kind: _height_type_bins([record for record in rows if record["direction"] == direction], kind)
+                for kind in ("二波", "三波")
             }
-        stats.append({"segment": segment, "types": types})
-
+            for direction in DIRECTIONS
+        }
+        stats.append({
+            "segment": segment,
+            "types": merge_height_types(list(by_direction.values())),
+            "by_direction": by_direction,
+        })
     return stats
 
 
@@ -1190,6 +1270,7 @@ def _tci_station_value(row: dict):
 
 def collect_tci_records(segments, tci_path, log=lambda _: None):
     records = []
+    conflicts = Counter()
     if tci_path is None:
         return records
     pth = Path(tci_path)
@@ -1204,6 +1285,7 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
         return records
     for file_number, fpath in enumerate(files, 1):
         log(format_progress("解析TCI", file_number, len(files), fpath.name))
+        file_dir = file_direction(fpath)
         try:
             wb = openpyxl.load_workbook(fpath, data_only=True, read_only=True)
         except Exception as e:
@@ -1348,7 +1430,8 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                 index = next((i for i, h in enumerate(headers) if h in names), None)
                 return str(vals[index] or "").strip() if index is not None and index < len(vals) else ""
             county = identity_value(("区县", "所属区县", "区域"))
-            direction = normalize_direction(identity_value(("方向", "行驶方向")))
+            _count_direction_conflict(conflicts, fpath, identity_value(("方向", "行驶方向")), file_dir)
+            direction = file_dir
             seg_idx = _segment_index(segments, station, row_route, county, direction)
             if seg_idx is None:
                 continue
@@ -1359,6 +1442,7 @@ def collect_tci_records(segments, tci_path, log=lambda _: None):
                             "source_sheet": sheet_name, "source_row": excel_row,
                             "light": int(light), "heavy": int(heavy), "sign": int(sign), "marking": float(marking)})
         log(f"TCI 病害 {fpath.name}: 落段 {len([r for r in records if True])} 条")
+    _log_direction_conflicts(conflicts, log)
     return records
 
 def make_tci_stats(segments, tci_records):
@@ -1937,16 +2021,17 @@ def order_example_records(records):
     return sorted(records, key=key)
 
 
-def row_has_height_photo(row, photo_index):
-    """Whether a height row has a role- and route-matching source photo."""
+def matching_height_photos(row, photo_index):
+    """Return only identity-matching photos at the first matching station basis."""
     if not photo_index:
-        return False
+        return []
     direction = normalize_direction(row.get("direction"))
     for station_key in ("raw_station", "electronic_station", "station"):
         station = row.get(station_key)
         if station is None:
             continue
         candidates = photo_index.get((direction, round(float(station), 1)), [])
+        matches = []
         for candidate in candidates:
             if isinstance(candidate, dict):
                 if candidate.get("role") not in (None, "height", "disease"):
@@ -1959,8 +2044,16 @@ def row_has_height_photo(row, photo_index):
                 candidate_county = str(candidate.get("county") or "").strip()
                 if row_county and candidate_county and candidate_county not in county_short_names(row_county):
                     continue
-            return True
-    return False
+            if candidate not in matches:
+                matches.append(candidate)
+        if matches:
+            return matches
+    return []
+
+
+def row_has_height_photo(row, photo_index):
+    """Use the same identity filter for example selection and photo rendering."""
+    return bool(matching_height_photos(row, photo_index))
 
 
 def select_height_example_points(rows, segment_index=0, kind="", photo_index=None):
@@ -2061,51 +2154,58 @@ def bolt_example_text(example):
 
 
 def report_images(temp_dir, segments, stats, records):
+    """按区段×方向分别绘制高度折线图与分档分布图（无图内标题）。"""
     images = {}
     plt.rcParams["font.sans-serif"] = ["SimSun", "Microsoft YaHei", "Arial Unicode MS"]
     plt.rcParams["axes.unicode_minus"] = False
+    grouped = {}
+    for record in records or []:
+        grouped.setdefault(
+            (record["segment"], normalize_direction(record.get("direction")), record["kind"]), []
+        ).append(record)
     for segment_index, item in enumerate(stats):
-        segment = item["segment"]
-        for kind in ("二波", "三波"):
-            rows = sorted(
-                [record for record in records if record["segment"] == segment_index and record["kind"] == kind],
-                key=lambda record: record["station"],
-            )
-            if not rows:
-                continue
-            key = (segment_index, kind)
-            line_path = Path(temp_dir) / f"line_{segment_index}_{kind}.png"
-            pie_path = Path(temp_dir) / f"pie_{segment_index}_{kind}.png"
-            x = list(range(len(rows))); heights = [row["height"] for row in rows]
-            figure, axis = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
-            axis.plot(x, heights, color="#4472C4", linewidth=1, label="梁板中心高度(mm)")
-            standards = (580, 620) if kind == "二波" else (677, 717)
-            for standard, color in zip(standards, ("#ED7D31", "#A5A5A5")):
-                axis.plot(
-                    x, [standard] * len(x), color=color, linewidth=2,
-                    label=f"标准值（{standard}mm）",
+        for direction in DIRECTIONS:
+            for kind in ("二波", "三波"):
+                rows = sorted(
+                    grouped.get((segment_index, direction, kind), []),
+                    key=lambda record: record["station"],
                 )
-            axis.set_ylim(300, 850); axis.grid(True, alpha=0.25)
-            ticks = sorted(set(int(i * (len(x) - 1) / min(9, max(1, len(x) - 1))) for i in range(min(10, len(x)))))
-            axis.set_xticks(ticks); axis.set_xticklabels([format_station(rows[i]["station"]) for i in ticks], rotation=30, ha="right", fontsize=7)
-            axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
-            figure.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.30)
-            figure.savefig(line_path, transparent=False); plt.close(figure)
+                if not rows:
+                    continue
+                key = (segment_index, direction, kind)
+                line_path = Path(temp_dir) / f"line_{segment_index}_{direction}_{kind}.png"
+                pie_path = Path(temp_dir) / f"pie_{segment_index}_{direction}_{kind}.png"
+                x = list(range(len(rows))); heights = [row["height"] for row in rows]
+                figure, axis = plt.subplots(figsize=(13 / 2.54, 8 / 2.54), dpi=180)
+                axis.plot(x, heights, color="#4472C4", linewidth=1, label="梁板中心高度(mm)")
+                standards = (580, 620) if kind == "二波" else (677, 717)
+                for standard, color in zip(standards, ("#ED7D31", "#A5A5A5")):
+                    axis.plot(
+                        x, [standard] * len(x), color=color, linewidth=2,
+                        label=f"标准值（{standard}mm）",
+                    )
+                axis.set_ylim(300, 850); axis.grid(True, alpha=0.25)
+                ticks = sorted(set(int(i * (len(x) - 1) / min(9, max(1, len(x) - 1))) for i in range(min(10, len(x)))))
+                axis.set_xticks(ticks); axis.set_xticklabels([format_station(rows[i]["station"]) for i in ticks], rotation=30, ha="right", fontsize=7)
+                axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3, frameon=False)
+                figure.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.30)
+                figure.savefig(line_path, transparent=False); plt.close(figure)
 
-            values = item["types"][kind]["pcts"]
-            labels = (["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"] if kind == "二波" else
-                      ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"])
-            nonzero = [(label, value, f"#{PIE_COLORS[i]}") for i, (label, value) in enumerate(zip(labels, values)) if value > 0]
-            figure, axis = plt.subplots(figsize=(14 / 2.54, 8.5 / 2.54), dpi=180)
-            wedges, _, _ = axis.pie(
-                [value for _, value, _ in nonzero], colors=[color for _, _, color in nonzero],
-                autopct=lambda pct: f"{pct:.2f}%" if pct > 0 else "", pctdistance=1.15,
-                textprops={"fontsize": 8},
-            )
-            axis.legend(wedges, [label for label, _, _ in nonzero], loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
-            figure.subplots_adjust(left=0.02, right=0.76, top=0.88, bottom=0.05)
-            figure.savefig(pie_path, transparent=False); plt.close(figure)
-            images[key] = {"line": line_path, "pie": pie_path}
+                data = (item.get("by_direction") or {}).get(direction, {}).get(kind) or _height_type_bins(rows, kind)
+                values = data["pcts"]
+                labels = (["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"] if kind == "二波" else
+                          ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"])
+                nonzero = [(label, value, f"#{PIE_COLORS[i]}") for i, (label, value) in enumerate(zip(labels, values)) if value > 0]
+                figure, axis = plt.subplots(figsize=(14 / 2.54, 8.5 / 2.54), dpi=180)
+                wedges, _, _ = axis.pie(
+                    [value for _, value, _ in nonzero], colors=[color for _, _, color in nonzero],
+                    autopct=lambda pct: f"{pct:.2f}%" if pct > 0 else "", pctdistance=1.15,
+                    textprops={"fontsize": 8},
+                )
+                axis.legend(wedges, [label for label, _, _ in nonzero], loc="center left", bbox_to_anchor=(1.0, 0.5), frameon=False)
+                figure.subplots_adjust(left=0.02, right=0.76, top=0.88, bottom=0.05)
+                figure.savefig(pie_path, transparent=False); plt.close(figure)
+                images[key] = {"line": line_path, "pie": pie_path}
     return images
 
 

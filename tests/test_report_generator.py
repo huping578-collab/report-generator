@@ -19,6 +19,57 @@ from bridge import DesktopBridge
 from backend import markdown_skeleton, minimal_docx, report_engine as engine
 
 
+def test_chongqing_three_chapters_preserve_sorted_section_direction(tmp_path):
+    segments = [dict(county='甲县', route='G210', start=a, end=b, mileage=(b-a)/1000)
+                for a, b in [(5000, 6000), (1000, 2000)]]
+    heights = [dict(segment=i, route='G210', county='甲县', kind='二波', height=600,
+                    direction=d, station=s['start']+10, raw_station=s['start']+10,
+                    electronic_station=s['start']+10)
+               for i, s in enumerate(segments) for d in engine.DIRECTIONS]
+    bolts = [dict(r, splice=10, connection=10, splice_missing=1, connection_missing=0) for r in heights]
+    tci = [dict(r, light=1, heavy=0, sign=0, marking=0) for r in heights]
+    hs, bs, ts = engine.make_stats(segments, heights), engine.make_bolt_stats(segments, bolts), engine.make_tci_stats(segments, tci)
+    images = engine.report_images(tmp_path, segments, hs, heights)
+    for chapter in ('height', 'bolt', 'tci'):
+        doc = Document()
+        if chapter == 'height':
+            minimal_docx._section_height(doc, segments, hs, heights, images, tmp_path)
+            assert len(doc.inline_shapes) == 8
+        elif chapter == 'bolt':
+            minimal_docx._section_bolt(doc, segments, bs, bolts, {}, tmp_path, hs)
+        else:
+            minimal_docx._section_tci(doc, segments, ts, engine.report_tci_images(tmp_path, segments, ts), tmp_path)
+        headings = [p.text for p in doc.paragraphs if p.style.name == 'Heading 3']
+        assert headings == [f'G210线{d}{engine.format_station(a)}～{engine.format_station(b)}段'
+                            for a,b in [(1000,2000),(5000,6000)] for d in engine.DIRECTIONS]
+        captions = [p.text.split()[0] for p in doc.paragraphs if p.text.startswith(('图4.', '图5.', '图3.'))]
+        assert len(captions) == len(set(captions))
+        route_tables = [t for t in doc.tables if '方向' in [c.text for c in t.rows[0].cells]]
+        assert route_tables and all('起点桩号' in [c.text for c in t.rows[0].cells] for t in route_tables)
+
+
+def test_height_photo_consumer_filters_each_candidate(tmp_path):
+    from PIL import Image
+    point = dict(route='G210', county='甲县', direction='上行', station=1100,
+                 raw_station=1100, electronic_station=1100, height=600)
+    candidates = []
+    for index, identity in enumerate([dict(route='G211'), dict(county='乙县'), dict(role='bolt'), {}]):
+        descriptor = dict(point, role='height', workbook=tmp_path / f'{index}.xlsx', media='xl/media/image1.png')
+        descriptor.update(identity)
+        data = io.BytesIO()
+        Image.new('RGB', (10,10), (index*50,0,0)).save(data, format='PNG')
+        with zipfile.ZipFile(descriptor['workbook'], 'w') as archive:
+            archive.writestr(descriptor['media'], data.getvalue())
+        candidates.append(descriptor)
+    result = minimal_docx._match_station_photos([point], {('上行',1100):candidates})
+    expected = engine.read_media(candidates[-1]['workbook'], candidates[-1]['media'])
+    assert result == {0:[expected]}
+    doc = Document()
+    minimal_docx._example_table(doc, [point], result, tmp_path)
+    assert [(shape.width, shape.height) for shape in doc.inline_shapes] == [(2160000,2880000)]
+    assert 'noChangeAspect="1"' not in doc._element.xml
+
+
 def test_desktop_apple_style_layout():
     """Render real HTML/JS in Chrome; no desktop API or report generation is mocked."""
     import html
@@ -124,8 +175,9 @@ def test_chongqing_tci_source_identity_and_boundary_assignment():
     path = root / "identity.xlsx"
     wb.save(path)
     records = engine.collect_tci_records(segments, path)
-    assert [r["segment"] for r in records] == [1, 2, 3, 4]
-    assert [r["direction"] for r in records] == ["上行", "下行", "上行", "上行"]
+    # 重庆口径：方向按源文件名判定（identity.xlsx 不含“下行”），表内方向仅用于冲突提示。
+    assert [r["segment"] for r in records] == [1, 0, 3, 4]
+    assert [r["direction"] for r in records] == ["上行", "上行", "上行", "上行"]
     assert records[2]["county"] == "乙县"
     # 市域标签不是区县；单县输入仍应落段。
     ws.delete_rows(3, 4)
@@ -1528,7 +1580,7 @@ class MinimalDocxTests(unittest.TestCase):
             self.assertFalse(any("5.1" in h or "5.2" in h for h in headings), headings)
             self.assertNotIn("由程序根据检测统计自动生成", text)
             # D6 联动：第二段螺栓无记录但高度有数据，应为中性表述。
-            self.assertIn("G210线共检出拼接螺栓80颗", text)
+            self.assertIn("共检出拼接螺栓80颗，连接螺栓120颗，缺失螺栓4颗，缺失率为1.96%", text)
             self.assertNotIn("本段无波形护栏", text)
 
     def test_overview_table_has_county_column(self) -> None:
@@ -2750,7 +2802,7 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
             self.assertTrue(any(required in h for h in headings), f"missing static heading: {required}")
         # 按路线合并后，部分缺源不再建立独立区段小节。
         self.assertIn("部分检测区间未提供TCI数据", text)
-        self.assertIn("G210线共检出拼接螺栓80颗", text)
+        self.assertIn("共检出拼接螺栓80颗，连接螺栓120颗，缺失螺栓4颗，缺失率为1.96%", text)
 
     def test_tci_section_writes_route_subsection_and_excludes_missing_units(self) -> None:
         segments = build_demo_segments()
@@ -3112,7 +3164,7 @@ class T11aDataLayerTests(unittest.TestCase):
         self.assertEqual(set(image_map), {("xl/worksheets/sheet2.xml", 2), ("xl/worksheets/sheet2.xml", 3)})
         self.assertIn("防护设施缺损", filtered)
         self.assertNotIn("交通标志缺损", filtered)
-        self.assertEqual(set(segment_photos), {0})
+        self.assertEqual(set(segment_photos), {(0, "上行")})
 
     def test_overview_sums_segment_mileage_and_merges_total_by_county_route(self) -> None:
         segments = [
