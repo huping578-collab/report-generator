@@ -3246,6 +3246,22 @@ class T11aDataLayerTests(unittest.TestCase):
         self.assertFalse(engine.row_has_height_photo(wrong_route, index))
         self.assertFalse(engine.row_has_height_photo(dict(good, station=1101, raw_station=1101, electronic_station=1101), index))
 
+    def test_height_example_points_are_filtered_to_photo_rows_before_selection(self) -> None:
+        """选点前先排除无照片点；一个可挂图点都没有时返回空（不输出无图示例表）。"""
+        records = [
+            {"height": 560.0 + index, "station": 1000.0 + index, "raw_station": 1000.0 + index,
+             "electronic_station": 1000.0 + index, "direction": "上行", "route": "G210", "county": "甲县"}
+            for index in range(10)
+        ]
+        photo = {"role": "height", "route": "G210", "county": "", "workbook": Path("disease.xlsx"), "media": "xl/media/image1.png"}
+        index = {("上行", 1003.0): [dict(photo)], ("上行", 1006.0): [dict(photo)]}
+        points = engine.select_height_example_points(records, 0, "二波", photo_index=index)
+        self.assertEqual([point["station"] for point in points], [1006.0])
+        for point in points:
+            self.assertTrue(engine.matching_height_photos(point, index), point)
+        self.assertEqual(engine.select_height_example_points(records, 0, "二波", photo_index={("上行", 9999.0): [dict(photo)]}), [])
+        self.assertEqual(len(engine.select_height_example_points(records, 0, "二波")), 1)
+
     def test_disease_image_index_keeps_workbook_identity_when_media_names_repeat(self) -> None:
         import io
         from openpyxl.drawing.image import Image as XLImage

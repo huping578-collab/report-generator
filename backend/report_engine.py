@@ -2058,48 +2058,34 @@ def row_has_height_photo(row, photo_index):
 
 
 def select_height_example_points(rows, segment_index=0, kind="", photo_index=None):
-    """按检测点数量和高度分位选择自动计算示例点，返回顺序固定且可复现。
+    """选自动计算示例点：先筛出能挂上病害照片的检测点，再按数量/高度分位选点。
 
-    photo_index 提供时优先从各分位区间内“带病害照片”的行中选取，
-    使自动计算示例尽量挂上现场照片；区间内无照片行时回退原中位/随机选择。
+    提供照片索引时只用可挂图点（无照片点不参与选点；本段本方向本波形一个可挂图点
+    都没有就返回空，由调用方不输出无图示例表）；未提供照片索引时退回全部检测点。
     """
+    if photo_index:
+        rows = [row for row in rows if row_has_height_photo(row, photo_index)]
+        if not rows:
+            return []
     ordered = sorted(rows, key=lambda item: (item["height"], item["station"]))
     count = len(ordered)
     if not count:
         return []
-
-    def prefer_photo(group):
-        if photo_index is not None:
-            photo_rows = [r for r in group if row_has_height_photo(r, photo_index)]
-            if photo_rows:
-                return photo_rows[len(photo_rows) // 2]
-        return group[len(group) // 2]
-
     if count > 1000:
         selected = []
         for index in range(4):
-            start = index * count // 4
-            end = (index + 1) * count // 4
-            group = ordered[start:end]
-            selected.append(prefer_photo(group))
+            group = ordered[index * count // 4:(index + 1) * count // 4]
+            selected.append(group[len(group) // 2])
         return order_example_records(selected)
     if count > 100:
         quarter_count = max(1, math.ceil(count * 0.25))
         randomizer = random.Random(f"{segment_index}|{kind}|{count}")
-        low, high = ordered[:quarter_count], ordered[-quarter_count:]
-        if photo_index is not None:
-            low_photo = [r for r in low if row_has_height_photo(r, photo_index)]
-            high_photo = [r for r in high if row_has_height_photo(r, photo_index)]
-            if low_photo:
-                low = low_photo
-            if high_photo:
-                high = high_photo
         return order_example_records([
-            randomizer.choice(low),
-            randomizer.choice(high),
+            randomizer.choice(ordered[:quarter_count]),
+            randomizer.choice(ordered[-quarter_count:]),
         ])
     # 偶数个点时采用靠前的中位点，确保选中的是实际存在的数据点。
-    return order_example_records([prefer_photo(ordered)])
+    return order_example_records([ordered[len(ordered) // 2]])
 
 
 def select_bolt_example_points(rows, disease_image_index=None):
