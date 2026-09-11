@@ -133,7 +133,6 @@ class DesktopBridge:
         engine.generate_statistics_and_report(
             config,
             log=self._on_engine_log,
-            generate_charts_first=True,
             process_height=True,
             process_bolts=True,
             process_tci=bool(values.get("tciPath")),

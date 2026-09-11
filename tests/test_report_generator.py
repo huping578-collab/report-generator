@@ -1157,6 +1157,54 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(events[-1]["status"], "complete")
         self.assertEqual(events[-1]["progress"], 100)
 
+    def test_run_worker_drives_real_chongqing_pipeline(self) -> None:
+        """跑通未打桩的 _run_chongqing 调用链：引擎签名与桥接调用不一致必须在此暴露。"""
+        import openpyxl
+
+        summary = self.root / "real-summary.xlsx"
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "各区县项目概况"
+        sheet.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+        sheet.append([1, "万州区", "G210", "", "一级", 2264.0, 2265.0, 1.0, 1.0])
+        workbook.save(summary)
+
+        detail = self.root / "real-detail"
+        detail.mkdir()
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+        sheet.title = "高度明细"
+        sheet.append(["路线编号", "方向", "原始桩号", "电子修正桩号", "护栏类型", "梁板中心高度(mm)", "异常标记"])
+        sheet.append(["G210", "上行", "K2264+100", "K2264+100", "两波护栏", 600, ""])
+        sheet.append(["G210", "上行", "K2264+200", "K2264+200", "两波护栏", 555, ""])
+        workbook.save(detail / "重庆市-万州区-交安设施现场检测-明细.xlsx")
+
+        disease = self.root / "real-disease"
+        disease.mkdir()
+        for name in ("重庆市-万州区-交安设施现场检测-病害清单.xlsx",):
+            workbook.save(disease / name)
+
+        window = FakeWindow()
+        self.bridge.attach_window(window)
+        payload = self.cq_payload()
+        payload["values"].update({
+            "summaryPath": str(summary),
+            "detailPath": str(detail),
+            "diseasePath": str(disease),
+            "tciPath": "",
+        })
+        with patch.object(self.bridge, "_template_paths", return_value=self.templates()):
+            self.bridge._run_worker(payload)
+        events = [json.loads(script.split("desktopEvents(", 1)[1][:-1]) for script in window.scripts]
+        final = events[-1]
+        self.assertEqual(final["status"], "complete", final.get("message"))
+        self.assertEqual(final["progress"], 100)
+        # 进度条与阶段只增不减
+        seen = [(event["progress"], event["stage"]) for event in events if "progress" in event]
+        self.assertEqual(seen, sorted(seen))
+        self.assertTrue((self.output / "重庆市万州区交安设施检测报告.xlsx").is_file())
+        workbook.close()
+
     def test_progress_mapping(self) -> None:
         """未量化的日志只把进度推进到该阶段起点，可量化阶段按 current/total 线性插值。"""
         self.assertEqual(self.bridge._progress_from_log("正在扫描资料"), (5, 1))
