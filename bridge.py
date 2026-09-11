@@ -19,6 +19,8 @@ class DesktopBridge:
         self._window: webview.Window | None = None
         self._running = False
         self._lock = threading.Lock()
+        self._progress = 5
+        self._stage = 0
 
     def attach_window(self, window: webview.Window) -> None:
         self._window = window
@@ -92,6 +94,7 @@ class DesktopBridge:
 
     def _run_worker(self, payload: dict[str, Any]) -> None:
         try:
+            self._progress, self._stage = 5, 0
             self._emit("run", status="running", progress=5, stage=0, message="开始校验项目资料")
             template = payload["template"]
             values = payload["values"]
@@ -246,30 +249,49 @@ class DesktopBridge:
     def _on_engine_log(self, message: Any) -> None:
         text = str(message)
         progress, stage = self._progress_from_log(text)
-        self._emit("log", status="running", progress=progress, stage=stage, message=text)
+        # 总进度与阶段只增不减：长耗时步骤之间的杂项日志不会让进度条回退。
+        self._progress = max(self._progress, progress)
+        self._stage = max(self._stage, stage)
+        self._emit("log", status="running", progress=self._progress, stage=self._stage, message=text)
 
-    @staticmethod
-    def _progress_from_log(message: str) -> tuple[int, int]:
+    # 各阶段在总进度中的区间，按真实运行实测耗时占比划分（两江新区+万盛+重庆市资料，总 177.5s：
+    # 解析明细≈7s、解析螺栓≈19s、索引病害图片≈4s、逐区县统计与报告≈145s）。
+    _PHASE_RANGES = {
+        "解析TCI": (1, 5, 6),
+        "解析明细": (1, 6, 15),
+        "解析螺栓明细": (1, 15, 26),
+        "索引病害图片": (1, 26, 30),
+        "扫描资料": (1, 5, 30),  # 广东扫描阶段
+    }
+    # 逐区县循环：同一个 1/n 计数器，区县内「统计工作簿」占前一半、「报告」占后一半。
+    _COUNTY_RANGE = (30, 99)
+    _COUNTY_PHASES = {"生成区县统计": (2, 0.0), "生成区县报告": (3, 0.5)}
+    _STAGE_START = (5, 5, 30, 62)
+    # 只认强信号词：完成/生成/报告 这类词在过程中频繁出现，会把进度提前顶到阶段起点。
+    _STAGE_KEYWORDS = (
+        (3, ("保存", "导出", "写入")),
+        (2, ("工作簿", "统计表", "汇总", "图表")),
+        (1, ("扫描", "识别", "索引", "解析", "读取", "校验", "导入")),
+    )
+
+    def _progress_from_log(self, message: str) -> tuple[int, int]:
         structured = engine.parse_progress(message)
         if structured:
-            stage_text = structured["stage"]
-            if any(word in stage_text for word in ("扫描", "识别", "索引", "解析", "读取")):
-                stage, start, end = 1, 20, 60
-            elif any(word in stage_text for word in ("图表", "工作簿", "报告", "生成", "统计")):
-                stage, start, end = 2, 60, 90
-            elif any(word in stage_text for word in ("保存", "完成", "清理")):
-                stage, start, end = 3, 90, 99
-            else:
-                stage, start, end = 0, 5, 20
-            ratio = structured["current"] / structured["total"]
-            return round(start + (end - start) * ratio), stage
-        if any(word in message for word in ("扫描", "识别", "索引", "解析", "读取")):
-            return 34, 1
-        if any(word in message for word in ("图表", "工作簿", "报告", "生成", "统计")):
-            return 72, 2
-        if any(word in message for word in ("保存", "完成", "清理")):
-            return 92, 3
-        return 14, 0
+            name = structured["stage"]
+            current, total = structured["current"], structured["total"]
+            if name in self._COUNTY_PHASES:
+                stage, offset = self._COUNTY_PHASES[name]
+                start, end = self._COUNTY_RANGE
+                position = (current - 1 + offset) / total
+                return round(start + (end - start) * position), stage
+            span = self._PHASE_RANGES.get(name)
+            if span:
+                stage, start, end = span
+                return round(start + (end - start) * (current / total)), stage
+        for stage, keywords in self._STAGE_KEYWORDS:
+            if any(word in message for word in keywords):
+                return self._STAGE_START[stage], stage
+        return self._STAGE_START[0], 0
 
     def _emit(self, event: str, **payload: Any) -> None:
         if self._window is None:

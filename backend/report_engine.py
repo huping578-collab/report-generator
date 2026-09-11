@@ -28,7 +28,7 @@ import openpyxl
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 from openpyxl.chart.label import DataLabel, DataLabelList
-from openpyxl.chart.layout import Layout, ManualLayout
+
 from openpyxl.chart.marker import DataPoint
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.chart.text import RichText
@@ -61,7 +61,6 @@ q = lambda ns, tag: f"{{{ns}}}{tag}"
 wt = lambda tag: q(W, tag)
 
 PIE_COLORS = ["4472C4", "ED7D31", "A5A5A5", "FFC000", "5B9BD5"]
-LINE_COLORS = ["4472C4", "ED7D31", "A5A5A5"]
 PROGRAM_NAME = "报告生成工具V0.1"
 OUT_XLSX_NAME = "重庆G210护栏统计.xlsx"
 OUT_DOCX_NAME = "重庆G210交安设施检测报告.docx"
@@ -562,8 +561,27 @@ def parse_progress(message):
     }
 
 
-def bin_index(kind, height):
-    limits = (550, 580, 620, 650) if kind == "二波" else (647, 677, 717, 747)
+HEIGHT_DESIGN = {"二波": 600, "三波": 697}
+HEIGHT_PASS_TOLERANCE = 20
+
+
+def height_limits(kind, tolerance=50):
+    """分档边界＝设计值∓容差（外边界）与设计值∓20mm（内边界）；默认±50与现口径一致。"""
+    design = HEIGHT_DESIGN.get(kind, 600)
+    return (design - tolerance, design - HEIGHT_PASS_TOLERANCE,
+            design + HEIGHT_PASS_TOLERANCE, design + tolerance)
+
+
+def height_bin_labels(kind, tolerance=50):
+    low, low_in, high_in, high = height_limits(kind, tolerance)
+    return [
+        f"h＜{low}", f"{low}≤h＜{low_in}", f"{low_in}≤h≤{high_in}",
+        f"{high_in}＜h≤{high}", f"h＞{high}",
+    ]
+
+
+def bin_index(kind, height, limits=None):
+    limits = limits or height_limits(kind)
     if height < limits[0]:
         return 0
     if height < limits[1]:
@@ -1176,15 +1194,19 @@ def make_bolt_stats(segments, records):
     return stats
 
 
-def _height_type_bins(rows, kind):
+def _height_type_bins(rows, kind, tolerance=50, pass_bins=(2,)):
+    """分档统计；pass_bins 决定合格率取哪几档（默认取中间档＝设计值±20mm）。"""
     heights = [record["height"] for record in rows if record["kind"] == kind]
+    limits = height_limits(kind, tolerance)
     bins = [0] * 5
     for height in heights:
-        bins[bin_index(kind, height)] += 1
+        bins[bin_index(kind, height, limits)] += 1
     percentages = [round(value * 100 / len(heights), 2) if heights else 0 for value in bins]
+    passed = sum(bins[index] for index in pass_bins)
     return {
         "count": len(heights), "bins": bins,
-        "pcts": percentages, "pass": percentages[2] if heights else 0,
+        "pcts": percentages,
+        "pass": round(passed * 100 / len(heights), 2) if heights else 0,
     }
 
 
@@ -1605,10 +1627,8 @@ def make_excel(
     wb = Workbook()
     wb.remove(wb.active)
     if height_stats is not None:
-        for title, kind, labels in (
-            ("二波统计", "二波", ["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"]),
-            ("三波统计", "三波", ["h＜647", "647≤h＜677", "677≤h≤717", "717＜h≤747", "h＞747"]),
-        ):
+        for title, kind in (("二波统计", "二波"), ("三波统计", "三波")):
+            labels = height_bin_labels(kind)
             ws = wb.create_sheet(title)
             if has_county:
                 ws.append(["序号", "区县", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数", *labels, "合格率"])
@@ -1670,6 +1690,42 @@ def make_excel(
             style_sheet(ws, [8, 62, 10, 16, 14, 12, 20, 12, 10, 16, 16])
         else:
             style_sheet(ws, [8, 62, 10, 16, 14, 12, 20, 16, 16])
+        # 高度分档对照：分档外边界＝设计值±50 / ±40，合格率＝落在该容差区间内的比例。
+        # 二波/三波分档边界数值不同，按波形各出一张对照表（±50 与 ±40 各一组）。
+        for tolerance in (50, 40):
+            for kind in ("二波", "三波"):
+                labels = height_bin_labels(kind, tolerance)
+                ws = wb.create_sheet(f"{kind}对照（±{tolerance}mm）")
+                if has_county:
+                    header = ["序号", "区县", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数"]
+                    widths = [7, 12, 10, 14, 24, 14, 14, 42, 11, 13, 14, 14, 14, 13, 12]
+                else:
+                    header = ["序号", "路线编号", "公路等级", "管理单位", "起点桩号", "终点桩号", "统计口径", "检测点数"]
+                    widths = [7, 10, 14, 24, 14, 14, 42, 11, 13, 14, 14, 14, 13, 12]
+                ws.append([*header, *labels, f"合格率（±{tolerance}mm）"])
+                sequence = 0
+                for segment_index, item in enumerate(height_stats):
+                    segment = item["segment"]
+                    rows = [record for record in height_records
+                            if record["segment"] == segment_index and record["kind"] == kind]
+                    if not rows:
+                        continue
+                    data = _height_type_bins(rows, kind, tolerance, pass_bins=(1, 2, 3))
+                    sequence += 1
+                    bases = {record["basis"] for record in rows}
+                    basis = next(iter(bases)) if len(bases) == 1 else "原始桩号+电子修正桩号（按来源文件分别采用）"
+                    ws.append([
+                        sequence,
+                        *([segment.get("county", "")] if has_county else []),
+                        segment.get("route", "G210"), segment["grade"], segment["manager"],
+                        format_station(segment["start"]), format_station(segment["end"]),
+                        basis, data["count"],
+                        *[value / 100 for value in data["pcts"]], data["pass"] / 100,
+                    ])
+                for row in ws.iter_rows(min_row=2, min_col=len(header) + 1, max_col=len(header) + 6):
+                    for cell in row:
+                        cell.number_format = "0.00%"
+                style_sheet(ws, widths)
 
     if bolt_stats is not None:
         ws = wb.create_sheet("螺栓缺失统计")
@@ -1788,7 +1844,8 @@ def make_excel(
             ("中心高度统计数值", "使用护栏高度表中的梁板中心高度(mm)列。"),
             ("中心高度备注过滤", f"仅保留异常标记为空或无备注的数据；排除{sum(excluded.values())}条：{dict(excluded)}。"),
             ("中心高度去重", f"完全一致的重叠记录去重，剔除{height_duplicates}条。"),
-            ("区间明细标准值", "标准值列为580mm、620mm、677mm和717mm；二波折线图使用580mm、620mm，三波折线图使用677mm、717mm。"),
+            ("区间明细标准值", "标准值列为580mm、620mm、677mm和717mm（设计值±20mm）。"),
+            ("高度分档对照", "不再在工作簿内绘图；新增二波/三波各两张对照表，分档外边界取设计值±50mm（二波550/580/620/650、三波647/677/717/747）和±40mm（二波560/580/620/640、三波657/677/717/737），合格率为落在该容差区间内的点占比。"),
         ])
     if tci_stats is not None:
         notes.extend([
@@ -2276,143 +2333,6 @@ def make_docx(
         skeleton_md=config.template_docx,
     )
 
-def add_distribution_charts(wb, source_name, target_name):
-    if target_name in wb.sheetnames:
-        del wb[target_name]
-    source, target = wb[source_name], wb.create_sheet(target_name)
-    target.sheet_view.showGridLines = False
-    display_name = source_name.replace("双波", "二波").replace("两波", "二波")
-    target["A1"] = f"{display_name}各区段波形梁护栏横梁中心高度分布情况图"
-    target["A1"].font = Font(size=14, bold=True)
-    # 按表头定位列：区县模式比无区县模式多一列“区县”，硬编码列号会错位（R3）。
-    headers = [cell.value for cell in source[1]]
-    start_col = headers.index("起点桩号") + 1
-    end_col = headers.index("终点桩号") + 1
-    count_col = headers.index("检测点数") + 1
-    count = 0
-    for row in range(2, source.max_row + 1):
-        start, end = source.cell(row, start_col).value, source.cell(row, end_col).value
-        if not start or not end:
-            continue
-        chart = PieChart()
-        chart.add_data(Reference(source, min_col=count_col + 1, max_col=count_col + 5, min_row=row, max_row=row), from_rows=True)
-        chart.set_categories(Reference(source, min_col=count_col + 1, max_col=count_col + 5, min_row=1, max_row=1))
-        chart.title, chart.legend.position, chart.roundedCorners = f"{start}-{end}", "r", False
-        chart.title.tx.rich.p[0].r[0].rPr = CharacterProperties(
-            latin=DrawingFont(typeface="Times New Roman"),
-            ea=DrawingFont(typeface="宋体"),
-            sz=1050,
-            b=True,
-        )
-        chart.height, chart.width, chart.varyColors = 8.5, 14, True
-        chart.layout = Layout(manualLayout=ManualLayout(x=-2 / 14, xMode="factor"))
-        chart.dataLabels = DataLabelList()
-        chart.dataLabels.showVal, chart.dataLabels.showPercent = True, False
-        chart.dataLabels.showCatName = chart.dataLabels.showSerName = chart.dataLabels.showLegendKey = False
-        chart.dataLabels.dLblPos, chart.dataLabels.numFmt = "outEnd", "0.00%"
-        chart.dataLabels.showLeaderLines = True
-        # 对占比为0的扇区单独设置删除标签，避免显示0.00%。
-        zero_labels = []
-        for index in range(5):
-            if not (source.cell(row, count_col + 1 + index).value or 0):
-                label = DataLabel(idx=index)
-                label.delete = True
-                zero_labels.append(label)
-        chart.dataLabels.dLbl = zero_labels
-        chart.series[0].data_points = [DataPoint(idx=i, spPr=GraphicalProperties(solidFill=color)) for i, color in enumerate(PIE_COLORS)]
-        grid_row, grid_col = divmod(count, 2)
-        target.add_chart(chart, f"{'A' if grid_col == 0 else 'J'}{3 + grid_row * 17}")
-        count += 1
-    return count
-
-
-def configure_line_chart(chart):
-    chart.title, chart.style, chart.roundedCorners = None, 2, False
-    chart.height, chart.width = 8, 13
-    chart.y_axis.scaling.min, chart.y_axis.scaling.max, chart.y_axis.majorUnit = 300, 850, 50
-    chart.x_axis.title = chart.y_axis.title = None
-    chart.x_axis.delete = chart.y_axis.delete = False
-    # 水平轴与图例间距约0.1厘米。
-    chart.layout = Layout(manualLayout=ManualLayout(
-        x=0.10, y=0.05, w=0.80, h=0.8125,
-        xMode="edge", yMode="edge", wMode="factor", hMode="factor",
-    ))
-    chart.legend.position = "b"
-    chart.legend.layout = Layout(manualLayout=ManualLayout(
-        x=0.10, y=0.875, w=0.80, h=0.10,
-        xMode="edge", yMode="edge", wMode="factor", hMode="factor",
-    ))
-    for index, series in enumerate(chart.series):
-        series.graphicalProperties.line.solidFill = LINE_COLORS[index]
-        series.graphicalProperties.line.width = 12700 if index == 0 else 25400
-        series.graphicalProperties.line.noFill = False
-
-
-def add_interval_line_charts(wb):
-    helper_name = "_折线图数据"
-    if helper_name in wb.sheetnames:
-        del wb[helper_name]
-    helper = wb.create_sheet(helper_name); helper.sheet_state = "hidden"
-    count = helper_group = 0
-    for sheet in [ws for ws in wb.worksheets if ws.title.startswith("区间")]:
-        sheet._charts = []
-        data_rows = [row for row in range(2, sheet.max_row + 1) if sheet.cell(row, 1).value is not None]
-        if not data_rows:
-            sheet["H4"] = "本区间无有效护栏高度数据，未绘制折线图。"
-            continue
-        sheet["H4"] = None
-        groups = {"二波": [], "三波": []}
-        for row in data_rows:
-            kind = str(sheet.cell(row, 3).value or "")
-            if "三" in kind:
-                groups["三波"].append(row)
-            elif any(word in kind for word in ("双", "两", "二")):
-                groups["二波"].append(row)
-        sheet_chart_index = 0
-        for kind in ("二波", "三波"):
-            rows = groups[kind]
-            if not rows:
-                continue
-            start_col = 1 + helper_group * 5; helper_group += 1
-            standard_columns = (5, 6) if kind == "二波" else (7, 8)
-            standard_values = (580, 620) if kind == "二波" else (677, 717)
-            helper_headers = [
-                "桩号", "梁板中心高度(mm)",
-                f"标准值（{standard_values[0]}mm）", f"标准值（{standard_values[1]}mm）",
-            ]
-            for offset, header in enumerate(helper_headers):
-                helper.cell(1, start_col + offset, header)
-            for target_row, source_row in enumerate(rows, 2):
-                helper.cell(target_row, start_col, sheet.cell(source_row, 2).value)
-                helper.cell(target_row, start_col + 1, sheet.cell(source_row, 4).value)
-                helper.cell(target_row, start_col + 2, sheet.cell(source_row, standard_columns[0]).value)
-                helper.cell(target_row, start_col + 3, sheet.cell(source_row, standard_columns[1]).value)
-            chart = LineChart(); chart.visible_cells_only = False
-            chart.add_data(Reference(helper, min_col=start_col + 1, max_col=start_col + 3, min_row=1, max_row=len(rows) + 1), titles_from_data=True)
-            chart.set_categories(Reference(helper, min_col=start_col, min_row=2, max_row=len(rows) + 1))
-            configure_line_chart(chart)
-            sheet.add_chart(chart, f"K{4 + sheet_chart_index * 17}")
-            sheet_chart_index += 1; count += 1
-    return count
-
-
-def add_charts(workbook_path, log=lambda _: None):
-    wb = openpyxl.load_workbook(workbook_path)
-    if "双波分布图" in wb.sheetnames:
-        del wb["双波分布图"]
-    if "二波统计" not in wb.sheetnames and "双波统计" in wb.sheetnames:
-        wb["双波统计"].title = "二波统计"
-    two_wave_source = "二波统计"
-    double_pies = add_distribution_charts(wb, two_wave_source, "二波分布图")
-    triple_pies = add_distribution_charts(wb, "三波统计", "三波分布图")
-    line_charts = add_interval_line_charts(wb)
-    for sheet in wb.worksheets:
-        for chart in sheet._charts:
-            chart.roundedCorners = False
-    wb.save(workbook_path)
-    log(f"图表已生成：二波饼图{double_pies}个，三波饼图{triple_pies}个，分类型折线图{line_charts}个。")
-
-
 def _iter_input_filenames(config):
     """明细/病害/TCI 输入文件名（去临时文件），供区县路由识别。"""
     names = []
@@ -2457,7 +2377,7 @@ def _apply_county_routing(config, segments, county_override, log):
 
 
 def generate_statistics_and_report(
-    config, log=lambda _: None, generate_charts_first=False,
+    config, log=lambda _: None,
     process_height=True, process_bolts=False, process_alongline=False, process_tci=False,
     require_template=True, county_override=None,
 ):
@@ -2491,7 +2411,10 @@ def generate_statistics_and_report(
         detail = "、".join(f"{route}{count}段" for route, count in sorted(routes.items()))
         log(f"区县{county}：识别到道路编号{detail}。")
 
-    def _write_outputs(cfg, segs, h_stats, h_recs, b_stats, b_recs, t_stats, t_recs):
+    def _write_outputs(cfg, segs, h_stats, h_recs, b_stats, b_recs, t_stats, t_recs, step=None):
+        # step=(第几个区县, 区县总数, 区县名)：给出可量化的阶段进度，避免进度条长时间不动。
+        if step:
+            log(format_progress("生成区县统计", step[0], step[1], step[2]))
         make_excel(
             cfg, segs,
             height_stats=h_stats, height_records=h_recs,
@@ -2500,8 +2423,8 @@ def generate_statistics_and_report(
             tci_stats=t_stats, tci_records=t_recs,
             log=log,
         )
-        if generate_charts_first and process_height and h_stats is not None:
-            add_charts(cfg.out_xlsx, log)
+        if step:
+            log(format_progress("生成区县报告", step[0], step[1], step[2]))
         make_docx(
             cfg, segs,
             height_stats=h_stats, height_records=h_recs,
@@ -2518,15 +2441,15 @@ def generate_statistics_and_report(
         if len(counties) == 1:
             if not getattr(config, "county", None):
                 config.county = counties[0]
-            _write_outputs(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records)
+            _write_outputs(config, segments, height_stats, height_records, bolt_stats, bolt_records, tci_stats, tci_records,
+                           step=(1, 1, counties[0]))
         else:
             from collections import defaultdict
             by_county = defaultdict(list)
             for idx, seg in enumerate(segments):
                 by_county[seg.get("county", "")].append(idx)
-            for county, idxs in by_county.items():
-                if not county:
-                    continue
+            county_items = [(name, ids) for name, ids in by_county.items() if name]
+            for position, (county, idxs) in enumerate(county_items, 1):
                 sub_segments = [segments[i] for i in idxs]
                 # 重映射记录的 segment 索引到子集 0..n-1
                 def _remap(records):
@@ -2559,7 +2482,8 @@ def generate_statistics_and_report(
                 sub_cfg = Config(config.project_dir, config.summary_xlsx, config.detail_dir, config.template_docx, sub_out, config.disease_dir, getattr(config, "tci_path", None), county=county)
                 # 复用 make_excel/make_docx 生成子报告
                 try:
-                    _write_outputs(sub_cfg, sub_segments, sub_height_stats, sub_height_records, sub_bolt_stats, sub_bolt_records, sub_tci_stats, sub_tci_records)
+                    _write_outputs(sub_cfg, sub_segments, sub_height_stats, sub_height_records, sub_bolt_stats, sub_bolt_records, sub_tci_stats, sub_tci_records,
+                                   step=(position, len(county_items), county))
                     log(f"区县分报告已生成：{county} -> {sub_out}")
                 except Exception as e:
                     log(f"区县 {county} 分报告生成失败：{e}")
@@ -2678,10 +2602,8 @@ def discover_paths(folder):
 
 class GuardrailApp(tk.Tk):
     MODES = (
-        "完整生成（统计、报告、区间明细、图表）",
-        "生成统计与报告（含区间明细）",
+        "完整生成（统计、报告、区间明细）",
         "仅更新区间明细",
-        "仅生成图表",
     )
 
     def __init__(self):
@@ -2797,7 +2719,7 @@ class GuardrailApp(tk.Tk):
             raise ValueError("请至少勾选一个处理细分项。")
         if not selected.intersection({"中心高度", "螺栓缺失"}):
             raise ValueError("沿线设施功能暂未开发，请同时勾选中心高度或螺栓缺失。")
-        if mode in self.MODES[:2]:
+        if mode == self.MODES[0]:
             if not config.summary_xlsx.is_file(): raise FileNotFoundError("请选择有效的分段汇总表。")
             if not config.detail_dir.is_dir(): raise FileNotFoundError("请选择有效的检测明细文件夹。")
             if "螺栓缺失" in selected and (config.disease_dir is None or not config.disease_dir.is_dir()):
@@ -2832,13 +2754,9 @@ class GuardrailApp(tk.Tk):
                 "process_alongline": "沿线设施" in selected,
             }
             if mode == self.MODES[0]:
-                generate_statistics_and_report(config, self.log, generate_charts_first=True, **options)
-            elif mode == self.MODES[1]:
                 generate_statistics_and_report(config, self.log, **options)
-            elif mode == self.MODES[2]:
-                add_interval_sheets(config.out_xlsx, config.summary_xlsx, self.log)
             else:
-                add_charts(config.out_xlsx, self.log)
+                add_interval_sheets(config.out_xlsx, config.summary_xlsx, self.log)
             self.queue.put(("done", "处理完成。"))
         except PermissionError:
             self.queue.put(("error", "文件被占用，无法保存。请关闭Excel或Word后重试。"))

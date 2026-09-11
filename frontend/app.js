@@ -201,17 +201,20 @@
   function setProgress(value, label, stageIndex) {
     const safeValue = Math.max(state.progress, Math.min(100, Number(value) || 0));
     const safeStage = Math.max(0, Math.min(3, Number(stageIndex) || 0));
+    // 阶段只前进不回退：逐区县循环里“统计→报告”会交替上报，回退会让时间线闪烁。
     state.progress = safeValue;
+    state.stage = Math.max(state.stage || 0, safeStage);
+    const shownStage = state.stage;
     progressBar.style.clipPath = `inset(0 ${100 - safeValue}% 0 0)`;
     progressTrack.setAttribute('aria-valuenow', String(safeValue));
     progressValue.textContent = `${safeValue}%`;
-    progressLabel.textContent = label || stageLabels[safeStage];
+    progressLabel.textContent = label || stageLabels[shownStage];
     stages.forEach((stage, index) => {
-      stage.classList.toggle('is-active', index === safeStage && safeValue < 100);
-      stage.classList.toggle('is-done', index < safeStage || safeValue === 100);
+      stage.classList.toggle('is-active', index === shownStage && safeValue < 100);
+      stage.classList.toggle('is-done', index < shownStage || safeValue === 100);
     });
     sideFlow.forEach((step, index) => {
-      step.classList.toggle('is-current', index === safeStage && safeValue < 100);
+      step.classList.toggle('is-current', index === shownStage && safeValue < 100);
     });
   }
 

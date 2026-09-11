@@ -1158,9 +1158,34 @@ class DesktopBridgeTests(unittest.TestCase):
         self.assertEqual(events[-1]["progress"], 100)
 
     def test_progress_mapping(self) -> None:
-        self.assertEqual(self.bridge._progress_from_log("正在扫描资料"), (34, 1))
-        self.assertEqual(self.bridge._progress_from_log("图表已生成"), (72, 2))
-        self.assertEqual(self.bridge._progress_from_log("已保存文件"), (92, 3))
+        """未量化的日志只把进度推进到该阶段起点，可量化阶段按 current/total 线性插值。"""
+        self.assertEqual(self.bridge._progress_from_log("正在扫描资料"), (5, 1))
+        self.assertEqual(self.bridge._progress_from_log("图表已生成"), (30, 2))
+        self.assertEqual(self.bridge._progress_from_log("已保存文件"), (62, 3))
+        # 逐区县循环：统计占区县区间前半、报告占后半，第 2/4 个区县时进度在区间中部。
+        first = self.bridge._progress_from_log(engine.format_progress("生成区县统计", 1, 4, "甲县"))
+        second = self.bridge._progress_from_log(engine.format_progress("生成区县报告", 2, 4, "乙县"))
+        self.assertEqual(first[1], 2)
+        self.assertEqual(second[1], 3)
+        self.assertGreater(second[0], first[0])
+
+    def test_progress_never_rewinds_across_log_lines(self) -> None:
+        """长耗时步骤之间的杂项日志不得让总进度或阶段回退。"""
+        window = FakeWindow()
+        self.bridge.attach_window(window)
+        messages = [
+            engine.format_progress("生成区县统计", 2, 4, "乙县"),
+            "区县乙县：识别到道路编号G210 3段。",
+            "统计工作簿已生成：x.xlsx",
+            engine.format_progress("解析明细", 1, 16, "甲.xlsx"),
+        ]
+        values = []
+        for message in messages:
+            self.bridge._on_engine_log(message)
+        events = [json.loads(script.split("desktopEvents(", 1)[1][:-1]) for script in window.scripts]
+        values = [(event["progress"], event["stage"]) for event in events]
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(values[-1][1], 2)
 
     def test_structured_progress_mapping_is_incremental(self) -> None:
         first = self.bridge._progress_from_log(engine.format_progress("扫描资料", 1, 4))
@@ -2787,33 +2812,54 @@ class ChongqingIntervalConvergenceTests(unittest.TestCase):
         self.assertIn("2264+000", intervals[0])
         self.assertEqual(count, 1)
 
-    def test_add_charts_places_pies_in_county_mode(self) -> None:
+    def test_height_excel_writes_tolerance_comparison_sheets_without_charts(self) -> None:
+        """高度统计工作簿不再画图，改为写出 ±50mm / ±40mm 两组分档对照表。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             summary = root / "summary.xlsx"
             self._write_summary(summary)
             segments = engine.read_segments(summary)
             county_segments = [s for s in segments if s["county"] == "万州区"]
-            record = {
-                "file": "f.xlsx", "direction": "上行", "station": 2264100.0,
-                "raw_station": 2264100.0, "electronic_station": 2264100.0,
-                "basis": "电子修正桩号", "kind": "二波", "height": 600.0, "segment": 0,
-            }
-            height_stats = engine.make_stats(county_segments, [record])
+
+            def record(station, height):
+                return {
+                    "file": "f.xlsx", "direction": "上行", "station": float(station),
+                    "raw_station": float(station), "electronic_station": float(station),
+                    "basis": "电子修正桩号", "kind": "二波", "height": float(height), "segment": 0,
+                }
+
+            # 600mm 落在三段内；555mm 只在 ±50mm 内（560mm 以下），用于区分两组对照。
+            records = [record(2264100, 600), record(2264200, 555)]
+            height_stats = engine.make_stats(county_segments, records)
             config = engine.Config(
-                root, summary, root, root / "template.md", root / "output",
-                county="万州区",
+                root, summary, root, root / "template.md", root / "output", county="万州区",
             )
-            engine.make_excel(
-                config, county_segments,
-                height_stats=height_stats, height_records=[record],
-            )
-            engine.add_charts(config.out_xlsx)
+            engine.make_excel(config, county_segments, height_stats=height_stats, height_records=records)
             workbook = openpyxl.load_workbook(config.out_xlsx)
-            self.assertIn("二波分布图", workbook.sheetnames)
-            charts = workbook["二波分布图"]._charts
+            sheets = workbook.sheetnames
+            charts = [len(sheet._charts) for sheet in workbook.worksheets]
+            main = workbook["二波统计"]
+            main_pass = main.cell(2, [cell.value for cell in main[1]].index("合格率") + 1).value
+            labels50 = [cell.value for cell in workbook["二波对照（±50mm）"][1]]
+            labels40 = [cell.value for cell in workbook["二波对照（±40mm）"][1]]
+            comp50 = workbook["二波对照（±50mm）"]
+            comp40 = workbook["二波对照（±40mm）"]
+            counts = (
+                comp50.cell(2, labels50.index("检测点数") + 1).value,
+                comp40.cell(2, labels40.index("检测点数") + 1).value,
+            )
+            pass50 = comp50.cell(2, labels50.index("合格率（±50mm）") + 1).value
+            pass40 = comp40.cell(2, labels40.index("合格率（±40mm）") + 1).value
             workbook.close()
-        self.assertEqual(len(charts), 1)
+        self.assertIn("二波对照（±50mm）", sheets)
+        self.assertIn("二波对照（±40mm）", sheets)
+        self.assertEqual(charts, [0] * len(sheets))
+        self.assertEqual(main_pass, 0.5)
+        self.assertEqual(counts, (2, 2))
+        self.assertEqual(labels50[9:14], ["h＜550", "550≤h＜580", "580≤h≤620", "620＜h≤650", "h＞650"])
+        self.assertEqual(labels40[9:14], ["h＜560", "560≤h＜580", "580≤h≤620", "620＜h≤640", "h＞640"])
+        self.assertEqual(pass50, 1.0)
+        self.assertEqual(pass40, 0.5)
 
 
 class ChongqingMarkdownOnlyTests(unittest.TestCase):
