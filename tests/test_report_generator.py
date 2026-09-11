@@ -2618,6 +2618,53 @@ class ChongqingCountyEndToEndTests(unittest.TestCase):
             workbook.close()
             self.assertEqual(counties, {"万州区"})
 
+    def test_bolt_example_title_shows_electronic_station_then_missing_then_raw(self) -> None:
+        """螺栓示例标题＝电子（修正）桩号＋螺栓缺失X颗＋原始桩号，两个桩号均保留一位小数。"""
+        from openpyxl.drawing.image import Image as XLImage
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            summary = root / "summary.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "各区县项目概况"
+            sheet.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+            sheet.append([1, "万州区", "G210", "", "一级", 2264.0, 2265.0, 1.0, 1.0])
+            workbook.save(summary)
+
+            detail = root / "detail"
+            detail.mkdir()
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "螺栓明细"
+            sheet.append(["路线编号", "方向", "原始桩号", "电子修正桩号", "拼接螺栓数量（颗）",
+                          "拼接螺栓缺失数量（颗）", "连接螺栓数量（颗）", "连接螺栓缺失数量（颗）"])
+            sheet.append(["G210", "上行", "K2264+409.0", "K2264+386", 10, 2, 10, 0])
+            workbook.save(detail / "重庆市-万州区-交安设施现场检测-明细.xlsx")
+
+            png = base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            )
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.append(["序号", "路线", "方向", "原始桩号", "电子修正桩号", "病害类型", "工程量", "单位", "病害照片"])
+            sheet.append([1, "G210", "上行", "K2264+409.0", "K2264+386", "波形护栏螺栓缺失", 2, "颗", None])
+            sheet.add_image(XLImage(io.BytesIO(png)), "I2")
+            workbook.save(detail / "重庆市-万州区-交安设施现场检测-病害清单.xlsx")
+
+            template = root / "template.md"
+            template.write_text("# 报告\n\n<!-- inject:bolt -->\n", encoding="utf-8")
+            output = root / "output"
+            config = engine.Config(root, summary, detail, template, output, disease_dir=detail)
+            engine.generate_statistics_and_report(
+                config, log=lambda _: None, process_height=False,
+                process_bolts=True, process_tci=False, require_template=False,
+            )
+            docx = next(output.rglob("*.docx"))
+            with zipfile.ZipFile(docx) as archive:
+                document = archive.read("word/document.xml").decode("utf-8")
+        self.assertIn("K2264+386.0 螺栓缺失2颗 K2264+409.0", document)
+
 
 class ChongqingFontTimesTests(unittest.TestCase):
     """R1：标题保持黑色，全文英文 Times New Roman（含封面标题）。"""

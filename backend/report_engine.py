@@ -2149,9 +2149,13 @@ def select_bolt_example_points(rows, disease_image_index=None):
 
 
 def bolt_example_text(example):
-    raw = example["record"].get("raw_station")
+    """螺栓示例标题：电子（修正）桩号 + 缺失颗数 + 原始桩号，两个桩号均保留一位小数。"""
+    record = example["record"]
+    raw = record.get("raw_station")
+    electronic = record.get("electronic_station")
     raw_text = format_station_one_decimal(raw) if raw is not None else "—"
-    return f"螺栓缺失{example['missing']}颗 {raw_text}"
+    electronic_text = format_station_one_decimal(electronic) if electronic is not None else "—"
+    return f"{electronic_text} 螺栓缺失{example['missing']}颗 {raw_text}"
 
 
 def report_images(temp_dir, segments, stats, records):
