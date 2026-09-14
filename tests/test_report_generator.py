@@ -213,13 +213,20 @@ def test_chongqing_route_report_and_appendix_end_to_end():
     assert sum(text.endswith('G210线') for text in headings) == 3
     assert sum(text.endswith('G319线') for text in headings) == 3
     text = '\n'.join(p.text for p in doc.paragraphs)
+    # 附表：同一区县一张表，路线分块——每条路线前重出表头、序号从 1 重排，块间整行合并空白行分隔。
     assert '附表1 重庆市甲县交安设施技术状况评定明细' in text
     assert '评定单元等权' in text
     assert '共检出拼接螺栓20颗' in text
-    appendix = next(table for table in doc.tables if [c.text for c in table.rows[0].cells] ==
-                    ['序号','路线编号','区县','方向','起点桩号','止点桩号','TCI','等级'])
-    assert len(appendix.rows) == 8  # 5 个单元 + 2 条路线汇总 + 表头
+    appendix_tables = [table for table in doc.tables if [c.text for c in table.rows[0].cells] ==
+                       ['序号','路线编号','区县','方向','起点桩号','止点桩号','TCI','等级']]
+    assert len(appendix_tables) == 1  # G210 与 G319 同表分块
+    appendix = appendix_tables[0]
     assert appendix.rows[0]._tr.xpath('./w:trPr/w:tblHeader')
+    assert [row.cells[0].text for row in appendix.rows] == ['序号','1','2','3','4','5','','序号','1','2']
+    assert appendix.rows[1].cells[4].text == '/'  # 路线汇总行的起止桩号留空
+    assert appendix.rows[7].cells[0].paragraphs[0].runs[0].bold is True  # 重复表头按表头样式
+    separator = appendix.rows[6]._tr.findall(qn('w:tc'))
+    assert len(separator) == 1 and separator[0].find(qn('w:tcPr')).find(qn('w:gridSpan')).get(qn('w:val')) == '8'
     assert not doc._element.xpath('.//w:r/w:r')  # TOC缓存不得生成嵌套run。
     assert sum("附表1 重庆市甲县交安设施技术状况评定明细" in p.text for p in doc.paragraphs) == 2
     assert len(doc.inline_shapes) >= 6
@@ -2514,7 +2521,9 @@ class ChongqingHeaderFooterTests(unittest.TestCase):
         self.assertTrue(footers, "重庆报告应生成页脚部件")
         body_footer = max(footers)
         self.assertIn("PAGE", footers[body_footer])
-        self.assertIn("NUMPAGES", footers[body_footer])
+        # “共X页”只统计目录以后的页数：正文节用 SECTIONPAGES，不再用全文 NUMPAGES。
+        self.assertIn("SECTIONPAGES", footers[body_footer])
+        self.assertNotIn("NUMPAGES", footers[body_footer])
         self.assertIn('w:val="center"', footers[body_footer])
 
     def test_first_page_clean_and_body_page_number_restarts(self) -> None:
@@ -3056,7 +3065,7 @@ class ChongqingSkeletonStructureTests(unittest.TestCase):
             text = "\n".join(p.text for p in document.paragraphs)
             h1 = [p.text for p in document.paragraphs if p.style.name == "Heading 1"]
             self.assertEqual(
-                [minimal_docx._strip_section_number(h) for h in h1 if not h.startswith("附表1")],
+                [minimal_docx._strip_section_number(h) for h in h1 if not h.startswith("附表")],
                 ["概况", "组织实施情况", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测结果", "波形梁护栏螺栓缺失", "结论与建议"],
             )
         for required in ("检测依据", "检测设备与评定方法", "沿线设施技术状况评价", "波形梁护栏横梁中心高度检测", "波形梁护栏螺栓缺失检测"):
@@ -3608,6 +3617,169 @@ class R12TemplateTests(unittest.TestCase):
             self.assertNotIn("防护设施缺损", filtered)
             all_types = engine.tci_type_photo_index(xlsx, image_map)
             self.assertIn("防护设施缺损", all_types)
+
+
+class ChongqingTemplateUpdateTests(unittest.TestCase):
+    """R13：4.x 表列、附表按路线拆分、页码“共X页”、Excel 区县合计行。"""
+
+    @staticmethod
+    def _segments():
+        return [dict(county="甲县", route="G210", start=1000.0, end=2000.0, mileage=1.0, grade="二级公路", manager=""),
+                dict(county="甲县", route="G319", start=3000.0, end=4000.0, mileage=1.0, grade="二级公路", manager="")]
+
+    @staticmethod
+    def _height_records(segments):
+        records = []
+        for index, segment in enumerate(segments):
+            for kind, heights in (("二波", (600.0, 555.0)), ("三波", (690.0, 650.0))):
+                for offset, height in enumerate(heights, 1):
+                    station = segment["start"] + offset * 10
+                    records.append(dict(file="t.xlsx", direction="上行", station=station, raw_station=station,
+                                        electronic_station=station, basis="电子修正桩号", kind=kind,
+                                        height=height, segment=index))
+        return records
+
+    def test_height_route_table_drops_valid_and_pass_point_columns(self) -> None:
+        segments = self._segments()
+        records = self._height_records(segments)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            doc = Document()
+            minimal_docx._section_height(doc, segments, engine.make_stats(segments, records), records, {}, Path(temp_dir))
+        route_tables = [table for table in doc.tables if "方向" in [cell.text for cell in table.rows[0].cells]]
+        self.assertTrue(route_tables)
+        for table in route_tables:
+            headers = [cell.text for cell in table.rows[0].cells]
+            self.assertNotIn("有效点数", headers)
+            self.assertNotIn("合格点数", headers)
+            self.assertIn("合格率（%）", headers)
+            self.assertEqual(len(headers), len(table.rows[1].cells))
+            self.assertTrue(all(len(row.cells) == len(headers) for row in table.rows))
+        self.assertEqual([cell.text for cell in route_tables[0].rows[0].cells][:5],
+                         ["序号", "方向", "起点桩号", "止点桩号", "合格率（%）"])
+
+    def test_appendix_keeps_one_table_with_route_blocks(self) -> None:
+        headers = ["序号", "路线编号", "区县", "方向", "起点桩号", "止点桩号", "TCI", "等级"]
+        segments = [dict(county="甲县", route=route, start=start, end=end, mileage=(end - start) / 1000)
+                    for route, start, end in [("G210", 1000.0, 2000.0), ("G210", 3000.0, 4000.0),
+                                              ("G319", 5000.0, 6000.0)]]
+        records = [dict(segment=index, direction="上行", station=segment["start"] + 10,
+                        light=0, heavy=0, sign=1, marking=0)
+                   for index, segment in enumerate(segments)]
+        stats = engine.make_tci_stats(segments, records)
+        doc = Document()
+        minimal_docx._section_tci_appendix(doc, segments, stats)
+        titles = [p.text for p in doc.paragraphs if p.text.startswith("附表")]
+        self.assertEqual(titles, ["附表1 重庆市甲县交安设施技术状况评定明细"])
+        self.assertEqual(doc._toc_entries, [("", titles[0])])
+        self.assertTrue(all(p.style.name == "Heading 1" for p in doc.paragraphs if p.text.startswith("附表")))
+        self.assertEqual(len(doc.tables), 1)
+        table = doc.tables[0]
+        # 序号按路线重排，块间第 4 行为合并空白行
+        self.assertEqual([row.cells[0].text for row in table.rows],
+                         ["序号", "1", "2", "3", "", "序号", "1", "2"])
+        for index in (0, 5):  # 表首表头 + 每条路线前的重复表头
+            cells = table.rows[index].cells
+            self.assertEqual([cell.text for cell in cells], headers)
+            self.assertTrue(cells[0].paragraphs[0].runs[0].bold)
+            self.assertIn("w:shd", table.rows[index]._tr.xml)
+        separator = table.rows[4]._tr.findall(qn("w:tc"))
+        self.assertEqual(len(separator), 1)
+        self.assertEqual(separator[0].find(qn("w:tcPr")).find(qn("w:gridSpan")).get(qn("w:val")), "8")
+        self.assertEqual(table.rows[1].cells[1].text, "G210")
+        self.assertEqual(table.rows[6].cells[1].text, "G319")
+        self.assertTrue(table.rows[0]._tr.xpath("./w:trPr/w:tblHeader"))
+
+    def test_body_footer_total_pages_and_jiuhao_font(self) -> None:
+        root = Path(__file__).parent / "artifacts" / "chongqing-footer"
+        root.mkdir(parents=True, exist_ok=True)
+        template = root / "template.md"
+        template.write_text(
+            "# @cover 主标题行一|主标题行二|重庆市|报告编号：BG-2026-T9"
+            "|项目名称：测试项目|委托单位：测试单位|测试公司|二〇二六年七月\n"
+            "\n<!-- toc -->\n\n# 1 概况\n",
+            encoding="utf-8",
+        )
+        output = root / "output"
+        output.mkdir(exist_ok=True)
+        config = engine.Config(root, root / "summary.xlsx", root, template, output)
+        minimal_docx.make_report(config, [], None, [], None, [], None, [], {}, root, skeleton_md=template)
+        doc = Document(Path(output) / engine.OUT_DOCX_NAME)
+        body_footer = doc.sections[-1].footer
+        paragraph = body_footer.paragraphs[0]
+        xml = paragraph._p.xml
+        self.assertIn("SECTIONPAGES", xml)
+        self.assertNotIn("NUMPAGES", xml)
+        self.assertEqual("".join(run.text for run in paragraph.runs), "第  页 共  页")
+        self.assertTrue(paragraph.runs)
+        for run in paragraph.runs:  # 小五号＝9pt，含页码域内的数字
+            self.assertIsNotNone(run.font.size, "页脚 run 必须显式设字号")
+            self.assertEqual(run.font.size.pt, 9.0)
+
+    def test_excel_appends_county_total_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            summary = root / "summary.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "各区县项目概况"
+            sheet.append(["序号", "区县", "路线编号", "路线名", "公路等级", "起点桩号", "止点桩号", "里程", "总里程"])
+            sheet.append([1, "甲县", "G210", "", "二级", 1.0, 2.0, 1.0, 2.0])
+            sheet.append([2, "甲县", "G319", "", "二级", 3.0, 4.0, 1.0, 2.0])
+            workbook.save(summary)
+            segments = engine.read_segments(summary)
+            heights = self._height_records(segments)
+            bolts = [dict(segment=index, direction="上行", station=segment["start"] + 10,
+                          raw_station=segment["start"] + 10, file="t.xlsx", basis="电子修正桩号",
+                          splice=10, connection=5, splice_missing=1, connection_missing=0)
+                     for index, segment in enumerate(segments)]
+            tci_records = [dict(segment=index, direction="上行", station=segment["start"] + 10,
+                                light=0, heavy=0, sign=1, marking=0)
+                           for index, segment in enumerate(segments)]
+            tci_stats = engine.make_tci_stats(segments, tci_records)
+            config = engine.Config(root, summary, root, root / "template.md", root / "output", county="甲县")
+            engine.make_excel(config, segments, height_stats=engine.make_stats(segments, heights),
+                              height_records=heights, bolt_stats=engine.make_bolt_stats(segments, bolts),
+                              bolt_records=bolts, tci_stats=tci_stats, tci_records=tci_records)
+            sheets = openpyxl.load_workbook(config.out_xlsx)
+            try:
+                for tolerance in (50, 40):
+                    for kind in ("二波", "三波"):
+                        sheet = sheets[f"{kind}对照（±{tolerance}mm）"]
+                        expected = engine._height_type_bins(heights, kind, tolerance, pass_bins=(1, 2, 3))
+                        self.assertEqual(sheet.max_row, 4)  # 表头+2条路线+合计
+                        self.assertEqual(sheet.cell(4, 1).value, "合计")
+                        self.assertEqual(sheet.cell(4, 2).value, "甲县")
+                        self.assertEqual(sheet.cell(4, 3).value, "全部路线")
+                        headers = [cell.value for cell in sheet[1]]
+                        self.assertEqual(sheet.cell(4, headers.index("检测点数") + 1).value, expected["count"])
+                        self.assertEqual(sheet.cell(4, headers.index(f"合格率（±{tolerance}mm）") + 1).value,
+                                         expected["pass"] / 100)
+                        self.assertEqual([round(sheet.cell(4, headers.index(label) + 1).value * 100, 2)
+                                          for label in engine.height_bin_labels(kind, tolerance)], expected["pcts"])
+                # 主统计表不加合计行（用户只要求对照表/螺栓/TCI）
+                self.assertEqual(sheets["二波统计"].max_row, 3)
+                bolt_sheet = sheets["螺栓缺失统计"]
+                total = engine.merge_bolt_totals(engine.make_bolt_stats(segments, bolts))
+                self.assertEqual(bolt_sheet.max_row, 4)
+                self.assertEqual(bolt_sheet.cell(4, 1).value, "合计")
+                self.assertEqual(bolt_sheet.cell(4, 3).value, "全部路线")
+                self.assertEqual(bolt_sheet.cell(4, 7).value, total["splice"])
+                self.assertEqual(bolt_sheet.cell(4, 8).value, total["connection"])
+                self.assertEqual(bolt_sheet.cell(4, 9).value, total["missing"])
+                self.assertAlmostEqual(bolt_sheet.cell(4, 10).value, total["rate"] / 100, places=10)
+                units = [unit for stat in tci_stats for unit in stat["units"]]
+                expected_tci = sum(unit["tci"] for unit in units) / len(units)
+                tci_sheet = sheets["沿线设施统计"]
+                self.assertEqual(tci_sheet.max_row, 4)
+                self.assertEqual(tci_sheet.cell(4, 1).value, "合计")
+                self.assertEqual(tci_sheet.cell(4, 3).value, "全部路线")
+                self.assertEqual(tci_sheet.cell(4, 5).value, engine.format_station(segments[-1]["end"]))
+                self.assertAlmostEqual(tci_sheet.cell(4, 11).value, expected_tci, places=6)
+                self.assertEqual(tci_sheet.cell(4, 12).value, engine.tci_grade(expected_tci))
+                notes = [row[0].value for row in sheets["统计说明"].iter_rows()]
+                self.assertIn("合计行", notes)
+            finally:
+                sheets.close()
 
 
 if __name__ == "__main__":

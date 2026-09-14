@@ -1177,7 +1177,7 @@ def merge_bolt_totals(items):
     return {
         "splice": splice, "connection": connection, "missing": missing,
         "rate": bolt_missing_rate(splice, connection, missing),
-        "points": sum(item["points"] for item in items),
+        "points": sum(item.get("points", 0) for item in items),
     }
 
 
@@ -1624,6 +1624,19 @@ def make_excel(
     tci_records = tci_records or []
     excluded = excluded or Counter()
     has_county = bool(segments and any(s.get("county") for s in segments))
+    # 各表末尾的“合计”行按区县分组；无区县维度时退化为一行全部路线。
+    county_groups = list(dict.fromkeys(str(s.get("county") or "") for s in segments)) if has_county else [""]
+
+    def _county_indices(county: str):
+        return [index for index, segment in enumerate(segments)
+                if (str(segment.get("county") or "") if has_county else "") == county]
+
+    def _county_of(segment_index):
+        """记录所属区县；索引越界返回 None（不参与任何区县合计）。"""
+        if not isinstance(segment_index, int) or not 0 <= segment_index < len(segments):
+            return None
+        return str(segments[segment_index].get("county") or "") if has_county else ""
+
     wb = Workbook()
     wb.remove(wb.active)
     if height_stats is not None:
@@ -1722,6 +1735,23 @@ def make_excel(
                         basis, data["count"],
                         *[value / 100 for value in data["pcts"]], data["pass"] / 100,
                     ])
+                # 合计行：整个区县各路线合并后按同一容差重新分档，合格率＝落在该容差区间内的点占比。
+                for county in county_groups:
+                    rows = [record for record in height_records
+                            if record["kind"] == kind and _county_of(record["segment"]) == county]
+                    if not rows:
+                        continue
+                    data = _height_type_bins(rows, kind, tolerance, pass_bins=(1, 2, 3))
+                    indices = sorted({record["segment"] for record in rows})
+                    ws.append([
+                        "合计",
+                        *([county] if has_county else []),
+                        "全部路线", "", "",
+                        format_station(min(segments[i]["start"] for i in indices)),
+                        format_station(max(segments[i]["end"] for i in indices)),
+                        "", data["count"],
+                        *[value / 100 for value in data["pcts"]], data["pass"] / 100,
+                    ])
                 for row in ws.iter_rows(min_row=2, min_col=len(header) + 1, max_col=len(header) + 6):
                     for cell in row:
                         cell.number_format = "0.00%"
@@ -1747,6 +1777,23 @@ def make_excel(
                     sequence, "G210", format_station(segment["start"]), format_station(segment["end"]),
                     segment["mileage"], item["splice"], item["connection"], item["missing"], item["rate"] / 100 if item["rate"] is not None else None,
                 ])
+        # 合计行：整个区县各路线螺栓缺失汇总（按数量求和后重算缺失率）。
+        for county in county_groups:
+            indices = _county_indices(county)
+            items = [bolt_stats[i] for i in indices if bolt_stats[i] is not None]
+            if not items:
+                continue
+            total = merge_bolt_totals(items)
+            ws.append([
+                "合计",
+                *([county] if has_county else []),
+                "全部路线",
+                format_station(min(segments[i]["start"] for i in indices)),
+                format_station(max(segments[i]["end"] for i in indices)),
+                sum(float(segments[i].get("mileage") or 0) for i in indices),
+                total["splice"], total["connection"], total["missing"],
+                total["rate"] / 100 if total["rate"] is not None else None,
+            ])
         if has_county:
             for cell in ws["J"][1:]:
                 cell.number_format = "0.00%"
@@ -1802,6 +1849,25 @@ def make_excel(
                 ws.append([idx, seg.get("county",""), seg.get("route","G210"), format_station(seg["start"]), format_station(seg["end"]), f"{seg['mileage']:.3f}", item["light"], item["heavy"], item["sign"], item["marking"], item["tci"], item["grade"]])
             else:
                 ws.append([idx, seg.get("route","G210"), format_station(seg["start"]), format_station(seg["end"]), f"{seg['mileage']:.3f}", item["light"], item["heavy"], item["sign"], item["marking"], item["tci"], item["grade"]])
+        # 合计行：整个区县各路线沿线设施汇总；TCI 按本区县全部评定单元等权平均。
+        for county in county_groups:
+            items = [item for item in tci_stats
+                     if (str(item["segment"].get("county") or "") if has_county else "") == county]
+            units = [unit for item in items for unit in item.get("units", [])]
+            if not items or not units:
+                continue
+            score = sum(unit["tci"] for unit in units) / len(units)
+            ws.append([
+                "合计",
+                *([county] if has_county else []),
+                "全部路线",
+                format_station(min(item["segment"]["start"] for item in items)),
+                format_station(max(item["segment"]["end"] for item in items)),
+                f"{sum(float(item['segment'].get('mileage') or 0) for item in items):.3f}",
+                sum(item["light"] for item in items), sum(item["heavy"] for item in items),
+                sum(item["sign"] for item in items), sum(item["marking"] for item in items),
+                score, tci_grade(score),
+            ])
         if has_county:
             style_sheet(ws, [8, 12, 11, 16, 16, 16, 14, 14, 14, 14, 10, 8])
         else:
@@ -1859,6 +1925,8 @@ def make_excel(
             ("螺栓缺失率", "缺失数量÷（拼接螺栓数量+连接螺栓数量+缺失数量）×100%。"),
             ("螺栓去重", f"完全一致的重叠记录去重，剔除{bolt_duplicates}条。"),
         ])
+    if height_stats is not None or bolt_stats is not None or tci_stats is not None:
+        notes.append(("合计行", "分档对照表、螺栓缺失统计和沿线设施统计的末行为“合计”（写在序号列，路线编号列为“全部路线”），表示该区县全部路线的汇总：分档对照按全部检测点重新计算分档占比与合格率，螺栓按数量求和后重算缺失率，沿线设施汇总的TCI取本区县全部评定单元等权平均。"))
     for row in notes:
         ws.append(row)
     style_sheet(ws, [18, 110])

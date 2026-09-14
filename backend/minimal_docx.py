@@ -673,6 +673,21 @@ def _notes_paragraphs(doc, spec: str) -> None:
     doc.paragraphs[-1].add_run().add_break(WD_BREAK.PAGE)
 
 
+def _table_cell(cell, value, style_config, *, bold=False, header_shading=False):
+    """写入单元格并按表样设置段落/字体；表头（bold=True）可按配置加灰底。"""
+    cell.text = str(value)
+    for paragraph in cell.paragraphs:
+        _apply_paragraph(paragraph, style_config, clear_indent=True)
+        if header_shading and bold:
+            shading = OxmlElement("w:shd")
+            shading.set(qn("w:val"), "clear")
+            shading.set(qn("w:fill"), style_config["header_shading"])
+            cell._tc.get_or_add_tcPr().append(shading)
+        run = paragraph.runs[0]
+        _apply_run(run, style_config, bold=bold and style_config["header_bold"])
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+
 def _table(doc, headers, rows, header_shading=False, vertical_merges=()):
     style_config = _current_format_config()["table"]
     table = doc.add_table(rows=1, cols=len(headers))
@@ -685,17 +700,7 @@ def _table(doc, headers, rows, header_shading=False, vertical_merges=()):
     table.style = "Table Grid"
 
     def fill(cell, value, bold=False):
-        cell.text = str(value)
-        for paragraph in cell.paragraphs:
-            _apply_paragraph(paragraph, style_config, clear_indent=True)
-            if header_shading and bold:
-                shading = OxmlElement("w:shd")
-                shading.set(qn("w:val"), "clear")
-                shading.set(qn("w:fill"), style_config["header_shading"])
-                cell._tc.get_or_add_tcPr().append(shading)
-            run = paragraph.runs[0]
-            _apply_run(run, style_config, bold=bold and style_config["header_bold"])
-        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        _table_cell(cell, value, style_config, bold=bold, header_shading=header_shading)
 
     for index, header in enumerate(headers):
         fill(table.rows[0].cells[index], header, True)
@@ -1019,13 +1024,14 @@ def _section_height(doc, segments, height_stats, height_records, images, temp_di
                             continue
                         rows.append([
                             len(rows) + 1, direction, engine.format_station(seg["start"]), engine.format_station(seg["end"]),
-                            data["count"], data["bins"][2], f"{data['pass']:.2f}%",
+                            f"{data['pass']:.2f}%",
                             *[f"{value:.2f}%" for value in data["pcts"]],
                         ])
                 if not rows:
                     continue
                 _caption(doc, "表", f"4.{route_no}-{table_offset}", f"{route_val}线{kind}形梁护栏横梁中心高度检测结果")
-                _table(doc, ["序号", "方向", "起点桩号", "止点桩号", "有效点数", "合格点数", "合格率（%）", *labels[kind]], rows, True)
+                # 4.x 表只保留合格率与分档占比；有效点数/合格点数只在正文说明里给出。
+                _table(doc, ["序号", "方向", "起点桩号", "止点桩号", "合格率（%）", *labels[kind]], rows, True)
             figure_no = 0
             for idx, seg, stat in route_items:
                 for direction in engine.DIRECTIONS:
@@ -1292,11 +1298,33 @@ def _section_tci(doc, segments, tci_stats, tci_images=None, temp_dir=None, tci_p
 
 
 def _section_tci_appendix(doc, segments, tci_stats):
-    """附表1：路线整体行及逐公里、逐方向评定明细，跨页重复表头。"""
+    """附表1：同一区县各路线共用一张表；每条路线前重出表头、序号从 1 重排，
+    路线之间用整行合并的空白行分隔；表首表头跨页重复。"""
+    headers = ["序号", "路线编号", "区县", "方向", "起点桩号", "止点桩号", "TCI", "等级"]
+    style_config = _current_format_config()["table"]
     groups = engine.tci_route_stats(segments, tci_stats)
     for county in dict.fromkeys(s.get("county", "") for s in segments):
-        doc.add_page_break()
         name = county if county.startswith("重庆市") else f"重庆市{county}"
+        rows, header_rows, separator_rows = [], [], []
+        for route in dict.fromkeys(s.get("route", "G210") for s in segments if s.get("county", "") == county):
+            selected = [g for g in groups if g["county"] == county and g["route"] == route]
+            units = [u for g in selected for u in g["units"]]
+            if not units:
+                continue
+            if rows:  # 第二条起：先插入整行合并的空白行，再重出表头，序号从 1 重新开始
+                separator_rows.append(len(rows))
+                rows.append([""] * len(headers))
+                header_rows.append(len(rows))
+                rows.append(list(headers))
+            score = sum(u["tci"] for u in units) / len(units)
+            block = [[1, route, county, "/".join(g["direction"] or "未注明" for g in selected), "/", "/",
+                      f"{score:.2f}", engine.tci_grade(score)]]
+            for unit in units:
+                block.append([len(block) + 1, route, county, unit["direction"] or "未注明",
+                              engine.format_station(unit["start"]), engine.format_station(unit["end"]),
+                              f"{unit['tci']:.2f}", unit["grade"]])
+            rows.extend(block)
+        doc.add_page_break()
         paragraph = doc.add_paragraph(f"附表1 {name}交安设施技术状况评定明细")
         paragraph.style = doc.styles["Heading 1"]
         heading_format = _current_format_config()["heading"]["1"]
@@ -1312,20 +1340,17 @@ def _section_tci_appendix(doc, segments, tci_stats):
         num_id.set(qn("w:val"), "0")
         num_pr.append(num_id)
         paragraph._p.get_or_add_pPr().append(num_pr)
-        rows = []
-        for route in dict.fromkeys(s.get("route", "G210") for s in segments if s.get("county", "") == county):
-            selected = [g for g in groups if g["county"] == county and g["route"] == route]
-            units = [u for g in selected for u in g["units"]]
-            if not units:
-                continue
-            score = sum(u["tci"] for u in units) / len(units)
-            rows.append([len(rows)+1, route, county, "/".join(g["direction"] or "未注明" for g in selected), "/", "/", f"{score:.2f}", engine.tci_grade(score)])
-            for unit in units:
-                rows.append([len(rows)+1, route, county, unit["direction"] or "未注明", engine.format_station(unit["start"]),
-                             engine.format_station(unit["end"]), f"{unit['tci']:.2f}", unit["grade"]])
-        table = _table(doc, ["序号", "路线编号", "区县", "方向", "起点桩号", "止点桩号", "TCI", "等级"], rows, True)
+        table = _table(doc, headers, rows, True)
         table.rows[0]._tr.get_or_add_trPr().append(OxmlElement("w:tblHeader"))
-
+        for index in header_rows:  # 重复表头行按表头样式加粗+灰底
+            for cell, value in zip(table.rows[index + 1].cells, headers):
+                _table_cell(cell, value, style_config, bold=True, header_shading=True)
+        for index in separator_rows:  # 分隔行整行合并为一个空白单元格
+            row = table.rows[index + 1]
+            merged = row.cells[0].merge(row.cells[-1])
+            for extra in merged._tc.findall(qn("w:p"))[1:]:
+                merged._tc.remove(extra)
+            _apply_paragraph(merged.paragraphs[0], style_config, clear_indent=True)
 
 def _section_conclusion(doc, segments, height_stats, bolt_stats, tci_stats=None):
     # 6.1 总结 + 6.2 建议，结构参考《报告模板-5.docx》附件模板。
@@ -1428,25 +1453,27 @@ def _paragraph_bottom_border(paragraph, size="6") -> None:
 
 
 def _add_page_field(paragraph, instruction: str) -> None:
-    """页码域（PAGE / NUMPAGES）：无缓存结果，Word 打开时计算；数字 Times 黑色。"""
-    run = paragraph.add_run()
-    _set_run_fonts(run, "宋体", LATIN_FONT)
+    """页码域（PAGE / SECTIONPAGES）：无缓存结果，Word 打开时计算；数字宋体小五号、Times 黑色。"""
+    def _field_run():
+        run = paragraph.add_run()
+        _set_run_fonts(run, "宋体", LATIN_FONT)
+        run.font.size = Pt(9)  # 小五号
+        return run
+
+    run = _field_run()
     begin = OxmlElement("w:fldChar")
     begin.set(qn("w:fldCharType"), "begin")
     run._r.append(begin)
-    run = paragraph.add_run()
-    _set_run_fonts(run, "宋体", LATIN_FONT)
+    run = _field_run()
     instr = OxmlElement("w:instrText")
     instr.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
     instr.text = f" {instruction} "
     run._r.append(instr)
-    run = paragraph.add_run()
-    _set_run_fonts(run, "宋体", LATIN_FONT)
+    run = _field_run()
     separate = OxmlElement("w:fldChar")
     separate.set(qn("w:fldCharType"), "separate")
     run._r.append(separate)
-    run = paragraph.add_run()
-    _set_run_fonts(run, "宋体", LATIN_FONT)
+    run = _field_run()
     end = OxmlElement("w:fldChar")
     end.set(qn("w:fldCharType"), "end")
     run._r.append(end)
@@ -1454,7 +1481,9 @@ def _add_page_field(paragraph, instruction: str) -> None:
 
 def _set_chongqing_header_footer(section, report_no: str) -> None:
     """重庆页眉页脚（base.pdf 基准）：左公司名 + 右报告编号变量 + 页眉下横线；
-    页脚“第 X 页 共 Y 页”居中。仅重庆链路调用，广东 writer 不经过此函数。"""
+    页脚“第 X 页 共 Y 页”（宋体小五号）居中；Y 用 SECTIONPAGES，只统计正文节
+    （目录以后）的页数，封面/注意事项/目录不计入。仅重庆链路调用，广东 writer 不经过此函数。
+    """
     from docx.enum.text import WD_TAB_ALIGNMENT
 
     section.header.is_linked_to_previous = False
@@ -1462,7 +1491,9 @@ def _set_chongqing_header_footer(section, report_no: str) -> None:
     header = section.header
     paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    paragraph.text = ""
+    # 清空原有 run（不用 text=""：空 run 无字号会把页眉/页脚行高按正文默认字号撑开）。
+    for run in list(paragraph.runs):
+        run._r.getparent().remove(run._r)
     content_width = section.page_width - section.left_margin - section.right_margin
     try:
         paragraph.paragraph_format.tab_stops.add_tab_stop(content_width, WD_TAB_ALIGNMENT.RIGHT)
@@ -1471,7 +1502,9 @@ def _set_chongqing_header_footer(section, report_no: str) -> None:
     left = paragraph.add_run(_CQ_HEADER_COMPANY)
     _set_run_fonts(left, "宋体", LATIN_FONT)
     left.font.size = Pt(9)
-    paragraph.add_run().add_tab()
+    tab_run = paragraph.add_run()
+    tab_run.add_tab()
+    tab_run.font.size = Pt(9)
     right = paragraph.add_run(report_no or "")
     _set_run_fonts(right, "宋体", LATIN_FONT)
     right.font.size = Pt(9)
@@ -1479,7 +1512,8 @@ def _set_chongqing_header_footer(section, report_no: str) -> None:
     footer = section.footer
     fpara = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
     fpara.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    fpara.text = ""
+    for run in list(fpara.runs):
+        run._r.getparent().remove(run._r)
     for text in ("第 ",):
         run = fpara.add_run(text)
         _set_run_fonts(run, "宋体", LATIN_FONT)
@@ -1488,7 +1522,8 @@ def _set_chongqing_header_footer(section, report_no: str) -> None:
     mid = fpara.add_run(" 页 共 ")
     _set_run_fonts(mid, "宋体", LATIN_FONT)
     mid.font.size = Pt(9)
-    _add_page_field(fpara, "NUMPAGES")
+    # SECTIONPAGES＝本节（正文节）页数，即目录以后的页数总量。
+    _add_page_field(fpara, "SECTIONPAGES")
     tail = fpara.add_run(" 页")
     _set_run_fonts(tail, "宋体", LATIN_FONT)
     tail.font.size = Pt(9)
