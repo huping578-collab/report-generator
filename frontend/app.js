@@ -172,7 +172,7 @@
 
     const target = button.dataset.target;
     const field = document.getElementById(target);
-    const isFile = /summary|manual|route/i.test(target);
+    const isFile = /summary|manual|route|marking/i.test(target);
     const previousText = button.textContent;
     button.disabled = true;
     button.textContent = isFile ? '正在选择…' : '正在识别…';

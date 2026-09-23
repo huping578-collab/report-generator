@@ -34,7 +34,8 @@ def main() -> None:
     webview.start(
         gui="edgechromium",
         debug=False,
-        private_mode=False,
+        # ponytail: 用一次性配置目录，否则 WebView2 会缓存 file:// 页面，改完前端界面仍是旧版
+        private_mode=True,
     )
 
 

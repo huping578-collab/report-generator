@@ -32,13 +32,17 @@ class YunfuTemplateTest(unittest.TestCase):
         sections = [text for style, text in headings if style == "Heading 2"]
         self.assertEqual(sections, ["（一）高速公路交安设施技术状况", "（二）普通国省道交安设施技术状况", "（三）工作建议"])
         texts = [text for _, text in headings]
-        for title in ("1.沿线设施技术状况TCI", "（5）防眩设施状况", "2.标线、护栏自动化检测", "（1）标线逆反射亮度系数情况", "（2）波形梁护栏中心高度情况", "（3）螺栓缺失情况"):
+        for title in ("1.沿线设施技术状况TCI", "2.标线、护栏自动化检测", "（1）标线逆反射亮度系数情况", "（2）护栏中心高度情况", "（3）波形梁护栏螺栓缺失情况"):
             self.assertEqual(texts.count(title), 2, title)
+        # TCI 部分只保留标题，不再输出五个分项小节与“未评定”占位正文
+        for removed in ("（1）总体评价", "（2）防护设施状况", "（3）交通标志状况", "（4）交通标线状况", "（5）防眩设施状况"):
+            self.assertNotIn(removed, texts, removed)
+        self.assertNotIn("TCI评价未评定", "\\n".join(p.text for p in doc.paragraphs))
         expected = ["1.重点路段处治建议（如有）", "2.迎国评工作建议", "3.养护提升建议"]
         self.assertEqual([text for style, text in headings if style == "Heading 3"][-3:], expected)
         for section in sections[:2]:
             start = texts.index(section)
-            self.assertLess(texts.index("（5）防眩设施状况", start), texts.index("2.标线、护栏自动化检测", start))
+            self.assertLess(texts.index("1.沿线设施技术状况TCI", start), texts.index("2.标线、护栏自动化检测", start))
         captions = [p.text for p in doc.paragraphs if p.style.name == "Caption"]
         self.assertTrue(captions)
         self.assertTrue(all(text.startswith(("表5-", "图5-")) for text in captions))

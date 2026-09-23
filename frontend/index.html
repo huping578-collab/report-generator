@@ -588,9 +588,9 @@
           </div>
 
           <div class="file-row only-gd" hidden>
-            <div class="file-label"><label for="markingPath">标线数据文件夹</label></div>
+            <div class="file-label"><label for="markingPath">标线统计表</label></div>
             <input class="path-field" id="markingPath" name="markingPath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时扫描项目文件夹…">
-            <button class="button choose-button" type="button" data-target="markingPath">更改位置</button>
+            <button class="button choose-button" type="button" data-target="markingPath">选择文件</button>
           </div>
           <div class="file-row only-gd" hidden>
             <div class="file-label"><label for="guardrailPath">护栏数据文件夹</label></div>
@@ -601,6 +601,11 @@
             <div class="file-label"><label for="manualPath">人工自动化对比表</label></div>
             <input class="path-field" id="manualPath" name="manualPath" type="text" autocomplete="off" readonly placeholder="尚未选择 Excel 文件…">
             <button class="button choose-button" type="button" data-target="manualPath">选择文件</button>
+          </div>
+          <div class="file-row only-gd" hidden>
+            <div class="file-label"><label for="manualBeforePath">进场前人工自动化对比表（选填）</label></div>
+            <input class="path-field" id="manualBeforePath" name="manualBeforePath" type="text" autocomplete="off" readonly data-optional="true" placeholder="未选择时自动识别进场前文件夹…">
+            <button class="button choose-button" type="button" data-target="manualBeforePath">选择文件</button>
           </div>
           <div class="file-row only-gd" hidden>
             <div class="file-label"><label for="routePath">路线分类表</label></div>

@@ -151,6 +151,7 @@ class DesktopBridge:
             bolt_threshold=values["boltThreshold"],
             marking_dir=Path(values["markingPath"]) if values.get("markingPath") else None,
             guardrail_dir=Path(values["guardrailPath"]) if values.get("guardrailPath") else None,
+            manual_before_xlsx=Path(values["manualBeforePath"]) if values.get("manualBeforePath") else None,
         )
         engine.run_guangdong_project(config, log=self._on_engine_log)
 
@@ -171,7 +172,7 @@ class DesktopBridge:
             "detailPath": "检测明细文件夹",
             "diseasePath": "病害清单文件夹",
             "tciPath": "TCI数据文件夹",
-            "markingPath": "标线数据文件夹",
+            "markingPath": "标线统计表",
             "guardrailPath": "护栏数据文件夹",
             "manualPath": "人工自动化对比表",
             "routePath": "路线分类表",
@@ -218,12 +219,13 @@ class DesktopBridge:
 
     def _detect_project_paths(self, folder: Path, template: str) -> dict[str, str]:
         if template == "gd":
-            marking, guardrail = engine.detect_guangdong_data_folders(folder)
+            marking, guardrail = engine.detect_guangdong_sources(folder)
             result = {"outputPath": str(folder)}
-            if marking:
-                result["markingPath"] = str(marking)
-            if guardrail:
-                result["guardrailPath"] = str(guardrail)
+            # 多市输入时不预填单个文件夹，留空由引擎按市逐个识别
+            if len(marking) == 1:
+                result["markingPath"] = str(marking[0])
+            if len(guardrail) == 1:
+                result["guardrailPath"] = str(guardrail[0])
             return result
 
         summary, detail, disease, tci = engine.discover_paths(folder)

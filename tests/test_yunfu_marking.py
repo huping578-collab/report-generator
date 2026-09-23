@@ -151,7 +151,7 @@ class YunfuMarkingTest(unittest.TestCase):
                         for shape in doc.inline_shapes}
             self.assertTrue(generated, "未生成 GD03 统计图")
             self.assertTrue(embedded and embedded <= generated, "docx 内嵌图必须来自本次生成的 GD03 统计图")
-            table = next(t for t in doc.tables if "检测范围" in [c.text for c in t.rows[0].cells])
+            table = next(t for t in doc.tables if "起止桩号" in [c.text for c in t.rows[0].cells])
             headers = [c.text for c in table.rows[0].cells]
             self.assertIn("管养单位", headers)
             self.assertLess(headers.index("左侧合格率(%)"), headers.index("右侧合格率(%)"))
