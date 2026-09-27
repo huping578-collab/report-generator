@@ -298,7 +298,7 @@ def test_tci_charts_split_by_original_segment_and_direction():
         assert tuple(round(v,5) for v in figure.get_size_inches()) == (round(13/2.54,5),round(8/2.54,5))
         assert figure.dpi == 180
         assert axis.get_title() == ''
-        assert axis.lines[0].get_color() == '#4472C4'
+        assert axis.lines[0].get_color() == engine.GD_SERIES_HEX[0]   # P1c：模板 2007-2010 accent1
         assert axis.lines[0].get_linewidth() == 1
         assert not axis.get_legend().get_frame_on()
         assert axis.get_xticklabels()[0].get_rotation() == 30
@@ -697,11 +697,16 @@ class GuangdongStructureAlignmentTests(unittest.TestCase):
             first_cols = [t.rows[i].cells[0].text.strip()
                           for t in document.tables for i in range(1, len(t.rows))]
 
-        # D8：高速 ① 表为「管理单位」级 5 列，首行为合计行（模板形态）
+        # brief-v3 §1 / P1b：高速 ① 表为「管理单位」级 5 列，逐字 4 行（全省抽检高速 / XX市抽检高速 /
+        # 非省交通集团 / 省交通集团）；第 1 行是全省行，4 个数据格全部留空。
         overall = [h for h in headers if h and h[0] == "管理单位"]
         self.assertTrue(overall, f"未找到①总体情况汇总表（管理单位级），现有表头：{headers}")
         self.assertTrue(all(len(h) == 5 for h in overall), f"①表应为 5 列（模板形态）：{overall}")
-        self.assertTrue(any(c == "合计" for c in first_cols), f"①表缺少合计行：{first_cols}")
+        for t in (t for t in document.tables if t.rows[0].cells[0].text.strip() == "管理单位"):
+            labels = [t.rows[i].cells[0].text.strip() for i in range(1, len(t.rows))]
+            self.assertEqual(labels, ["全省抽检高速", "佛山市抽检高速", "非省交通集团", "省交通集团"])
+            self.assertEqual([c.text.strip() for c in t.rows[1].cells[1:]], ["", "", "", ""],
+                             "全省抽检高速行的 4 个数据格必须留空，不填占位也不填「—」")
 
 
 class T2bTemplateAlignmentTests(unittest.TestCase):
@@ -775,10 +780,12 @@ class T2bTemplateAlignmentTests(unittest.TestCase):
         overall = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "管理单位")
         body = "\n".join(p.text for p in document.paragraphs)
 
-        # D8：高速 ① 表为管理单位级 5 列，首行合计
+        # brief-v3 §1 / P1b：高速 ① 表逐字 4 行，首行「全省抽检高速」且数据格留空
         self.assertEqual([c.text.strip() for c in overall.rows[0].cells],
                          ["管理单位", "抽检里程(km)", "总体合格率(%)", "两波合格率(%)", "三波合格率(%)"])
-        self.assertEqual(overall.rows[1].cells[0].text.strip(), "合计")
+        self.assertEqual([overall.rows[i].cells[0].text.strip() for i in range(1, len(overall.rows))],
+                         ["全省抽检高速", "测试市抽检高速", "非省交通集团", "省交通集团"])
+        self.assertEqual([c.text.strip() for c in overall.rows[1].cells[1:]], ["", "", "", ""])
         # D10：② 前置句逐字（模板句型）
         self.assertIn("抽检的各高速公路路段波形梁护栏中心高度总体合格率明细如下表所示。", body)
 
@@ -933,10 +940,16 @@ class T2cAdviceScopeTests(unittest.TestCase):
         match = re.search(r"分属(\d+)家管养单位", body)
 
         self.assertIsNotNone(match, body[:300])
-        # C4：引言「分属 N 家管养单位」== ①表去掉表头行与合计行后的数据行数
-        self.assertEqual(int(match.group(1)), len(overall.rows) - 2)
-        # C4：①表管养单位取路线表口径（明细行写法「明细行简称」被覆写）
-        self.assertEqual(overall.rows[2].cells[0].text.strip(), "广东省高速公路有限公司")
+        # C4：引言「分属 N 家管养单位」== 清单表里不同的管养单位数。
+        # P1b：① 表已改为模板四行（全省/本市/非集团/集团），不再按管养单位逐行展开，
+        # 所以这个数改从清单表核对 —— 两处口径同源，见 gd_manager_lookup。
+        managers = {row.get("manager") for row in self._bundle()["route_segments"]
+                    if row.get("category") == "高速公路"}
+        self.assertEqual(int(match.group(1)), len(managers))
+        # C4：② 表管养单位取路线表口径（明细行写法「明细行简称」被覆写）
+        table2 = next(t for t in document.tables
+                      if t.rows[0].cells[0].text.strip() == "路线编号" and "管养单位" in t.rows[0].cells[2].text)
+        self.assertEqual(table2.rows[1].cells[2].text.strip(), "广东省高速公路有限公司")
 
 
 class GuangdongTemplateConfigTests(unittest.TestCase):
@@ -2880,6 +2893,201 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(by_route["S6"][4], "非集团")
         self.assertEqual(by_route["G4"][4], "跨主体")
         self.assertIsNone(by_route["S269"][4])      # 普通国省道：空单元格，不写占位
+
+    def test_cross_owner_row_splits_by_station_and_closes_the_gap(self):
+        """P1h：跨主体行按 P2 桩号拆分，①表「非集团+集团=全市」闭合（广州 433+75=508≠655 的根因修复）。
+
+        数据取自广州 G0425：附件在 K18.339 处换主体，抽检行是 [0, 40]。
+        拆分前该行整行落空（两侧都不计）→ 差额 40km；拆分后 18.339+21.661=40.000 归零。
+        """
+        index = engine.RouteCategoryIndex({("广州", "G0425"): "高速公路", ("广州", "S2"): "高速公路"},
+                                          owners={("广州", "G0425"): engine.CROSS_OWNER},
+                                          names={("广州", "S2"): "广河高速"})
+        index.owner_index = {("广州", "G0425"): [
+            {"start": 0.0, "end": 18.339, "owner": "非集团", "keeper": "广州公路"},
+            {"start": 18.339, "end": 54.371, "owner": "集团", "keeper": "京珠北段"}]}
+        # 行级 owner：P2 覆盖两个主体 → 判不出（不是取第一段/多数）
+        self.assertIsNone(index.owner_for("广州", "G0425", 0, 40, "广州公路"))
+        spans = index.owner_spans("广州", "G0425", 0, 40)
+        self.assertEqual(spans, [(0.0, 18.339, "非集团"), (18.339, 40.0, "集团")])
+        self.assertEqual(engine.gd_cross_owner_spans(spans, 0, 40), spans)
+
+        row = {"route": "G0425", "direction": "下行", "category": "高速公路",
+               "start": 0.0, "end": 40.0, "length_km": 40.0, "owner": None, "owner_spans": spans}
+        plain = {"route": "S2", "direction": "下行", "category": "高速公路",
+                 "start": 0.0, "end": 70.0, "length_km": 70.0, "owner": "非集团"}
+        inspection = [row, plain]
+        # 里程：拆分行各归其主体，合计回到全市 110 km，差额 0.000
+        other = engine.gd_mileage(inspection, category="高速公路", owner="非集团")
+        prov = engine.gd_mileage(inspection, category="高速公路", owner="集团")
+        self.assertAlmostEqual(other, 18.339 + 70.0, places=6)
+        self.assertAlmostEqual(prov, 21.661, places=6)
+        self.assertAlmostEqual(other + prov, 110.0, places=6)      # 差额 0
+
+        # 率分母：明细行按自身 station_m（米）落段，两侧不重不漏
+        owner_map = engine.gd_owner_map(inspection)
+        details = [{"route": "G0425", "direction": "下行", "station_m": 5000.0},     # K5  非集团
+                   {"route": "G0425", "direction": "下行", "station_m": 30000.0},   # K30 集团
+                   {"route": "G0425", "direction": "下行", "station_m": 40000.0}]   # K40 末点
+        self.assertEqual(len(engine.gd_owner_rows(details, owner_map, "非集团")), 1)
+        self.assertEqual(len(engine.gd_owner_rows(details, owner_map, "集团")), 2)
+
+    def test_owner_gap_note_is_visible_in_report_text(self):
+        """P1i：①表差额必须有产物内可见的说明句（闭合写事实句，有差额写未定主体的路线/里程/原因）。"""
+        closed = [{"route": "G0422", "direction": "下行", "category": "高速公路",
+                   "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}]
+        note = engine.gd_owner_gap_note(closed, "高速公路")
+        self.assertIsNotNone(note)
+        self.assertIn("经营主体已全部核定", note or "")
+        self.assertIn("33.000", note or "")
+
+        gap = [{"route": "G0422", "direction": "下行", "category": "高速公路",
+                "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": None}]
+        note = engine.gd_owner_gap_note(gap, "高速公路")
+        self.assertIsNotNone(note)
+        self.assertIn("少 33.000 km", note or "")
+        self.assertIn("G0422", note or "")       # 点名未核定主体的路段
+        self.assertIn("未覆盖", note or "")      # 写明原因，不空话
+        self.assertIsNone(engine.gd_owner_gap_note([], "高速公路"))
+
+    def test_branch_key_matches_same_branch_written_differently(self):
+        """P1i：管养单位按分支名归一 —— 同一分公司在附件/明细里公司名不同仍视为同一单位。
+
+        深圳 G0422：附件写「广东省公路建设有限公司博深分公司」，明细写「广东博大高速公路
+        有限公司博深分公司」。整串等值时 P3 落空，附件未覆盖的 7.131km 判不出主体。
+        """
+        self.assertEqual(engine.gd_branch_key("广东博大高速公路有限公司博深分公司"),
+                         engine.gd_branch_key("广东省公路建设有限公司博深分公司"))
+        # 不同分支不得混同
+        self.assertNotEqual(engine.gd_branch_key("广东省公路建设有限公司博深分公司"),
+                            engine.gd_branch_key("深圳高速运营发展有限公司"))
+        self.assertNotEqual(engine.gd_branch_key("广东省公路建设有限公司江罗分公司"),
+                            engine.gd_branch_key("广东省公路建设有限公司博深分公司"))
+        # 无分支后缀的单位名原样返回（这类名称在附件内本身唯一）
+        self.assertEqual(engine.gd_branch_key("深圳高速运营发展有限公司"),
+                         "深圳高速运营发展有限公司")
+
+    def test_shenzhen_g0422_attachment_holes_close_via_branch_key(self):
+        """P1i：深圳 G0422 抽检段 [988,1021] 里的 3 个附件空洞靠分支名归一补齐，差额 7.131 → 0。
+
+        附件 28 行只覆盖 25.869km（[994.599,997.340]、[1000.630,1002.534]、[1003.040,1005.526]
+        三段无记录）。空洞内的明细行管养单位是「广东博大高速公路有限公司博深分公司」，
+        附件里同一分支写作「广东省公路建设有限公司博深分公司」（集团）——按整串等值比 P3 落空，
+        这 7.131km 两侧都不计，①表出现差额；按分支名归一后归入集团，差额归零。
+        """
+        # 附件真实数据（节选：3 段集团 + 尾部非集团，中间留 3 个空洞）
+        index = engine.RouteCategoryIndex({("深圳", "G0422"): "高速公路"})
+        index.owner_index = {("深圳", "G0422"): [
+            {"start": 987.423, "end": 994.599, "owner": "集团", "keeper": "广东省公路建设有限公司博深分公司"},
+            {"start": 997.340, "end": 1007.624, "owner": "集团", "keeper": "广东省公路建设有限公司博深分公司"},
+            {"start": 1007.624, "end": 1021.300, "owner": "非集团", "keeper": "深圳高速运营发展有限公司"}]}
+        # 明细行管养单位：同一分支但公司名不同
+        keepers = [(996.0, 996.0, "广东博大高速公路有限公司博深分公司"),
+                   (1001.5, 1001.5, "广东博大高速公路有限公司博深分公司"),
+                   (1004.0, 1004.0, "广东博大高速公路有限公司博深分公司")]
+        spans = index.owner_spans("深圳", "G0422", 988.0, 1021.0, keepers)
+        covered = sum(b - a for a, b, _ in spans)
+        self.assertAlmostEqual(covered, 33.0, places=6)          # 33km 全覆盖
+        prov = sum(b - a for a, b, o in spans if o == "集团")
+        other = sum(b - a for a, b, o in spans if o == "非集团")
+        self.assertAlmostEqual(prov + other, 33.0, places=6)     # 差额 0
+        self.assertAlmostEqual(prov, 19.624, places=3)           # 集团 = 12.493 + 7.131 空洞
+        self.assertAlmostEqual(other, 13.376, places=3)
+        # 空洞落在两侧而非整行一侧：分段里既有集团也有非集团
+        self.assertEqual({o for _a, _b, o in spans}, {"集团", "非集团"})
+        # 判不出的片段仍不返回（宁缺勿摊派）：管养单位在附件里跨主体时不得取多数
+        ambiguous = engine.RouteCategoryIndex({("深圳", "S3"): "高速公路"})
+        ambiguous.owner_index = {("深圳", "S3"): [
+            {"start": 0.0, "end": 5.0, "owner": "集团", "keeper": "广东省公路建设有限公司博深分公司"},
+            {"start": 5.0, "end": 10.0, "owner": "非集团", "keeper": "广东省公路建设有限公司江罗分公司"}]}
+        # 片段跨两个附件分段 → 两个主体 → 判不出（不取第一段）
+        self.assertIsNone(ambiguous._owner_of_slice(ambiguous.owner_index[("深圳", "S3")],
+                                                    1.0, 9.0, ()))
+
+    def test_owner_km_display_stays_additive_across_cities(self):
+        """P1j：① 表三行里程用最大余数法取整，整数显示恒等（深圳 237=163+74，不是 238）。
+
+        精确值取自 7 市产物说明句：说明句承担 3 位小数，表承担恒等。
+        """
+        # (全市, 非集团, 集团) → 期望的三个整数格
+        for total, non_prov, prov, expected in (
+            (226.818, 156.804, 70.014, ("227", "157", "70")),    # 东莞
+            (173.065, 91.000, 82.065, ("173", "91", "82")),      # 中山
+            (390.166, 209.941, 180.225, ("390", "210", "180")),   # 佛山
+            (654.668, 541.133, 113.535, ("655", "541", "114")),   # 广州
+            (417.154, 256.864, 160.290, ("417", "257", "160")),   # 惠州
+            (237.283, 162.658, 74.625, ("237", "163", "74")),     # 深圳：原 163+75=238 ≠ 237
+            (117.003, 97.003, 20.000, ("117", "97", "20")),       # 珠海
+        ):
+            with self.subTest(total=total):
+                cells = engine.gd_km_split_text(total, non_prov, prov)
+                self.assertEqual(cells, expected)
+                self.assertEqual(int(cells[1]) + int(cells[2]), int(cells[0]))
+                # 全市格是精确值普通四舍五入；分项只因补齐恒等而平移，不超过 1
+                self.assertLessEqual(abs(int(cells[1]) - non_prov), 1.0)
+                self.assertLessEqual(abs(int(cells[2]) - prov), 1.0)
+
+        # 无值行不参与分配，仍写「—」；说明句的 3 位小数不受影响
+        self.assertEqual(engine.gd_km_split_text(100.0, None, 60.0), ("100", "—", "60"))
+        note = engine.gd_owner_gap_note(
+            [{"route": "G0422", "direction": "下行", "category": "高速公路",
+              "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}], "高速公路")
+        self.assertIn("33.000", note or "")       # 说明句仍是 3 位精确值
+
+    def test_owner_km_rows_only_split_highway_owner_triple(self):
+        """P1j：取整只作用于高速的「全市/非集团/集团」三行；普通国省道的全市/国道/省道原样。"""
+        groups = [("全省抽检高速", None), ("深圳市抽检高速", {"km": 237.283}),
+                  ("非省交通集团", {"km": 162.658}), ("省交通集团", {"km": 74.625})]
+        self.assertEqual(engine.gd_km_row_texts(groups), ["", "237", "163", "74"])
+        # 无主体行的普通分支：逐格原逻辑，不做恒等调整（km 为 None 的行写「—」）
+        normal = [("全省抽检普通国省道", None), ("全省抽检普通国道", None), ("全省抽检普通省道", None),
+                  ("珠海市抽检普通国省道", {"km": 10.4}), ("珠海市抽检普通国道", {"km": None}),
+                  ("珠海市抽检普通省道", {"km": 9.6})]
+        self.assertEqual(engine.gd_km_row_texts(normal), ["", "", "", "10", "—", "10"])
+
+    def test_owner_name_alias_resolves_to_route_code(self):
+        """P1h：源表「路线编号」列填路线名时按本市唯一名称反查编码（广河高速→S2），不做模糊匹配。"""
+        index = engine.RouteCategoryIndex({("广州", "S2"): "高速公路"},
+                                          owners={("广州", "S2"): "非集团"},
+                                          names={("广州", "S2"): "广河高速"})
+        self.assertEqual(index.owner_route_key("广州", "广河高速"), ("广州", "S2"))
+        self.assertEqual(index.owner_for("广州", "广河高速", 2.45, 69.998), "非集团")
+        # 本市不存在该名称 → 不反查，仍按原值查（判不出而非乱认）
+        self.assertEqual(index.owner_route_key("广州", "沈海高速"), ("广州", "沈海高速"))
+        # 同名多行时不反查（route_of_name 只收本市唯一的名称）
+        ambiguous = engine.RouteCategoryIndex({("广州", "S2"): "高速公路", ("广州", "S3"): "高速公路"},
+                                             names={("广州", "S2"): "广河高速", ("广州", "S3"): "广河高速"})
+        self.assertNotIn(("广州", "广河高速"), ambiguous.route_of_name)
+
+    def test_match_owner_p3_ignored_when_keeper_covers_only_part_of_span(self):
+        """P1h：P3 管养单位只覆盖查询区间一段时不得收窄，否则整行被判给那一个主体（摊派）。"""
+        index = engine.RouteCategoryIndex({("广州", "G0425"): "高速公路"})
+        index.owner_index = {("广州", "G0425"): [
+            {"start": 0.0, "end": 18.339, "owner": "非集团", "keeper": "广州公路"},
+            {"start": 18.339, "end": 54.371, "owner": "集团", "keeper": "京珠北段"}]}
+        # keeper 只管 0-18.339，盖不满 0-40 → 不收窄，判不出
+        self.assertIsNone(engine.match_owner(index.owner_index, "广州", "G0425", 0, 40, "广州公路"))
+        # keeper 覆盖整段时照常收窄（P3 原义不变）
+        self.assertEqual(engine.match_owner(index.owner_index, "广州", "G0425", 0, 18, "广州公路"),
+                         "非集团")
+        # 附件无覆盖的尾段用 P3：管养单位在附件里唯一对应一个主体才认
+        # （附件 G0425 止于 54.371，54.371 之后无覆盖）
+        spans = index.owner_spans("广州", "G0425", 54.371, 60.0,
+                                  [(56.0, 56.0, "京珠北段")])
+        self.assertEqual(spans, [(54.371, 60.0, "集团")])
+        # 尾段管养单位判不出 → 该片段不返回，差额如实保留
+        self.assertEqual(index.owner_spans("广州", "G0425", 54.371, 60.0), [])
+
+    def test_cross_owner_spans_requires_full_coverage_and_two_owners(self):
+        """P1h：只拆「≥2 主体且首尾完整覆盖」的行，其余返回 None 走单值路径（零回归）。"""
+        single = [(0.0, 70.0, "非集团")]
+        self.assertIsNone(engine.gd_cross_owner_spans(single, 0, 70))
+        # 少一段：拼不回原区间 → 不拆
+        self.assertIsNone(engine.gd_cross_owner_spans([(0.0, 18.3, "非集团"), (18.3, 40.0, "集团")],
+                                                      0, 41))
+        self.assertIsNone(engine.gd_cross_owner_spans(None, 0, 40))
+        self.assertIsNone(engine.gd_cross_owner_spans([(0.0, 18.3, "非集团"), (18.3, 40.0, "集团")],
+                                                      None, 40))
 
     def test_measured_segments_parsed_from_detail_filenames(self):
         """P1d-b：实测段索引从明细文件名解析（K<起>K<止>，单位 km，市名取自目录名）。"""
@@ -5215,3 +5423,52 @@ class T2kWorkbookSeparatorTests(unittest.TestCase):
         self.assertEqual(sheet["A2"].value, "K975+740-K979+740")
         self.assertEqual(sheet["A3"].value, "无数据 —")
 
+
+
+class P1cTemplatePaletteAndRouteNameTests(unittest.TestCase):
+    """P1c：① 统计图配色改用模板的 Office 2007-2010 调色板（brief-v3 需求 #4）；
+    ② 叙述里路线号后补路线名称（需求 #3），③ 小标题不补。"""
+
+    def test_series_palette_matches_template_theme(self) -> None:
+        # 模板 18 个内嵌 xlsx 的 theme accent1/2/3（实测，见 reviews/p1c-narrative-charts.md）
+        self.assertEqual(engine.GD_SERIES_COLORS, ("4F81BD", "C0504D", "9BBB59"))
+        self.assertEqual(engine.GD_SERIES_HEX, ("#4F81BD", "#C0504D", "#9BBB59"))
+        self.assertEqual(engine.GD03_COLORS, engine.GD_SERIES_HEX)
+        # PIE_COLORS 前三位复用同一组；第 4 位 FFC000、第 5 位对齐 2007 系 accent5
+        self.assertEqual(engine.PIE_COLORS[:3], list(engine.GD_SERIES_COLORS))
+        self.assertEqual(engine.PIE_COLORS[3:], ["FFC000", "4BACC6"])
+        # 模板根本不用的 Office 2013 色号，一个都不许残留在常量里
+        for stale in ("4472C4", "ED7D31", "A5A5A5", "5B9BD5"):
+            self.assertNotIn(stale, engine.GD_SERIES_COLORS)
+            self.assertNotIn(stale, engine.PIE_COLORS)
+
+    def test_no_office2013_palette_literal_left_in_engine_source(self) -> None:
+        source = Path(engine.__file__).read_text(encoding="utf-8")
+        body = "\n".join(line for line in source.splitlines()
+                         if not line.lstrip().startswith("#"))   # 注释里保留取证说明
+        for stale in ("4472C4", "ED7D31", "A5A5A5", "5B9BD5"):
+            self.assertNotIn(stale, body, f"仍有 Office 2013 色号 {stale} 硬编码在引擎里")
+
+    def test_intro_route_label_appends_authoritative_name(self) -> None:
+        # 需求 #3：引言「涉及G0422、G1523…」必须写成「G0422武汉－深圳、G1523宁波－东莞」
+        names = {"G0422": "武汉－深圳", "G1523": "宁波－东莞"}
+
+        def label(route):
+            return f"{route}{names.get(route) or ''}"
+
+        self.assertEqual(label("G0422"), "G0422武汉－深圳")
+        self.assertEqual("、".join(label(r) for r in ("G0422", "G1523")),
+                         "G0422武汉－深圳、G1523宁波－东莞")
+        # 查不到名称就只写路线号（如实标注为未命中），不拿别处措辞顶替
+        self.assertEqual(label("G9999"), "G9999")
+
+    def test_intro_km_split_matches_owner_triple(self) -> None:
+        # P1k：引言「省集团X公里、非集团Y公里」必须与 ① 表三行同法取整（最大余数法），
+        # 深圳曾出现 75+163=238 ≠ ① 表 237=163+74。
+        self.assertEqual(engine.gd_km_split_text(237.283, 162.658, 74.625),
+                         ("237", "163", "74"))
+        self.assertEqual(sum(int(x) for x in engine.gd_km_split_text(237.283, 162.658, 74.625)[1:]), 237)
+        # 普通分支无「全市=分项」三行关系，仍走原取整
+        self.assertEqual(engine.gd_km_row_texts(
+            [("XX市抽检普通国省道", {"km": 16.0}), ("XX市抽检普通国道", {"km": 8.0}),
+             ("XX市抽检普通省道", {"km": 8.0})]), ["16", "8", "8"])
