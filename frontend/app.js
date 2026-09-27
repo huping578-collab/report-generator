@@ -247,6 +247,7 @@
     }
 
     if (state.template === 'gd') {
+      // 标线/护栏高度是偏差(0～100 %/mm)；螺栓是缺失数量差值(颗/柱)，取整数
       const invalid = ['markingThreshold', 'heightThreshold', 'boltThreshold']
         .map((id) => document.getElementById(id))
         .find((input) => input.value === '' || Number(input.value) < 0 || Number(input.value) > 100);

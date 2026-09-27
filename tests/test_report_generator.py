@@ -5,6 +5,7 @@ import io
 import json
 import os
 import openpyxl
+import re
 import tempfile
 import unittest
 import zipfile
@@ -674,15 +675,17 @@ class GuangdongStructureAlignmentTests(unittest.TestCase):
             document = Document(output)
             texts = [p.text.strip() for p in document.paragraphs]
 
-        # 组标题与附件一致
-        self.assertIn("（2）护栏中心高度情况", texts)
+        # G2（用户第 3 轮裁决，覆盖 D7/R10）：三个自动化小节标题统一带 `（1）（2）（3）`
+        self.assertIn("（1）标线逆反射亮度系数情况", texts)
+        self.assertIn("（2）波形梁护栏中心高度情况", texts)
         self.assertIn("（3）波形梁护栏螺栓缺失情况", texts)
+        self.assertNotIn("（2）护栏中心高度情况", texts)
         # 三个指标组各自的①②小节（附件口径）
         self.assertEqual(texts.count("②各抽检路段情况"), 2)  # 本样例仅有高度/螺栓数据
         # 模板注释不得进入正文
         self.assertFalse([t for t in texts if t.startswith("<!--")])
 
-    def test_overall_tables_use_road_class_rows(self) -> None:
+    def test_overall_tables_use_manager_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output = engine.GuangdongChapterWriter.write(
                 "佛山市", self._bundle(), Path(temp_dir) / "out",
@@ -694,10 +697,246 @@ class GuangdongStructureAlignmentTests(unittest.TestCase):
             first_cols = [t.rows[i].cells[0].text.strip()
                           for t in document.tables for i in range(1, len(t.rows))]
 
-        overall = [h for h in headers if h and h[0] == "道路类别"]
-        self.assertTrue(overall, f"未找到①总体情况汇总表，现有表头：{headers}")
-        self.assertTrue(all(len(h) == 5 for h in overall), f"①表应为 5 列（附件形态）：{overall}")
-        self.assertTrue(any(c == "高速公路" for c in first_cols), f"①表缺少“高速公路”行：{first_cols}")
+        # D8：高速 ① 表为「管理单位」级 5 列，首行为合计行（模板形态）
+        overall = [h for h in headers if h and h[0] == "管理单位"]
+        self.assertTrue(overall, f"未找到①总体情况汇总表（管理单位级），现有表头：{headers}")
+        self.assertTrue(all(len(h) == 5 for h in overall), f"①表应为 5 列（模板形态）：{overall}")
+        self.assertTrue(any(c == "合计" for c in first_cols), f"①表缺少合计行：{first_cols}")
+
+
+class T2bTemplateAlignmentTests(unittest.TestCase):
+    """T2b：① 汇总表（D8）、抽检路段清单表（D2/D3/D19/D4）、② 前置句（D10）按甲方模板逐字对齐。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        def height(value, station):
+            return {"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K2+000",
+                    "guardrail_type": "二波", "height": value, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": station, "end_m": station + 1}
+
+        return {
+            "city": "测试市",
+            "marking": [],
+            "height": [height(600.0, 1000.0), height(600.0, 2000.0)],
+            "bolt": [],
+            "notes": [],
+            "comparison_detail": [],
+            "weak_segments": [],
+            "route_segments": [
+                {"city": "测试", "route": "S14", "direction": "上行", "category": "高速公路",
+                 "start": 964.986, "end": 1009.0, "length": 44.014, "manager": "广东省高速公路有限公司"},
+                {"city": "测试", "route": "S14", "direction": "下行", "category": "高速公路",
+                 "start": 1009.0, "end": 2000.0, "length": 991.0, "manager": "广东省高速公路有限公司"},
+                {"city": "测试", "route": "S357", "direction": "上行", "category": "普通国省道",
+                 "start": 40.0109, "end": 60.0, "length": 19.9891, "manager": "测试市公路事务中心"},
+                {"city": "测试", "route": "S357", "direction": "下行", "category": "普通国省道",
+                 "start": 60.0, "end": 80.0, "length": 20.0, "manager": "测试市公路事务中心"},
+            ],
+        }
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_inspection_list_table_matches_template(self) -> None:
+        document = self._write()
+        captions = [p.text for p in document.paragraphs if p.style.name == "Caption"]
+        table = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "类型")
+        headers = [c.text.strip() for c in table.rows[0].cells]
+
+        # D2 表题去「表」；D3 第 7 列 `段长（Km)`；D5 声明在 GD_TABLE_WIDTHS
+        self.assertIn("表5-1 测试市交通安全设施抽检路段清单", captions)
+        self.assertEqual(headers, ["类型", "路线编号", "路线名称", "检测方向", "起点桩号", "终点桩号",
+                                   "段长（Km)", "管养单位", "备注"])
+        self.assertIsNotNone(engine.GD_TABLE_WIDTHS.get(tuple(engine._norm_header_text(h) for h in headers)))
+        # Q3 整数公里：964.986→965、40.0109→40、44.014→44
+        self.assertEqual([table.rows[1].cells[i].text.strip() for i in (4, 5, 6)], ["965", "1009", "44"])
+        self.assertEqual([table.rows[2].cells[i].text.strip() for i in (4, 5, 6)], ["1009", "2000", "991"])
+        self.assertEqual([table.rows[3].cells[i].text.strip() for i in (4, 5, 6)], ["40", "60", "20"])
+
+        # D4 类型列按高速/普通块纵向合并（连续同值合并，首行 restart）
+        xml_rows = table._tbl.findall("./w:tr", table._tbl.nsmap)
+
+        def vmerge_of(row):
+            cell = row.findall("./w:tc", table._tbl.nsmap)[0]
+            node = cell.find("./w:tcPr/w:vMerge", cell.nsmap)
+            return "none" if node is None else (node.get(qn("w:val")) or "continue")
+
+        self.assertEqual([vmerge_of(row) for row in xml_rows],
+                         ["none", "restart", "continue", "restart", "continue"])
+
+    def test_overall_table_and_preface_sentence_match_template(self) -> None:
+        document = self._write()
+        overall = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "管理单位")
+        body = "\n".join(p.text for p in document.paragraphs)
+
+        # D8：高速 ① 表为管理单位级 5 列，首行合计
+        self.assertEqual([c.text.strip() for c in overall.rows[0].cells],
+                         ["管理单位", "抽检里程(km)", "总体合格率(%)", "两波合格率(%)", "三波合格率(%)"])
+        self.assertEqual(overall.rows[1].cells[0].text.strip(), "合计")
+        # D10：② 前置句逐字（模板句型）
+        self.assertIn("抽检的各高速公路路段波形梁护栏中心高度总体合格率明细如下表所示。", body)
+
+
+class T2dTableLayoutTests(unittest.TestCase):
+    """T2d：列宽取自 GD_TABLE_WIDTHS(_BY_CAPTION) 且与 template-tables.tsv 一致；② 表尾行合计合并。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        rows = [
+            {"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K2+000",
+             "guardrail_type": kind, "height": 600.0, "city": "测试市", "manager": "广东省高速公路有限公司",
+             "station_m": station, "end_m": station + 1.0}
+            for station, kind in ((1000.0, "两波"), (1001.0, "三波"))
+        ]
+        return {"city": "测试市", "marking": [], "bolt": [], "notes": [], "comparison_detail": [],
+                "weak_segments": [], "height": rows,
+                "route_segments": [{"city": "测试", "route": "S14", "direction": "上行", "category": "高速公路",
+                                    "start": 1.0, "end": 2.0, "length": 1.0, "manager": "广东省高速公路有限公司"}]}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_widths_dict_matches_template_tsv(self) -> None:
+        # 清单表 / 人工复核 / 分支列宽不同（表题口径）：数值取自 requirements/template-tables.tsv
+        self.assertEqual(
+            engine.GD_TABLE_WIDTHS[("类型", "路线编号", "路线名称", "检测方向", "起点桩号", "终点桩号",
+                                    "段长（Km)", "管养单位", "备注")],
+            [1.36, 1.04, 1.78, 1.09, 1.09, 1.12, 1.31, 4.25, 2.47])
+        self.assertEqual(
+            engine.GD_TABLE_WIDTHS[("路线", "桩号区段", "护栏类型", "人工检测复核结果", "人工检测复核结果",
+                                    "人工检测复核结果", "自动化检测结果", "自动化检测结果", "自动化检测结果", "结果一致性")],
+            [1.52, 2.56, 1.26, 1.31, 1.31, 1.32, 1.32, 1.32, 1.32, 1.37])
+        self.assertEqual(engine.GD_TABLE_WIDTHS_BY_CAPTION["普通国省道标线逆反射亮度系数不佳路段汇总表"],
+                         [1.13, 5.91, 2.21, 1.85, 1.79, 1.80])
+        # 人工复核三表（标线两分支同宽；高度/螺栓两分支列宽不同 → 表题口径）
+        self.assertEqual(
+            engine.GD_TABLE_WIDTHS[("路线编号", "桩号区段", "标线颜色", "人工检测复核结果", "人工检测复核结果",
+                                    "自动化检测结果", "自动化检测结果", "结果一致性")],
+            [1.34, 3.55, 1.63, 1.63, 1.79, 1.46, 1.76, 1.58])
+        self.assertEqual(
+            engine.GD_TABLE_WIDTHS[("路线编号", "桩号区段", "护栏类型", "合格值(mm)", "人工检测复核结果",
+                                    "人工检测复核结果", "自动化检测结果", "自动化检测结果", "结果一致性")],
+            [1.23, 3.26, 1.0, 2.17, 1.25, 1.59, 1.23, 1.62, 1.44])
+        self.assertEqual(engine.GD_TABLE_WIDTHS_BY_CAPTION["普通国省道波形梁护栏中心高度人工复核对比明细表"],
+                         [1.23, 3.29, 1.0, 2.16, 1.25, 1.59, 1.23, 1.62, 1.43])
+
+    def test_route_table_widths_and_tail_total_row(self) -> None:
+        document = self._write()
+        table = next(t for t in document.tables
+                     if len(t.columns) == 8 and t.rows[0].cells[4].text.strip() == "里程(km)")
+        self.assertEqual([round(column.width.cm, 2) for column in table.columns],
+                         [1.01, 1.60, 3.64, 2.21, 1.18, 1.78, 1.78, 1.78])
+        last = table.rows[-1]
+        # D2：尾行 = 合计行（前 4 列并成一格，文本 `{市}合计`），表头 + 1 数据行 + 合计行
+        self.assertEqual(len(table.rows), 3)
+        self.assertEqual(last.cells[0].text.strip(), "测试市合计")
+        self.assertIs(last.cells[0]._tc, last.cells[3]._tc)
+        self.assertEqual(last.cells[4].text.strip(), table.rows[1].cells[4].text.strip())
+
+
+class T2cAdviceScopeTests(unittest.TestCase):
+    """T2c：工作建议结构（C1 养护提升建议/C2 迎国评前缀/C3 重点路段处治建议）与管养单位口径（C4）。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        return {
+            "city": "测试市",
+            "marking": [],
+            "height": [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K2+000",
+                        "guardrail_type": "二波", "height": 600.0, "city": "测试市",
+                        "manager": "明细行简称", "station_m": 1000.0, "end_m": 1001.0}],
+            "bolt": [],
+            "notes": [],
+            "comparison_detail": [],
+            "weak_segments": [{"route": "S14", "direction": "上行", "segment": "S14上行K1+000～K2+000",
+                               "type": "护栏高度偏差超10cm", "reason": "三波护栏偏差超10 cm点数1个"}],
+            "route_segments": [
+                {"city": "测试", "route": "S14", "direction": "上行", "category": "高速公路",
+                 "start": 1.0, "end": 2.0, "length": 1.0, "manager": "广东省高速公路有限公司"},
+                {"city": "测试", "route": "S357", "direction": "上行", "category": "普通国省道",
+                 "start": 1.0, "end": 2.0, "length": 1.0, "manager": "测试市公路事务中心"},
+            ],
+        }
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    @staticmethod
+    def _font(paragraph):
+        run = next(run for run in paragraph.runs if run.text.strip())
+        rpr = run._element.find(qn("w:rPr"))
+        rfonts = rpr.find(qn("w:rFonts")) if rpr is not None else None
+        return ((rfonts.get(qn("w:eastAsia")) if rfonts is not None else None),
+                run.font.size.pt if run.font.size else None, run.bold)
+
+    def test_maintenance_advice_matches_template(self) -> None:
+        document = self._write()
+        by_text = {p.text.strip(): p for p in document.paragraphs if p.text.strip()}
+        leads = ("（1）建立差异化、精准化的养护策略", "（2）分类型完善设施养护策略",
+                 "（3）资金保障与技术能力提升", "（4）病害源头治理")
+        titles = ("①高速公路，加强属地养护监管", "②普通国省道，统筹养护",
+                  "①防护护栏", "②交通标线", "③交通标志与防眩设施")
+
+        # C1：4 个 `（n）` 引导段 + 5 个 `①②③` 二级标题（模板-1 原文）
+        for text in leads:
+            self.assertIn(text, by_text, text)
+            self.assertEqual(self._font(by_text[text]), ("仿宋_GB2312", 12.0, None), text)
+        for text in titles:
+            self.assertIn(text, by_text, text)
+            self.assertEqual(by_text[text].style.name, "Heading 5", text)
+            self.assertEqual(self._font(by_text[text]), ("黑体", 12.0, True), text)
+        self.assertIn(engine.GD_MAINTENANCE_LEAD, by_text)
+
+    def test_induction_prefix_and_key_route_structure(self) -> None:
+        document = self._write()
+        texts = [p.text.strip() for p in document.paragraphs]
+
+        # C2：迎国评第 1 项按模板原文含 `（1）`（无句号）
+        self.assertIn("（1）分类开展显性问题突击整治", texts)
+        self.assertNotIn("分类开展显性问题突击整治。", texts)
+        # F1：`（1）` 下 3 段按模板-1 原文逐字
+        for text in ("清除标志遮挡：标志板遮挡是高速公路和普通国省道共有的突出问题。组织一次全线排查，集中修剪遮挡交通标志的树木和植被，成本低、见效快。",
+                     "高速公路方面：更换变形护栏板并同步排查补齐护栏缺失螺栓，修复锈蚀、缺损防眩网；对路段旧标线未清除问题开展专项清理。",
+                     "普通国省道方面：优先处置波形梁护栏缺损并补齐护栏缺失螺栓、防护设施防护能力不足隐患，快速翻新缺损严重的标线。"):
+            self.assertIn(text, texts)
+        body = "\n".join(texts)
+        self.assertIn("（2）做好迎检路段现场排查", body)
+        self.assertIn("（3）统筹力量，差异化投入", body)
+        # C3：重点路段处治建议 = 模板原文单段 + 工作簿指向句，无子标题
+        self.assertIn(engine.GD_KEY_ROUTE_ADVICE, texts)
+        self.assertIn("优先处治路段明细见《测试市交安设施统计图表.xlsx》「优先处治路段」工作表。", texts)
+        self.assertNotIn("（一）优先处治路段（6个月完成）", texts)
+        self.assertNotIn("（二）闭环督办管理要求", texts)
+
+    def test_overall_table_manager_count_matches_intro(self) -> None:
+        document = self._write()
+        overall = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "管理单位")
+        body = "\n".join(p.text for p in document.paragraphs)
+        match = re.search(r"分属(\d+)家管养单位", body)
+
+        self.assertIsNotNone(match, body[:300])
+        # C4：引言「分属 N 家管养单位」== ①表去掉表头行与合计行后的数据行数
+        self.assertEqual(int(match.group(1)), len(overall.rows) - 2)
+        # C4：①表管养单位取路线表口径（明细行写法「明细行简称」被覆写）
+        self.assertEqual(overall.rows[2].cells[0].text.strip(), "广东省高速公路有限公司")
 
 
 class GuangdongTemplateConfigTests(unittest.TestCase):
@@ -1862,7 +2101,8 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
             document = Document(output)
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
 
-        self.assertIn("共获得有效检测点2个", text)
+        # G1（用户第 3 轮）：① 总体情况 下不再输出统计口径段（模板①只有 1 段）
+        self.assertNotIn("覆盖整公里检测段", text)
         self.assertIn("其中两波护栏合格率", text)
         self.assertIn("三波护栏合格率", text)
         self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", text)
@@ -1908,7 +2148,7 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
             )
             document = Document(output)
             paragraphs = document.paragraphs
-            start = next(i for i, p in enumerate(paragraphs) if p.text == "（2）护栏中心高度情况")
+            start = next(i for i, p in enumerate(paragraphs) if p.text == "（2）波形梁护栏中心高度情况")
             end = next(i for i, p in enumerate(paragraphs) if p.text == "（3）波形梁护栏螺栓缺失情况")
             section = paragraphs[start:end]
             height_headings = [p.text for p in section if p.style.name == "Heading 5"]
@@ -1922,7 +2162,7 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
                 "③典型状况不佳路段及原因分析",
             ],
         )
-        self.assertIn("共获得有效检测点1个", height_text)
+        self.assertNotIn("覆盖整公里检测段", height_text)
         self.assertNotIn("当前区段为桥梁路段，无有效检测点位。", height_text)
 
     def test_writer_accepts_markdown_template_with_city_placeholder(self) -> None:
@@ -1963,7 +2203,7 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
 
         self.assertIn("本章为佛山市交通安全设施技术状况检测评价内容。", text)
         self.assertIn("五、交通安全设施技术状况检测评价情况", text)
-        self.assertIn("（2）护栏中心高度情况", text)
+        self.assertIn("（2）波形梁护栏中心高度情况", text)
         self.assertIn("其中两波护栏", text)
         self.assertNotIn("{{地市}}", text)
 
@@ -2008,12 +2248,14 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
                 "absolute_difference": 1.0,
                 "relative_deviation": None,
                 "within_threshold": True,
+                "consistent": True,
             },
             {
                 "indicator": "height",
                 "absolute_difference": 3.0,
                 "relative_deviation": None,
                 "within_threshold": False,
+                "consistent": False,
             },
         ]
         engine.GuangdongChapterWriter._comparison_table(
@@ -2025,6 +2267,158 @@ class GuangdongBusinessRegressionTests(unittest.TestCase):
         self.assertIn("平均偏差", text)
         self.assertIn("一致性占比", text)
         self.assertNotIn("1.00～3.00", text)
+
+
+class ManualConsistencyRuleTests(unittest.TestCase):
+    """M1（brief-v3 §7 用户裁决）：结果一致性 = 两侧合格判定是否相同，测值偏差/阈值不再是判据。"""
+
+    THRESHOLDS = {"marking": 7, "height": 5, "bolt": 5}
+
+    @classmethod
+    def _compare(cls, **record):
+        base = {"indicator": "height", "gtype": "三波护栏", "city": "测试市", "route": "G1",
+                "direction": "上行", "segment": "K1+000~K1+100"}
+        base.update(record)
+        detail, summary = engine.ManualAutoComparator(cls.THRESHOLDS).compare([base])
+        return detail[0], summary
+
+    def test_same_verdict_is_consistent_for_qualified_and_failed(self):
+        """两边合格同判一致、两边不合格同判一致。"""
+        passed, _ = self._compare(manual=704.0, automatic=708.0)          # 697±20 内
+        failed, _ = self._compare(manual=640.0, automatic=600.0)          # 697±20 外
+        self.assertIs(passed["consistent"], True)
+        self.assertIs(failed["consistent"], True)
+        # 同一侧数值差很大仍同判（600 与 610 双波都合格）
+        wide, _ = self._compare(manual=585.0, automatic=610.0, gtype="双波护栏")
+        self.assertIs(wide["consistent"], True)
+
+    def test_mixed_verdict_is_inconsistent_even_when_values_are_close(self):
+        """一合一不合 → 不一致（579/582 双波：差 3mm 但跨合格界限）。"""
+        detail, _ = self._compare(manual=579.0, automatic=582.0, gtype="双波护栏")
+        self.assertIs(detail["within_threshold"], True)                   # 旧偏差法会判「一致」
+        self.assertIs(detail["consistent"], False)                        # 新口径判「不一致」
+
+    def test_bolt_consistency_from_missing_count_difference(self):
+        """M2（第二轮裁决）：螺栓按两侧缺失数量差值判定，差值<阈值→一致、≥阈值→不一致。"""
+        same, _ = self._compare(indicator="bolt", manual=3, automatic=3)          # 差值 0
+        near, _ = self._compare(indicator="bolt", manual=0, automatic=4)          # 差值 4 < 5
+        both_positive, _ = self._compare(indicator="bolt", manual=1, automatic=38)
+        at_limit, _ = self._compare(indicator="bolt", manual=0, automatic=5)      # 差值 5 = 阈值
+        far, _ = self._compare(indicator="bolt", manual=0, automatic=13)          # 差值 13
+        self.assertIs(same["consistent"], True)
+        self.assertIs(near["consistent"], True)
+        self.assertIs(both_positive["consistent"], False)                         # 差值 37
+        self.assertIs(at_limit["consistent"], False)                              # 差值 5 ≥ 5
+        self.assertIs(far["consistent"], False)
+        # within_threshold 同步改为「差值 < 阈值」，与 consistent 同源
+        self.assertIs(near["within_threshold"], True)
+        self.assertIs(far["within_threshold"], False)
+
+    def test_bolt_threshold_is_configurable(self):
+        """同一批数据换阈值结论随之改变：差值 1 在阈值 5 下判一致、阈值 1 下判不一致。"""
+        def verdict(threshold):
+            detail, _ = engine.ManualAutoComparator(
+                {"marking": 7, "height": 5, "bolt": threshold}).compare(
+                [{"indicator": "bolt", "gtype": "双波护栏", "city": "测试市", "route": "G1",
+                  "direction": "上行", "segment": "K1+000~K1+100", "manual": 0, "automatic": 1}])
+            return detail[0]["consistent"]
+        self.assertIs(verdict(5), True)                                           # 差值 1 < 5
+        self.assertIs(verdict(1), False)                                          # 差值 1 ≥ 1
+
+    def test_bolt_missing_side_is_dash_not_consistent(self):
+        """螺栓任一侧缺值 → consistent=None（Word 表显示「—」），不得视作一致。"""
+        self.assertIsNone(engine.gd_consistent("bolt", None, 3, "", 5))
+        self.assertIsNone(engine.gd_consistent("bolt", 2, None, "", 5))
+        self.assertIsNone(engine.gd_consistent("bolt", None, None, "", 5))
+        self.assertIsNone(engine.gd_pass("bolt", 0, ""))                          # 螺栓无合格判定
+
+    def test_unknown_verdict_is_dash_and_excluded_from_rate(self):
+        """任一侧无法判定 → 行级 consistent=None（显示 —），不计入一致性占比分母。"""
+        unknown_type, summary = self._compare(manual=700.0, automatic=690.0, gtype="四波护栏")
+        self.assertIsNone(unknown_type["consistent"])                      # 禁止 None==None 报一致
+        self.assertEqual(summary["height"]["unjudged_count"], 1)
+        self.assertIsNone(summary["height"]["consistency_rate"])
+        judged, _ = self._compare(manual=704.0, automatic=640.0)
+        self.assertIs(judged["consistent"], False)                         # 704 合格 / 640 不合格（697±20）
+        _, mixed = self._compare(manual=704.0, automatic=708.0)
+        self.assertEqual(mixed["height"]["consistent_count"], 1)
+        self.assertEqual(mixed["height"]["unjudged_count"], 0)
+        self.assertEqual(mixed["height"]["consistency_rate"], 1.0)
+
+    def test_section_table_uses_row_consistent_and_drops_old_wording(self):
+        """三张 Word 表读行级 consistent；旧「测值偏差不大于允许偏差」说明必须消失。"""
+        detail, _ = engine.ManualAutoComparator(self.THRESHOLDS).compare([
+            {"indicator": "height", "city": "测试市", "route": "G1", "gtype": "双波护栏",
+             "segment": "K1+000~K1+100", "manual": 579.0, "automatic": 582.0},
+            {"indicator": "height", "city": "测试市", "route": "G1", "gtype": "四波护栏",
+             "segment": "K2+000~K2+100", "manual": 700.0, "automatic": 690.0},
+        ])
+        document = Document()
+        tables = []
+        engine.GuangdongChapterWriter._comparison_gd03_section(
+            document, "高速公路", detail, self.THRESHOLDS,
+            lambda headers, rows, title, merge=None, vmerge=None:
+                tables.append((title, [list(row) for row in rows])))
+        body = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        self.assertNotIn("测值偏差不大于允许偏差", body)
+        self.assertIn("两侧的合格判定结果", body)
+        # M2：旧「螺栓缺失数量合计为0判合格」口径必须消失，改为差值口径
+        self.assertNotIn("合计为0判合格", body)
+        self.assertIn("差值小于5记为一致", body)
+        height_rows = dict(tables)["高速公路波形梁护栏中心高度人工复核对比明细表"]
+        self.assertEqual([row[-1] for row in height_rows], ["不一致", "—"])
+        self.assertEqual([row[3] for row in height_rows], ["600±20mm", "—"])
+
+    def test_oscillation_marking_remark_noted_below_table(self):
+        """M3（brief-v3 §7）：源表 备注「现场震荡标线」的标线行在表下说明段列出桩号区段；无备注行则不输出该句。"""
+        def render(remark):
+            detail, _ = engine.ManualAutoComparator(self.THRESHOLDS).compare([
+                {"indicator": "marking", "city": "测试市", "route": "G4", "direction": "下行",
+                 "segment": "K1887+200~K1887+100", "manual": 73.2, "automatic": 190.0, "remark": remark},
+                {"indicator": "marking", "city": "测试市", "route": "G0422", "direction": "下行",
+                 "segment": "K699+200~K699+100", "manual": 38.4, "automatic": 184.1, "remark": remark},
+            ])
+            document = Document()
+            tables = []
+            engine.GuangdongChapterWriter._comparison_gd03_section(
+                document, "高速公路", detail, self.THRESHOLDS,
+                lambda headers, rows, title, merge=None, vmerge=None:
+                    tables.append((title, list(headers), [list(row) for row in rows])))
+            return document, tables
+
+        document, tables = render("现场震荡标线")
+        body = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        self.assertIn("注：以上 2 个路段现场为震荡标线，其人工复核与自动化检测结果的差异受标线型式影响。", body)
+        self.assertIn("G4下行K1887+200-K1887+100", body)          # 桩号连接符归一化为 ASCII `-`
+        self.assertIn("G0422下行K699+200-K699+100", body)
+        self.assertNotIn("～", body)
+        # 约束：不新增表列 —— 标线表列头与模板固定 10 列一字不动
+        title, headers, _ = tables[0]
+        self.assertEqual(title, "高速公路标线逆反射亮度系数人工复核对比明细表")
+        self.assertEqual(headers, ["路线编号", "桩号区段", "标线颜色", "人工检测复核结果", "测值",
+                                   "合格判定", "自动化检测结果", "测值", "合格判定", "结果一致性"])
+
+        document, _ = render("")
+        self.assertNotIn("现场为震荡标线", "\n".join(p.text for p in document.paragraphs))
+
+    def test_read_file_bolt_blank_side_is_missing_not_zero(self):
+        """螺栓某侧两格皆空 → 该侧 None（进 issues），不得静默补 0 判合格。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "进场后_人工自动化对比_统计结果.xlsx"
+            workbook = openpyxl.Workbook()
+            sheet = workbook.active
+            sheet.title = "螺栓缺失"
+            # 与真实表一致：第1行主表头，第2行子表头，数据自第3行起
+            sheet.append(["地区", "路线", "护栏类型", "护栏位置", "方向", "桩号范围",
+                          "人工复核螺栓缺失数量", None, "自动化螺栓缺失数量", None, "备注"])
+            sheet.append([None, None, None, None, None, None,
+                          "拼接螺栓缺失数量", "连接螺栓缺失数量",
+                          "拼接螺栓缺失数量", "连接螺栓缺失数量", None])
+            sheet.append(["测试市", "G1", "双波护栏", "路侧", "上行", "K1+000~K1+100", None, None, 2, 0, None])
+            workbook.save(path)
+            records, issues = engine.ManualAutoComparator.read_file(str(path))
+        self.assertEqual(records, [])
+        self.assertTrue(any("字段缺失" in issue for issue in issues), issues)
 
 
 class Gd03ManualReviewAdviceTests(unittest.TestCase):
@@ -2078,8 +2472,9 @@ class Gd03ManualReviewAdviceTests(unittest.TestCase):
     def _collector():
         tables = []
 
-        def table(headers, rows, title):
-            tables.append({"title": title, "headers": list(headers), "rows": [list(row) for row in rows]})
+        def table(headers, rows, title, merge=None, vmerge=None):
+            tables.append({"title": title, "headers": list(headers), "rows": [list(row) for row in rows],
+                           "merge": merge, "vmerge": vmerge})
 
         return tables, table
 
@@ -2106,16 +2501,24 @@ class Gd03ManualReviewAdviceTests(unittest.TestCase):
             "高速公路波形梁护栏中心高度人工复核对比明细表",
             "高速公路路侧波形梁护栏螺栓缺失人工复核对比明细表"])
         by_title = {item["title"]: item for item in tables}
+        # D14：三表均为两行表头（首行合并），列头逐字照模板
         self.assertEqual(by_title["高速公路标线逆反射亮度系数人工复核对比明细表"]["headers"],
-                         ["路线", "桩号区段", "类别", "人工", "自动化", "绝对偏差", "相对偏差%", "人工判定", "自动判定"])
+                         ["路线编号", "桩号区段", "标线颜色", "人工检测复核结果", "测值", "合格判定",
+                          "自动化检测结果", "测值", "合格判定", "结果一致性"])
         self.assertEqual(by_title["高速公路波形梁护栏中心高度人工复核对比明细表"]["headers"],
-                         ["路线", "护栏", "桩号区段", "来源", "人工（mm)", "自动化(mm)", "绝对偏差(mm)", "标准值(mm)", "人工判定", "自动判定"])
+                         ["路线编号", "桩号区段", "护栏类型", "合格值(mm)", "人工检测复核结果", "测值", "合格判定",
+                          "自动化检测结果", "测值", "合格判定", "结果一致性"])
         self.assertEqual(by_title["高速公路路侧波形梁护栏螺栓缺失人工复核对比明细表"]["headers"],
-                         ["路线", "护栏", "桩号区段", "类别", "来源", "人工(拼)", "人工(连)", "人工合计", "自动(拼)", "自动(连)", "自动合计"])
+                         ["路线", "桩号区段", "护栏类型", "人工检测复核结果", "拼接螺栓缺失", "连接螺栓缺失", "总体缺失",
+                          "自动化检测结果", "拼接螺栓缺失", "连接螺栓缺失", "总体缺失", "结果一致性"])
+        self.assertEqual(by_title["高速公路标线逆反射亮度系数人工复核对比明细表"]["merge"],
+                         {3: ("人工检测复核结果", 3), 6: ("自动化检测结果", 3)})
+        marking_row = by_title["高速公路标线逆反射亮度系数人工复核对比明细表"]["rows"][0]
+        self.assertEqual(marking_row[0], "G2518")
+        self.assertEqual(marking_row[3:], ["105.76", "合格", "101.04", "合格", "一致"])
         bolt_row = by_title["高速公路路侧波形梁护栏螺栓缺失人工复核对比明细表"]["rows"][0]
-        self.assertEqual(bolt_row[-1], "38")
-        self.assertEqual(bolt_row[-4], "1")
-        self.assertIn("正式检测后", bolt_row)
+        # M2：螺栓无合格判定列，按两侧缺失数量差值（|1−38|=37 ≥ 阈值 5）判不一致
+        self.assertEqual(bolt_row[3:], ["1", "0", "1", "30", "8", "38", "不一致"])
 
     def test_inspection_segments_aggregate_by_category_route_direction(self):
         bundle = {"marking": [{"category": "高速公路", "route": "G4", "direction": "上行", "station_m": 100.0, "manager": "甲分公司"},
@@ -2143,6 +2546,15 @@ class Gd03ManualReviewAdviceTests(unittest.TestCase):
         rows = engine.gd_inspection_segments(bundle)
         self.assertEqual(rows[0]["remark"], "人工复核：进场前6公里")
 
+    def test_inspection_segments_skip_rows_without_category(self):
+        """P1g：类别判不出（None/空）的明细行不进抽检路段清单，避免出现空 `类型` 行。"""
+        bundle = {"marking": [{"category": "高速公路", "route": "S2", "direction": "上行", "station_m": 100.0},
+                              {"category": None, "route": "S272", "direction": "上行", "station_m": 29000.0},
+                              {"category": "  ", "route": "S278", "direction": "上行", "station_m": 30000.0}],
+                  "height": [{"category": "", "route": "S282", "direction": "下行", "station_m": 31000.0}]}
+        rows = engine.gd_inspection_segments(bundle)
+        self.assertEqual([(row["category"], row["route"]) for row in rows], [("高速公路", "S2")])
+
     def test_advice_section_tables_and_headings(self):
         bundle = self._bundle()
         document = Document()
@@ -2150,18 +2562,16 @@ class Gd03ManualReviewAdviceTests(unittest.TestCase):
         engine.GuangdongChapterWriter._advice_gd03_section(document, bundle, table)
         headings = [p.text for p in document.paragraphs if p.style.name == "Heading 3"]
         self.assertEqual(headings, ["1.重点路段处治建议（如有）", "2.迎国评工作建议", "3.养护提升建议"])
-        by_title = {item["title"]: item for item in tables}
-        self.assertEqual(set(by_title), {"高速公路优先处治路段表", "普通国省道优先处治路段表"})
-        for title in by_title:
-            self.assertEqual(by_title[title]["headers"], ["路线", "管养单位", "桩号范围", "存在问题"])
-            self.assertTrue(by_title[title]["rows"])
-        self.assertEqual(by_title["高速公路优先处治路段表"]["rows"][0][:2], ["G2518", "云梧分公司"])
-        self.assertEqual(by_title["普通国省道优先处治路段表"]["rows"][0][:2], ["G324", "云城区公路事务中心"])
+        # D16/Q1：模板无优先处治路段表，正文改为清单说明句（明细进交安设施统计图表工作簿）
+        self.assertEqual(tables, [])
         body = "\n".join(p.text for p in document.paragraphs)
-        for token in ("（一）优先处治路段（6个月完成）", "（二）闭环督办管理要求", "建立整改清单", "验收销号",
-                      "考核挂钩", "清除标志遮挡", "高速公路方面", "普通国省道方面",
+        self.assertIn("优先处治路段明细见《云浮市交安设施统计图表.xlsx》「优先处治路段」工作表。", body)
+        for token in ("清除标志遮挡", "高速公路方面", "普通国省道方面",
                       "（2）做好迎检路段现场排查", "（3）统筹力量，差异化投入"):
             self.assertIn(token, body)
+        # C3：模板该节仅 1 个正文段，原（一）/（二）子标题与督办段落已删（明细进工作簿）
+        for removed in ("（一）优先处治路段（6个月完成）", "（二）闭环督办管理要求", "建立整改清单", "验收销号", "考核挂钩"):
+            self.assertNotIn(removed, body)
 
 
 class GuangdongRouteTableFormatTests(unittest.TestCase):
@@ -2253,6 +2663,246 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(annex_index.category("云浮", "G80"), "高速公路")
         self.assertEqual(annex_index.category("云浮", "G324"), "普通国省道")
 
+    def test_owner_column_is_read_and_exported_as_fifth_column(self):
+        """P1d：表头含「经营主体」时读入为第 5 字段，owner_for 按 (归一地市, 路线号) 取值。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._write(Path(temp_dir) / "routes.xlsx", {
+                "路线分类表": [
+                    ["地市", "路线编号", "路线名称", "道路类别", "经营主体"],
+                    ["东莞", "G0422", "武汉-深圳", "高速公路", "集团"],
+                    ["珠海", "S270", "金湾高速", "普通国省道", None],
+                ],
+            })
+            index = engine.RouteCategoryIndex.from_file(path)
+            # 缺列不抛异常；地市去后缀归一后仍能取到（东莞/东莞市、珠海/珠海市）
+            self.assertEqual(index.owner_for("东莞", "G0422"), "集团")
+            self.assertEqual(index.owner_for("东莞市", "g0422"), "集团")
+            self.assertEqual(index.owner_for("珠海", "S270"), None)
+            self.assertEqual(index.owner_for("韶关", "G105"), None)
+
+            out = Path(temp_dir) / "out"
+            written = engine.write_guangdong_route_workbook_all(
+                index, {"G0422": "武汉-深圳", "S270": "金湾高速"}, out, filename="含经营主体.xlsx")
+            self.assertIsNotNone(written)
+            from openpyxl import load_workbook
+            sheet = load_workbook(written, data_only=True)["路线分类表"]
+            rows = list(sheet.iter_rows(values_only=True))
+        self.assertEqual(rows[0], ("地市", "路线编号", "路线名称", "道路类别", "经营主体"))
+        self.assertEqual(len(rows[0]), 5)
+        by_route = {r[1]: r for r in rows[1:]}
+        self.assertEqual(by_route["G0422"][4], "集团")
+        # 取不到 → 空单元格，不写「—」「缺失」等占位
+        self.assertIsNone(by_route["S270"][4])
+        # 前 4 列顺序与语义不变
+        self.assertEqual(by_route["G0422"][:4], ("东莞", "G0422", "武汉-深圳", "高速公路"))
+
+    def test_owner_falls_back_to_annex_match_when_column_missing(self):
+        """P1d：表里没有经营主体列时回退附件匹配；跨主体且无桩号 → None（不得按路线号猜）。"""
+        index = engine.RouteCategoryIndex({("东莞", "G0422"): "高速公路", ("东莞", "S6"): "高速公路"})
+        self.assertEqual(index.owners, {})
+        index.owner_index = {
+            ("东莞", "G0422"): [{"start": 0.0, "end": 10.0, "owner": "集团", "keeper": "A"}],
+            # 同一路线跨主体：有桩号才能消歧
+            ("东莞", "S6"): [{"start": 0.0, "end": 13.459, "owner": "集团", "keeper": "A"},
+                             {"start": 13.459, "end": 77.869, "owner": "非集团", "keeper": "B"}],
+        }
+        self.assertEqual(index.owner_for("东莞市", "G0422"), "集团")
+        self.assertIsNone(index.owner_for("东莞", "S6"))
+        self.assertEqual(index.owner_for("东莞", "S6", start=20, end=30), "非集团")
+        self.assertEqual(index.owner_for("东莞", "S6", start=1, end=5), "集团")
+        # 附件无此(市,路线) → None
+        self.assertIsNone(index.owner_for("东莞", "G105"))
+
+    def test_city_normalization_strips_trailing_shi_for_folder_derived_names(self):
+        """P1d：现有输入表混用「韶关市」与「中山」，按文件夹推导的市名无后缀，归一后必须指向同一键。"""
+        self.assertEqual(engine.RouteCategoryIndex._norm_city("韶关市"), "韶关")
+        self.assertEqual(engine.RouteCategoryIndex._norm_city(" 中山 "), "中山")
+        self.assertEqual(engine.RouteCategoryIndex._norm_city("江门市"), "江门")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._write(Path(temp_dir) / "routes.xlsx", {
+                "路线分类表": [
+                    ["地市", "路线编号", "路线名称", "道路类别", "经营主体"],
+                    ["韶关市", "G105", "北京－澳门", "普通国省道", None],
+                    ["中山", "G105", "北京－澳门", "普通国省道", None],
+                ],
+            })
+            index = engine.RouteCategoryIndex.from_file(path)
+        # 两种写法都能按归一后的键查到，且是同一条记录
+        self.assertEqual(index.category("韶关", "G105"), "普通国省道")
+        self.assertEqual(index.category("韶关市", "G105"), "普通国省道")
+        self.assertEqual(index.rows("韶关"), index.rows("韶关市"))
+        self.assertEqual([row["route"] for row in index.rows("中山")], ["G105"])
+
+    # ---------- P1d-b ----------
+
+    def test_category_for_records_refuses_to_borrow_other_city_route(self):
+        """P1d-b P0-A：第 2 级兜底不得跨市借类别（江门明细里的 12 个他市省道码曾污染江门①②分母）。"""
+        index = engine.RouteCategoryIndex({
+            ("江门", "S269"): "普通国省道", ("江门", "G15"): "高速公路",
+            ("佛山", "S272"): "普通国省道", ("云浮", "S368"): "普通国省道",
+        })
+        # 他市路线码：全表唯一命中，但归属地市 ≠ 当前市 → 拒绝借用，返回 None（与留空行走同一出口）
+        self.assertIsNone(index.category_for_records("江门", "S272"))
+        self.assertIsNone(index.category_for_records("江门", "S368"))
+        # 本市路线号照常命中（贯通路线场景不受影响）
+        self.assertEqual(index.category_for_records("江门", "S269"), "普通国省道")
+        self.assertEqual(index.category_for_records("江门市", "s269"), "普通国省道")
+        self.assertEqual(index.category_for_records("江门", "G15"), "高速公路")
+        # 路线号在多市出现且类别唯一时，只有当前市自己那行才算命中
+        index2 = engine.RouteCategoryIndex({("佛山", "G105"): "普通国省道", ("中山", "G105"): "普通国省道"})
+        self.assertEqual(index2.category_for_records("中山", "G105"), "普通国省道")
+        self.assertIsNone(index2.category_for_records("东莞", "G105"))
+
+    def test_category_for_records_falls_back_to_route_name(self):
+        """P1d-b P0-B：源表把「路线编号」列整列填成路线名称时，按本市唯一的名称反查补回类别。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._write(Path(temp_dir) / "routes.xlsx", {
+                "路线分类表": [
+                    ["地市", "路线编号", "路线名称", "道路类别"],
+                    ["广州", "S2", "广河高速", "高速公路"],
+                    ["惠州", "S2", "广河高速", "高速公路"],
+                    ["广州", "G4", "北京－港澳", "高速公路"],
+                ],
+            })
+            index = engine.RouteCategoryIndex.from_file(path)
+        # 广州「广河高速」在本市唯一对应 S2 → 补回高速公路（此前整段 32256 行被排除出分母）
+        self.assertEqual(index.category_for_records("广州", "广河高速"), "高速公路")
+        self.assertEqual(index.category_for_records("广州市", " 广河高速 "), "高速公路")
+        self.assertEqual(index.category_for_records("惠州", "广河高速"), "高速公路")
+        # 名称在两市都出现 → 按 (地市, 名称) 各自唯一命中，不串市
+        self.assertEqual(index.category_for_records("东莞", "广河高速"), None)
+        # 本市同名多行 → 不做名称兜底
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dup = self._write(Path(temp_dir) / "dup.xlsx", {
+                "路线分类表": [
+                    ["地市", "路线编号", "路线名称", "道路类别"],
+                    ["广州", "S2", "广河高速", "高速公路"],
+                    ["广州", "S81", "广河高速", "高速公路"],
+                ],
+            })
+            dup_index = engine.RouteCategoryIndex.from_file(dup)
+        self.assertNotIn(("广州", "广河高速"), dup_index.route_of_name)
+        self.assertEqual(dup_index.category_for_records("广州", "广河高速"), None)
+
+    def test_route_code_errata_only_rewrites_the_declared_pair(self):
+        """P1d-b：茂名/G291 是录入笔误，实为 S291（用户 2026-09-27 澄清）；其它市/其它码不受影响。"""
+        self.assertEqual(engine.ROUTE_CODE_ERRATA, {("茂名", "G291"): "S291"})
+        index = engine.RouteCategoryIndex({
+            ("茂名", "S291"): "普通国省道", ("茂名", "S292"): "普通国省道",
+            ("佛山", "G291"): "普通国省道",
+        })
+        # 归一到 S291 → 命中分类表既有行，不得落成类别留空
+        self.assertEqual(index.category_for_records("茂名", "G291"), "普通国省道")
+        self.assertEqual(index.category_for_records("茂名市", " g291 "), "普通国省道")
+        self.assertEqual(index.category_or_none("茂名", "G291"), "普通国省道")
+        # 其它市不误伤
+        self.assertEqual(index.category_for_records("佛山", "G291"), "普通国省道")
+        # 茂名的其它码不受影响
+        self.assertEqual(index.category_for_records("茂名", "S292"), "普通国省道")
+        self.assertIsNone(index.category_for_records("茂名", "G292"))
+
+    def test_city_display_appends_shi_for_render_layer_only(self):
+        """P1d-b 裁决①：显示层市名统一带「市」；分类表「地市」列与 _norm_city 匹配键保持原样。"""
+        self.assertEqual(engine.RouteCategoryIndex.city_display("东莞"), "东莞市")
+        self.assertEqual(engine.RouteCategoryIndex.city_display("云浮市"), "云浮市")
+        self.assertEqual(engine.RouteCategoryIndex.city_display(" 韶关市 "), "韶关市")
+        self.assertEqual(engine.RouteCategoryIndex.city_display(""), "")
+        # 匹配键不受影响
+        self.assertEqual(engine.RouteCategoryIndex._norm_city("东莞市"), "东莞")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = self._write(Path(temp_dir) / "routes.xlsx", {
+                "路线分类表": [
+                    ["地市", "路线编号", "路线名称", "道路类别"],
+                    ["东莞", "S6", "广深沿江", "高速公路"],
+                    ["江门市", "G15", "沈阳－海口", "高速公路"],
+                ],
+            })
+            index = engine.RouteCategoryIndex.from_file(path)
+            out = Path(temp_dir) / "out"
+            engine.write_guangdong_route_workbook_all(index, {}, out, filename="r.xlsx")
+            from openpyxl import load_workbook
+            rows = list(load_workbook(out / "r.xlsx", data_only=True)["路线分类表"].iter_rows(values_only=True))
+        # 表内「地市」列原样保留（东莞 / 江门市），不因显示层统一而改写
+        self.assertEqual(sorted(r[0] for r in rows[1:]), ["东莞", "江门市"])
+        # 表里没有阳江 → 不补 EXTRA_ROUTE_ROWS（部分表/单市表不凭空多行）
+        self.assertEqual(len(rows[1:]), 2)
+
+    def test_export_adds_missing_extra_row_but_never_duplicates_it(self):
+        """P1d-b：阳江/G324 只在分类表缺该行时补一次；本工具产物回灌时不重复补。"""
+        header = ["地市", "路线编号", "路线名称", "道路类别"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_path = self._write(Path(temp_dir) / "a.xlsx", {"路线分类表": [
+                header + [], ["阳江市", "G234", "兴隆－阳江", "普通国省道"],
+                ["阳江市", "S278", "罗镜-溪头", "普通国省道"],
+            ]})
+            first = engine.RouteCategoryIndex.from_file(missing_path)
+            out = Path(temp_dir) / "o1"
+            engine.write_guangdong_route_workbook_all(first, {}, out, filename="r.xlsx")
+            from openpyxl import load_workbook
+            rows1 = list(load_workbook(out / "r.xlsx", data_only=True)["路线分类表"].iter_rows(values_only=True))
+            # 补一行 → 阳江 3 行（含 G324）
+            self.assertEqual(len(rows1[1:]), 3)
+            self.assertEqual(sorted((r[0], r[1]) for r in rows1[1:]),
+                             [("阳江市", "G234"), ("阳江市", "G324"), ("阳江市", "S278")])
+            # 拿产物回灌 → 不得再补（不得出现重复行）
+            second = engine.RouteCategoryIndex.from_file(out / "r.xlsx")
+            out2 = Path(temp_dir) / "o2"
+            engine.write_guangdong_route_workbook_all(second, {}, out2, filename="r.xlsx")
+            rows2 = list(load_workbook(out2 / "r.xlsx", data_only=True)["路线分类表"].iter_rows(values_only=True))
+        self.assertEqual(len(rows2[1:]), 3)
+        self.assertEqual(len({(r[0], r[1]) for r in rows2[1:]}), 3)
+
+    def test_export_fills_owner_by_measured_segments_and_marks_cross_owner(self):
+        """P1d-b 裁决③：分类表无桩号列 → 用明细文件名实测段消歧；跨两个主体写「跨主体」。"""
+        index = engine.RouteCategoryIndex({("东莞", "S6"): "高速公路", ("东莞", "G4"): "高速公路",
+                                           ("东莞", "S269"): "普通国省道"})
+        index.owner_index = {
+            ("东莞", "S6"): [{"start": 0.0, "end": 13.459, "owner": "集团", "keeper": "A"},
+                             {"start": 13.459, "end": 77.869, "owner": "非集团", "keeper": "B"}],
+            ("东莞", "G4"): [{"start": 0.0, "end": 20.0, "owner": "集团", "keeper": "A"},
+                             {"start": 20.0, "end": 40.0, "owner": "非集团", "keeper": "B"}],
+        }
+        # 无实测段 → 跨主体判不出，仍留空
+        self.assertIsNone(index.owner_for("东莞", "S6"))
+        # 实测段全部落入同一主体 → 写该主体
+        index.measured = {("东莞", "S6"): [(20.0, 30.0)], ("东莞", "G4"): [(0.0, 18.0), (20.0, 40.0)]}
+        self.assertEqual(index.owner_for("东莞", "S6"), "非集团")
+        self.assertEqual(index.owner_for("东莞", "G4"), engine.CROSS_OWNER)
+        # 普通国省道一律留空，即使附件里有分段也不写
+        index.owner_index[("东莞", "S269")] = [{"start": 0.0, "end": 5.0, "owner": "集团", "keeper": "A"}]
+        self.assertEqual(index.owner_for("东莞", "S269"), "集团")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "out"
+            engine.write_guangdong_route_workbook_all(index, {}, out, filename="r.xlsx")
+            from openpyxl import load_workbook
+            rows = list(load_workbook(out / "r.xlsx", data_only=True)["路线分类表"].iter_rows(values_only=True))
+        by_route = {r[1]: r for r in rows[1:]}
+        self.assertEqual(by_route["S6"][4], "非集团")
+        self.assertEqual(by_route["G4"][4], "跨主体")
+        self.assertIsNone(by_route["S269"][4])      # 普通国省道：空单元格，不写占位
+
+    def test_measured_segments_parsed_from_detail_filenames(self):
+        """P1d-b：实测段索引从明细文件名解析（K<起>K<止>，单位 km，市名取自目录名）。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "东莞-最终提交9.14"
+            (root / "护栏数据明细").mkdir(parents=True)
+            for name in ("S6上行K15K50-S6-交安设施现场检测-明细-20260901120000.xlsx",
+                         "G4下行K2171K2151-G4-交安设施现场检测-明细-20260901120001.xlsx",
+                         "S120上行中分带补测K19K25-S120-交安设施现场检测-明细-20260902105433.xlsx",
+                         "S268上行中分带K63.4K64.4-S268-交安设施现场检测-明细-20260902105527.xlsx",
+                         "人工自动化对比_统计结果.xlsx"):
+                (root / "护栏数据明细" / name).write_bytes(b"")
+            index = engine.RouteCategoryIndex({("东莞", "S6"): "高速公路", ("东莞", "G4"): "高速公路",
+                                               ("东莞", "S268"): "普通国省道"})
+            segments = engine.load_measured_segments(temp_dir, index)
+            self.assertEqual(segments[("东莞", "S6")], [(15.0, 50.0)])
+            self.assertEqual(segments[("东莞", "G4")], [(2151.0, 2171.0)])
+            self.assertEqual(segments[("东莞", "S120")], [(19.0, 25.0)])
+            self.assertEqual(segments[("东莞", "S268")], [(63.4, 64.4)])
+            self.assertNotIn(("东莞", "人工自动化对比_统计结果"), segments)
+            # 目录不存在/无市名 → 空 dict，不抛异常
+            self.assertEqual(engine.load_measured_segments(Path(temp_dir) / "不存在", index), {})
+
 
 class GuangdongImportSourceTests(unittest.TestCase):
     """导入源识别口径：标线取“标线统计”表（区间统计/单路线明细为派生物，不得重复读取），
@@ -2327,6 +2977,65 @@ class GuangdongImportSourceTests(unittest.TestCase):
         # 空输入不得抛异常
         self.assertEqual(engine.filter_own_city_marking([]), (None, []))
 
+    def test_guardrail_dir_name_variants_including_nested(self):
+        """护栏目录实测命名有 5 种形态（含嵌套在「云浮明细」这类父目录下），都不得漏扫。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "最终复核数据"
+            for city, guardrail_rel in (
+                ("云浮9.9", "云浮明细/2. 护栏高度、螺栓数据"),   # 父目录名不含「护栏」，只能靠子目录
+                ("清远9.10", "清远市明细/2. 护栏高度、螺栓数据"),
+                ("湛江9.10", "2. 护栏螺栓、高度数据"),            # 螺栓在前
+                ("茂名9.10", "护栏明细数据"),                      # 字序与常量相反
+                ("阳江9.11", "护栏明细"),                          # 只有「护栏明细」
+            ):
+                (root / city / guardrail_rel).mkdir(parents=True)
+
+            for city_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+                marking, guardrail = engine.detect_guangdong_sources(city_dir)
+
+                self.assertEqual(len(guardrail), 1, f"{city_dir.name} 护栏目录未命中：{guardrail}")
+
+    def test_marking_hit_does_not_short_circuit_guardrail_fallback(self):
+        """标线命名命中不得短路护栏回退：有标线、护栏目录名未命中时护栏仍须按表头找到（否则高度/螺栓静默为 0）。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "云浮9.9"
+            marking_dir = root / "云浮明细" / "1. 云浮标线处理数据"
+            marking_dir.mkdir(parents=True)
+            (marking_dir / "标线统计.xlsx").write_bytes(b"")
+            guardrail_dir = root / "云浮明细" / "2. 交安数据"   # 目录名不含「护栏」，命名规则必然不命中
+            guardrail_dir.mkdir(parents=True)
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["桩号", "护栏类型", "梁板中心高度(mm)", "地市", "路线编号", "检测方向"])
+            ws.append(["1000+000-1000+020", "波形梁", 750, "云浮市", "S368", "上行"])
+            wb.save(guardrail_dir / "S368上行K1000K999-交安设施现场检测-明细.xlsx")
+
+            marking, guardrail = engine.detect_guangdong_sources(root)
+
+        self.assertEqual([p.name for p in marking], ["标线统计.xlsx"])
+        self.assertEqual([p.name for p in guardrail], ["2. 交安数据"])
+
+    def test_guardrail_empty_but_header_files_present_must_warn(self):
+        """禁止静默 0：高度/螺栓解析为 0 而项目内确有护栏表头明细时必须给出含目录的警告。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "云浮9.9"
+            guardrail_dir = root / "2. 护栏高度、螺栓数据"
+            guardrail_dir.mkdir(parents=True)
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["桩号", "护栏类型", "梁板中心高度(mm)", "地市", "路线编号", "检测方向"])
+            ws.append(["1000+000-1000+020", "波形梁", 750, "云浮市", "S368", "上行"])
+            wb.save(guardrail_dir / "S368上行K1000K999-交安设施现场检测-明细.xlsx")
+
+            empty = {"height": [], "bolt": [], "marking": [{"city": "云浮市"}]}
+            warning = engine.guardrail_missing_warning(root, empty)
+
+        self.assertIsNotNone(warning, "护栏解析为 0 且存在护栏表头文件时不得静默")
+        self.assertIn("2. 护栏高度、螺栓数据", warning or "")
+        # 有数据时不得产生噪音警告
+        self.assertIsNone(engine.guardrail_missing_warning(
+            Path(temp_dir), {"height": [{"city": "云浮市"}], "bolt": [], "marking": []}))
+
     def test_naming_miss_falls_back_to_header_detection(self):
         """命名未命中（新格式）时回退表头识别，不得直接报空。"""
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2344,6 +3053,90 @@ class GuangdongImportSourceTests(unittest.TestCase):
         # 命名未命中时回退为目录级表头识别（旧版行为），要求非空且指向含数据的目录
         self.assertEqual([p.name for p in marking], ["含糊命名目录"])
         self.assertEqual(guardrail, [])
+
+
+class R2FolderCityTests(unittest.TestCase):
+    """R2（用户明确要求）：城市归属以数据所在文件夹定市。
+
+    文件夹内记录即使“地市”列写的是别的市，也计入该文件夹对应的市；地市列不再决定归属、
+    也不再因此丢弃。旧口径按“文件内多数地市”过滤（东莞实测丢弃 2000 条标线记录）。
+    """
+
+    HEADERS = ["地市", "路线编号", "检测方向", "管养单位", "桩号",
+               "主车道左侧标线逆反亮度系数", "主车道右侧标线逆反亮度系数",
+               "左侧标线逆反射目标值", "右侧标线逆反射目标值", "计算区间"]
+
+    @classmethod
+    def _marking_row(cls, city, route, station):
+        return dict(zip(cls.HEADERS, [city, route, "下行", "甲管养单位", station, 40, 90, 50, 80, 20]))
+
+    @classmethod
+    def _write_marking(cls, path, rows):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(cls.HEADERS)
+        for row in rows:
+            ws.append([row.get(key) for key in cls.HEADERS])
+        wb.save(path)
+        wb.close()
+
+    def test_folder_city_is_authoritative_for_records_inside_it(self):
+        """文件夹内的记录一律记为文件夹市；旧口径丢弃的“其他市标记”记录必须保留。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "东莞-最终提交9.14" / "东莞标线数据明细"
+            folder.mkdir(parents=True)
+            path = folder / "标线统计.xlsx"
+            rows = ([self._marking_row("东莞", "G220", f"1000+{i:03d}.0-1000+{i + 20:03d}.0") for i in (0, 20, 40)]
+                    + [self._marking_row("深圳", "G0422", f"1005+{i:03d}.0-1005+{i + 20:03d}.0") for i in (0, 20)])
+            self._write_marking(path, rows)
+            route_index = engine.RouteCategoryIndex({("东莞", "G220"): "普通国省道", ("深圳", "G0422"): "高速公路"})
+            logs = []
+
+            scanner = engine.GuangdongInputScanner(path, route_index, log=logs.append)
+            self.assertEqual(scanner.default_city, "东莞")   # 文件夹定市：数据在 东莞-最终提交9.14 下
+            scanned = scanner.scan()
+            # 5 行 × 左右两侧 = 10 条，其中 4 条“地市”列写深圳
+            self.assertEqual(len(scanned["marking"]), 10)
+            self.assertEqual({row["city"] for row in scanned["marking"]}, {"东莞"})
+            kept = engine.own_city_marking(scanned["marking"], logs.append, scanner.default_city)
+            bundles = engine.GuangdongBatchRunner.build_bundles({"marking": kept, "issues": []}, route_index)
+
+        self.assertEqual(len(kept), 10)                      # 旧口径只保留 6 条
+        self.assertEqual(sum(1 for row in kept if row.get("declared_city")), 4)
+        self.assertIn("按文件夹归属东莞取数，保留其他市标记记录 4 条",
+                      [line.strip() for line in logs])
+        # 显示层市名带「市」（P1d-b 裁决 1）；旧口径会把 4 条归到“深圳”分组
+        self.assertEqual(list(bundles), ["东莞市"])
+        self.assertEqual(len(bundles["东莞市"]["marking"]), 10)
+        # G0422 归属深圳，P1d-b 起东莞不再借用其类别 → 只有东莞自己的 G220 有类别
+        self.assertEqual({row["category"] for row in bundles["东莞市"]["marking"]},
+                         {"普通国省道", None})
+
+    def test_missing_route_category_falls_back_and_never_aborts_city(self):
+        """路线不在本市路线表：P1d-b 起不再跨市借类别，留空并记 issues（整市报告不中断）。"""
+        route_index = engine.RouteCategoryIndex({
+            ("东莞", "G220"): "普通国省道",
+            ("深圳", "G0422"): "高速公路",      # 归属深圳：P1d-b 起东莞不再借用（P0-A）
+            ("广州", "S999"): "高速公路",
+            ("佛山", "S999"): "普通国省道",     # 同号跨市且类别冲突 → 无法唯一判定
+        })
+        scanned = {"issues": [], "marking": [
+            {"city": "东莞", "route": "G0422", "direction": "下行", "segment": "a", "station_m": 1000.0},
+            {"city": "东莞", "route": "S999", "direction": "下行", "segment": "b", "station_m": 2000.0},
+        ]}
+
+        bundle = engine.GuangdongBatchRunner.build_bundles(scanned, route_index)["东莞市"]
+
+        self.assertNotIn("_error", bundle)                   # 旧实现抛 KeyError → 整市报告中断
+        by_route = {row["route"]: row for row in bundle["marking"]}
+        self.assertIsNone(by_route["G0422"]["category"])      # 他市路线码：不借类别（P0-A）
+        self.assertIsNone(by_route["S999"]["category"])
+        self.assertEqual(by_route["S999"]["city"], "东莞市")   # 仍归属该文件夹的市（显示层带「市」）
+        self.assertTrue(any("S999" in message for message in bundle["issues"]),
+                        f"无法判定类别的行必须记入 issues：{bundle['issues']}")
+        self.assertEqual(bundle["unknown_categories"],
+                         [{"kind": "marking", "route": "G0422", "count": 1},
+                          {"kind": "marking", "route": "S999", "count": 1}])
 
 
 REAL_E2E_ENV = "REPORT_E2E_REAL"
@@ -4049,3 +4842,376 @@ class ChongqingTemplateUpdateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class T2fFixesTests(unittest.TestCase):
+    """T2f：标线颜色映射 / 引言逐字与上标 / 分页标记 / 管养单位显示名 / 合格值公差。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        marking = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K2+000",
+                    "marking_position": "左侧标线", "value": 80.0, "target": 80.0, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        detail = [
+            {"indicator": "marking", "category": "高速公路", "route": "S14", "direction": "上行",
+             "segment": "K1+000～K2+000", "city": "测试市", "manual": 78.0, "automatic": 80.0,
+             "marking_position": "标线1"},
+            {"indicator": "height", "category": "高速公路", "route": "S14", "direction": "上行",
+             "segment": "K1+500～K2+000", "city": "测试市", "manual": 600.0, "automatic": 604.0,
+             "gtype": "两波护栏"},
+        ]
+        return {"city": "测试市", "marking": marking, "height": [], "bolt": [], "notes": [],
+                "comparison_detail": detail, "weak_segments": [], "route_segments": []}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_marking_color_derived_from_target(self) -> None:
+        """P1-1：颜色由自动化单元目标值推导（80→白色、50→黄色），判定不了写 —，不回填道路等级。"""
+        auto_white = [{"route": "G1", "direction": "上行", "value": 80.0, "target": 80.0}]
+        auto_yellow = [{"route": "G1", "direction": "上行", "value": 50.0, "target": 50.0}]
+        row = {"route": "G1", "direction": "上行", "automatic": 80.0, "category": "高速公路"}
+        self.assertEqual(engine.gd_marking_color(row, auto_white), "白色")
+        self.assertEqual(engine.gd_marking_color({**row, "automatic": 50.0}, auto_yellow), "黄色")
+        # 测值命中单元优先：命中即只认该单元的目标值
+        self.assertEqual(engine.gd_marking_color(row, auto_white + auto_yellow), "白色")
+        # 测值命不中、退化为该路线方向全部单元且目标值不唯一 → 无法判定
+        miss = {**row, "automatic": 999.0}
+        self.assertEqual(engine.gd_marking_color(miss, auto_white + auto_yellow), "—")
+        # 无自动化单元 → —
+        self.assertEqual(engine.gd_marking_color(row, []), "—")
+
+    def test_intro_paragraph_verbatim_and_superscript(self) -> None:
+        """P1-2：引言段按模板-1 逐字（含 ±20mm 与 JTG 5210—2018），-²/-¹ 为上标 run（模板 4 处）。"""
+        document = self._write()
+        intro = next(p for p in document.paragraphs if "mcd·m" in p.text)
+        text = intro.text.strip()
+        self.assertIn("JTG 5210—2018", text)
+        self.assertIn("两波形梁钢护栏为600mm±20mm、三波形梁钢护栏为697mm±20mm即为合格", text)
+        self.assertIn("mcd·m-²·lx-¹", text)
+        self.assertNotIn("合格合格率", text)
+        self.assertNotIn("重新统计", text)
+        self.assertEqual(sum(1 for run in intro.runs if run.font.superscript), 4)
+
+    def test_pagination_flags(self) -> None:
+        """P2-2/P2-3/P3-6：表格行 cantSplit、题注 keep_with_next、正文引导段 keep_with_next。"""
+        document = self._write()
+        self.assertGreater(document.element.xml.count("cantSplit"), 0)
+        captions = [p for p in document.paragraphs if p.style.name == "Caption"]
+        self.assertTrue(captions)
+        self.assertTrue(all(p.paragraph_format.keep_with_next for p in captions))
+        lead = next(p for p in document.paragraphs if p.text.strip() == "（1）分类开展显性问题突击整治")
+        self.assertTrue(lead.paragraph_format.keep_with_next)
+
+    def test_manager_display_keeps_route_table_name(self) -> None:
+        """P2-5：显示名统一到路线分类表口径（不再简写公司/去地市前缀），缺值写 —。"""
+        self.assertEqual(engine.manager_display("东莞市公路事务中心", "东莞"), "东莞市公路事务中心")
+        self.assertEqual(engine.manager_display("广东博大高速公路有限公司博深分公司"), "广东博大高速公路有限公司博深分公司")
+        self.assertEqual(engine.manager_display(None, "东莞"), "—")
+
+    def test_height_grade_with_tolerance(self) -> None:
+        """P3-1：高度人工复核表 `合格值(mm)` 按模板带公差。"""
+        document = self._write()
+        table = next(t for t in document.tables if any("合格值" in c.text for c in t.rows[0].cells))
+        column = next(i for i, c in enumerate(table.rows[0].cells) if "合格值" in c.text)
+        values = {row.cells[column].text.strip() for row in table.rows[1:]} - {"合格值(mm)"}
+        self.assertEqual(values, {"600±20mm"})
+class T2gRoundThreeTests(unittest.TestCase):
+    """T2g（用户第 3 轮）：① 只留 1 段 / 三小节带序号 / 典型段标题为正文级且补「段」。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        marking = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                    "marking_position": "左侧标线", "value": 60.0, "target": 80.0, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        height = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                   "guardrail_type": "两波", "height": 600.0, "city": "测试市",
+                   "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        return {"city": "测试市", "marking": marking, "height": height, "bolt": [], "notes": [],
+                "comparison_detail": [], "weak_segments": [], "route_segments": []}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_overall_section_has_single_paragraph(self) -> None:
+        """G1：① 总体情况 下只剩 1 段（统计口径/检测点/应安装螺栓段已删）。"""
+        document = self._write()
+        texts = [p.text.strip() for p in document.paragraphs]
+        joined = "\n".join(texts)
+        # 三处被删的口径段特征串（唯一出现在 ① 第 2 段）
+        self.assertNotIn("有效计算单元", joined)
+        self.assertNotIn("覆盖整公里检测段", joined)
+        self.assertNotIn("本次共检测应安装螺栓", joined)
+        for index, text in enumerate(texts):
+            if text != "①总体情况":
+                continue
+            # ① 下恰好 1 段正文：其后第一段不得是统计口径段
+            body = texts[index + 1]
+            for token in ("本次共抽检", "本次共获得有效检测点", "本次共检测应安装螺栓"):
+                self.assertFalse(body.startswith(token), body)
+
+    def test_auto_sections_are_numbered(self) -> None:
+        """G2：三个自动化小节标题带 `（1）（2）（3）`，Heading 4 + outlineLvl=3 + 仿宋_GB2312 12 bold。"""
+        document = self._write()
+        by_text = {p.text.strip(): p for p in document.paragraphs}
+        for title, level in (("（1）标线逆反射亮度系数情况", 4), ("（2）波形梁护栏中心高度情况", 4),
+                             ("（3）波形梁护栏螺栓缺失情况", 4)):
+            paragraph = by_text[title]
+            self.assertEqual(paragraph.style.name, "Heading %d" % level)
+            self.assertEqual(engine.GuangdongChapterWriter._outline_level(paragraph), level)
+            run = paragraph.runs[0]
+            self.assertEqual(run.font.name, "Times New Roman")
+            self.assertEqual(run.font.size.pt, 12.0)
+            self.assertTrue(run.bold)
+            self.assertEqual(run._element.rPr.rFonts.get(qn("w:eastAsia")), "仿宋_GB2312")
+
+    def test_typical_segment_heading_is_body_level_with_suffix(self) -> None:
+        """G3：`1）…` 典型段标题为正文级（Normal、无 outlineLvl）、无「（约N公里）」、末尾带「段」、楷体 12 bold。"""
+        document = self._write()
+        items = [p for p in document.paragraphs if re.match(r"^\d+）", p.text.strip())]
+        self.assertTrue(items, "样例数据应生成 ③ 典型段标题")
+        for paragraph in items:
+            text = paragraph.text.strip()
+            self.assertEqual(paragraph.style.name, "Normal")
+            self.assertIsNone(engine.GuangdongChapterWriter._outline_level(paragraph))
+            self.assertNotIn("（约", text)
+            self.assertTrue(text.endswith("段"), text)
+            run = paragraph.runs[0]
+            self.assertTrue(run.bold)
+            self.assertEqual(run.font.size.pt, 12.0)
+            self.assertEqual(run._element.rPr.rFonts.get(qn("w:eastAsia")), "楷体_GB2312")
+            self.assertTrue(paragraph.paragraph_format.keep_with_next)
+
+
+class T2hTableDisplayTests(unittest.TestCase):
+    """T2h（表格显示效果）：tblLayout=fixed / 逐行 trHeight / 单元格 12pt 固定行距 /
+    清单表类型列手动换行 / 高度②表数值不带 % / 标线②表里程取整。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        marking = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                    "marking_position": "左侧标线", "value": 60.0, "target": 80.0, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        height = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                   "guardrail_type": "两波", "height": 600.0, "city": "测试市",
+                   "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        marking.append({"category": "普通国省道", "route": "S120", "direction": "下行", "segment": "K6+000～K6+001",
+                        "marking_position": "右侧标线", "value": 40.0, "target": 80.0, "city": "测试市",
+                        "manager": "东莞市公路事务中心", "station_m": 6000.0, "end_m": 6001.0})
+        return {"city": "测试市", "marking": marking, "height": height, "bolt": [], "notes": [],
+                "comparison_detail": [], "weak_segments": [], "route_segments": []}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_tables_use_fixed_layout(self) -> None:
+        """A1：每张表 tblLayout=fixed（缺它会按内容 auto-fit，窄列被压扁）。"""
+        document = self._write()
+        self.assertTrue(document.tables)
+        for table in document.tables:
+            node = table._tbl.find(qn("w:tblPr")).find(qn("w:tblLayout"))
+            self.assertIsNotNone(node, table.rows[0].cells[0].text)
+            self.assertEqual(node.get(qn("w:type")), "fixed")
+
+    def test_every_row_has_template_height(self) -> None:
+        """A2：每行都有 trHeight（atLeast；模板缺值 fallback=397），③ 表首行照模板 601。"""
+        document = self._write()
+        for table in document.tables:
+            for row in table.rows:
+                node = row._tr.find(qn("w:trPr")).find(qn("w:trHeight"))
+                self.assertIsNotNone(node)
+                self.assertGreater(int(node.get(qn("w:val"))), 0)
+                self.assertEqual(node.get(qn("w:hRule")), "atLeast")
+        captions = engine.gd_table_captions(document)
+        for index, table in enumerate(document.tables):
+            expected = engine.GD_TABLE_HEIGHTS_BY_CAPTION.get(captions[index] if index < len(captions) else "")
+            if not expected:
+                continue
+            node = table.rows[0]._tr.find(qn("w:trPr")).find(qn("w:trHeight"))
+            self.assertEqual(int(node.get(qn("w:val"))), expected[0], captions[index])
+            data_heights = [int(r._tr.find(qn("w:trPr")).find(qn("w:trHeight")).get(qn("w:val")))
+                            for r in table.rows[1:]]
+            self.assertIn(expected[1], data_heights, captions[index])
+
+    def test_cells_use_exact_line_spacing(self) -> None:
+        """A3：单元格段落 12pt 固定行距（w:spacing line=240 lineRule=exact）。"""
+        document = self._write()
+        checked = 0
+        for table in document.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        node = paragraph._p.find(qn("w:pPr")).find(qn("w:spacing"))
+                        self.assertIsNotNone(node)
+                        self.assertEqual((node.get(qn("w:line")), node.get(qn("w:lineRule"))), ("240", "exact"))
+                        checked += 1
+        self.assertGreater(checked, 10)
+
+    def test_list_type_column_breaks_line(self) -> None:
+        """A4：清单表「类型」列照模板手动换行（高速\\n公路 / 普通\\n国省道）。"""
+        document = self._write()
+        table = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "类型")
+        self.assertEqual({row.cells[0].text.strip() for row in table.rows[1:]},
+                         {"高速\n公路", "普通\n国省道"})
+        for row in table.rows[1:]:
+            self.assertEqual(len(row.cells[0]._tc.findall(".//" + qn("w:br"))), 1)
+
+    def test_height_table_has_no_percent_and_marking_km_is_integer(self) -> None:
+        """B1/B3：高度②表数值不带 %（模板该表数据格即无 %）；标线②表里程列为整数。"""
+        document = self._write()
+        height_table = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "路线编号"
+                            and any("三波合格率" in c.text for c in t.rows[0].cells))
+        for row in height_table.rows[1:]:
+            for cell in row.cells[1:]:
+                self.assertNotIn("%", cell.text)
+        marking_table = next(t for t in document.tables if t.rows[0].cells[0].text.strip() == "路线编号"
+                             and any("左侧合格率" in c.text for c in t.rows[0].cells))
+        for row in marking_table.rows[1:]:
+            self.assertNotIn(".", row.cells[4].text)
+            self.assertTrue(row.cells[4].text.strip().replace(",", "").isdigit(), row.cells[4].text)
+
+    def test_section_margins_follow_template(self) -> None:
+        """A5：版心照模板（L/R 31.75mm、T/B 25.40mm）。"""
+        section = self._write().sections[0]
+        self.assertEqual(section.left_margin.twips, 1800)
+        self.assertEqual(section.right_margin.twips, 1800)
+        self.assertEqual(section.top_margin.twips, 1440)
+        self.assertEqual(section.bottom_margin.twips, 1440)
+
+class T2iPercentHeightTests(unittest.TestCase):
+    """T2i：全文档数据单元格不带 %（列头已写单位）；普通分支螺栓②表行高按模板别名条目取 (397, 432)。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        marking = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                    "marking_position": "左侧标线", "value": 60.0, "target": 80.0, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0},
+                   {"category": "普通国省道", "route": "S120", "direction": "下行", "segment": "K6+000～K6+001",
+                    "marking_position": "右侧标线", "value": 40.0, "target": 80.0, "city": "测试市",
+                    "manager": "东莞市公路事务中心", "station_m": 6000.0, "end_m": 6001.0}]
+        height = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                   "guardrail_type": "两波", "height": 600.0, "city": "测试市",
+                   "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        bolt = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                 "bolt_type": "拼接螺栓", "missing": 2, "expected": 100, "city": "测试市",
+                 "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        return {"city": "测试市", "marking": marking, "height": height, "bolt": bolt, "notes": [],
+                "comparison_detail": [], "weak_segments": [], "route_segments": []}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_no_percent_in_data_cells(self) -> None:
+        """T2i/B1：列头含 % 的表，数据单元格一律不带 %（全文档统一，有意偏离模板混用）。"""
+        document = self._write()
+        offenders = [(table.rows[0].cells[0].text.strip(), cell.text.strip())
+                     for table in document.tables for row in table.rows[1:]
+                     for cell in row.cells if "%" in cell.text]
+        self.assertEqual(offenders, [])
+
+    def test_cell_formatters_have_no_percent(self) -> None:
+        """T2i/B1：③/② 表格式化函数一律不带 %；空值分别写 `/` 与 `—`。"""
+        writer = engine.GuangdongChapterWriter
+        self.assertEqual(writer._g03_cell(None), "/")
+        self.assertEqual(writer._g03_cell(0.1385), "13.85")
+        self.assertEqual(writer._g03_cell(0.0), "0.00")
+        self.assertEqual(writer._g03_num(None), "—")
+        self.assertEqual(writer._g03_num(0.026, 2), "2.60")
+
+    def test_bolt_route_table_heights_use_tsv_alias_entry(self) -> None:
+        """T2i/A2：普通分支螺栓②表对应模板笔误同名的别名条目 (397, 432)；高速分支 510/510。"""
+        self.assertEqual(engine.GD_TABLE_HEIGHTS_BY_CAPTION["普通国省道各路段公司螺栓缺失率汇总表"], (397, 432))
+        self.assertEqual(engine.GD_TABLE_HEIGHTS_BY_CAPTION["高速公路各路段公司螺栓缺失率汇总表"], (510, 510))
+        self.assertEqual(engine.GD_TABLE_HEIGHTS_BY_CAPTION["{市}交通安全设施抽检路段清单"], (397, 397))
+
+class T2jStationSeparatorTests(unittest.TestCase):
+    """T2j（用户第 5 轮 Q9）：桩号区间连接符统一 ASCII `-`，全文不得出现 `～`/`〜`/`~`。"""
+
+    @staticmethod
+    def _bundle() -> dict:
+        marking = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                    "marking_position": "左侧标线", "value": 60.0, "target": 80.0, "city": "测试市",
+                    "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        height = [{"category": "高速公路", "route": "S14", "direction": "上行", "segment": "K1+000～K1+001",
+                   "guardrail_type": "两波", "height": 600.0, "city": "测试市",
+                   "manager": "广东省高速公路有限公司", "station_m": 1000.0, "end_m": 1001.0}]
+        return {"city": "测试市", "marking": marking, "height": height, "bolt": [], "notes": [],
+                "comparison_detail": [], "weak_segments": [], "route_segments": []}
+
+    def _write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = engine.GuangdongChapterWriter.write(
+                "测试市", self._bundle(), Path(temp_dir) / "out",
+                Path(__file__).resolve().parents[1] / "templates" / "广东项目第五章模板.md",
+                {"marking": 5, "height": 5, "bolt": 5},
+            )
+            return Document(output)
+
+    def test_document_has_no_station_separator_variants(self) -> None:
+        """T2j：正文与表格全文不得出现 `～`/`〜`/`~`（输入样例本身带 `～`）。"""
+        document = self._write()
+        texts = [p.text for p in document.paragraphs] + [
+            cell.text for table in document.tables for row in table.rows for cell in row.cells]
+        for variant in ("\uff5e", "\u301c", "\u007e"):
+            self.assertEqual([t for t in texts if variant in t], [], repr(variant))
+        self.assertTrue(any("-" in text for text in texts))
+
+    def test_station_range_uses_ascii_hyphen(self) -> None:
+        """T2j：② 表起止桩号用 `-`（`_gd03_range` 不再输出 `～`）。"""
+        writer = engine.GuangdongChapterWriter
+        self.assertEqual(writer._gd03_range(1000.0, 3000.0),
+                         "%s-%s" % (engine.format_station(1000.0), engine.format_station(3000.0)))
+        self.assertNotIn("～", writer._gd03_range(1000.0, 3000.0))
+        self.assertEqual(writer._gd03_range(None, None), "—")
+
+    def test_normalize_helper_replaces_variants_only(self) -> None:
+        """T2j：helper 只把 `～`/`〜`/`~` 换成 `-`，`—`（占位/中文连接）保留。"""
+        document = Document()
+        document.add_paragraph("K1+000～K2+000、K3+000〜K4+000、K5+000~K6+000、路线—管养单位、无数据 —")
+        changed = engine.normalize_station_separators(document)
+        text = document.paragraphs[0].text
+        self.assertEqual(changed, 1)
+        self.assertEqual(text, "K1+000-K2+000、K3+000-K4+000、K5+000-K6+000、路线—管养单位、无数据 —")
+
+class T2kWorkbookSeparatorTests(unittest.TestCase):
+    """T2k：xlsx 写入点与 docx 共用同一归一化出口（桩号区间一律 ASCII `-`）。"""
+
+    def test_text_normalizer_uses_hyphen(self) -> None:
+        self.assertEqual(engine.normalize_station_text("K1+000～K2+000、K3+000~K4+000"),
+                         "K1+000-K2+000、K3+000-K4+000")
+        self.assertEqual(engine.normalize_station_text("无数据 —"), "无数据 —")
+
+    def test_workbook_separators_normalized(self) -> None:
+        from openpyxl import Workbook
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"], sheet["A2"], sheet["A3"] = "G0422下行K1005～K965", "K975+740~K979+740", "无数据 —"
+        changed = engine.normalize_workbook_separators(workbook)
+        self.assertEqual(changed, 2)
+        self.assertEqual(sheet["A1"].value, "G0422下行K1005-K965")
+        self.assertEqual(sheet["A2"].value, "K975+740-K979+740")
+        self.assertEqual(sheet["A3"].value, "无数据 —")
+

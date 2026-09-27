@@ -32,7 +32,9 @@ class YunfuTemplateTest(unittest.TestCase):
         sections = [text for style, text in headings if style == "Heading 2"]
         self.assertEqual(sections, ["（一）高速公路交安设施技术状况", "（二）普通国省道交安设施技术状况", "（三）工作建议"])
         texts = [text for _, text in headings]
-        for title in ("1.沿线设施技术状况TCI", "2.标线、护栏自动化检测", "（1）标线逆反射亮度系数情况", "（2）护栏中心高度情况", "（3）波形梁护栏螺栓缺失情况"):
+        # D7：三个自动化小节标题去编号并按甲方模板改名
+        for title in ("1.沿线设施技术状况TCI", "2.标线、护栏自动化检测", "（1）标线逆反射亮度系数情况",
+                      "（2）波形梁护栏中心高度情况", "（3）波形梁护栏螺栓缺失情况"):
             self.assertEqual(texts.count(title), 2, title)
         # TCI 部分只保留标题，不再输出五个分项小节与“未评定”占位正文
         for removed in ("（1）总体评价", "（2）防护设施状况", "（3）交通标志状况", "（4）交通标线状况", "（5）防眩设施状况"):
@@ -48,7 +50,7 @@ class YunfuTemplateTest(unittest.TestCase):
         self.assertTrue(all(text.startswith(("表5-", "图5-")) for text in captions))
         text = "\n".join(p.text for p in doc.paragraphs)
         self.assertIn("本次未提供人工复核对比记录", text)
-        self.assertIn("本次未识别到高速公路优先处治路段", text)
+        self.assertIn("优先处治路段明细见《结构测试交安设施统计图表.xlsx》「优先处治路段」工作表。", text)
         self.assertNotIn("绿化管护状况", text)
         self.assertNotIn("细化展开", text)
         body_sizes = {run.font.size.pt for p in doc.paragraphs if p.style.name == "Normal" and p.text.strip()
