@@ -98,6 +98,9 @@ class GuangdongConfig:
     # 附件《全省高速公路基础信息表》：唯一带桩号、可按 P2 消歧跨主体路线的经营主体来源。
     # 不给时退到同目录 `路线分类表（含经营主体）.xlsx`（只有 (地市,路线) 级归属）。
     owner_xlsx: Path | None = None
+    # P4-1：项目路线表《广东交安省检项目线路统计-*.xlsx》——分段/里程/管养单位/经营主体的一级源。
+    # 不给时由 `discover_project_route_table` 自动发现（requirements 副本 → 路线表同目录 → …）。
+    project_route_xlsx: Path | None = None
 
     def __post_init__(self):
         values = validate_thresholds(self.marking_threshold, self.height_threshold, self.bolt_threshold)
@@ -3052,48 +3055,125 @@ def detect_manual_before_workbook(project_dir):
     return None
 
 
+# 项目路线表（P4-1 附件）文件名同名前缀的版本号；自动发现时取版本号最大者。
+GD_ROUTE_TABLE_PREFIX = "线路统计"
+GD_ROUTE_TABLE_GLOB = "广东交安省检项目线路统计-*.xlsx"
+# 自动发现时额外搜索的目录（本次 = 项目 requirements 副本，附件原件所在）。
+GD_ROUTE_TABLE_DIRS = ("C:/FakeD/HermesTeam/projects/gd-zhujiang/requirements",)
+
+
+def station_km(value):
+    """桩号单元格 → 公里数（km）。`K1305+000`→1305.0、`K20+000`→20.0、裸数字按原值；判不出 None。
+
+    P4-1：项目路线表的起止桩号是 `K1305+000` 文本，`_float` 直接返回 None 会让整表读不出路段。
+    故意不并进 `_float`（那是通用数值口，桩号文本只在本口径出现）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    match = re.search(r"K?\s*(\d+)\s*(?:[+＋]\s*(\d+(?:\.\d+)?))?", str(value), re.I)
+    if not match:
+        return None
+    return int(match.group(1)) + float(match.group(2) or 0) / 1000.0
+
+
+def discover_project_route_table(route_xlsx=None, extra_dirs=GD_ROUTE_TABLE_DIRS):
+    """自动发现项目路线表《广东交安省检项目线路统计-*.xlsx》（P4-1 一级数据源）。
+
+    两条路：① `extra_dirs`（默认 = `GD_ROUTE_TABLE_DIRS`，即项目 requirements 副本目录）
+    → ② 路线表同目录 / 引擎仓 references+requirements / 数据目录。取版本号最大者
+    （`线路统计-7` 优先于 `-3`）。找不到返回 None（调用方如实回退明细聚合口径并打日志）。
+    """
+    folders = [Path(d) for d in extra_dirs if d]
+    if route_xlsx:
+        try:
+            folders.append(Path(route_xlsx).parent)
+        except Exception:
+            pass
+    folders += [application_root() / "references", application_root() / "requirements",
+                Path("C:/文件/工作工具台/广东报告数据")]
+    best = None
+    for folder in folders:
+        try:
+            if not folder.is_dir():
+                continue
+            for hit in folder.glob(GD_ROUTE_TABLE_GLOB):
+                if hit.name.startswith("~$"):
+                    continue
+                version = _route_table_version(hit.name)
+                if best is None or version > best[0]:
+                    best = (version, hit)
+        except Exception:
+            continue
+    return best[1] if best else None
+
+
+def _route_table_version(name):
+    """`广东交安省检项目线路统计-7.xlsx` → 7；无版本号按 0。"""
+    match = re.search(r"-(\d+)\.xlsx$", name)
+    return int(match.group(1)) if match else 0
+
+
 def load_route_segments(path):
-    """读取路线表中的抽检路段行（附件清单表口径：起点/终点/里程为公里数，管养单位取路线表）。"""
+    """项目路线表 → 抽检路段行（P4-1 一级数据源：分段/里程/管养单位/经营主体全部取自本表）。
+
+    两种 sheet 表头自适应（brief-v4 §0）：
+      · 珠三角片区：`序号|地市|路线|方向|路段起点|路段终点|检测里程（km）|管养单位|经营主体`，
+        类别取首列块标签（高速/国省道，向下填充），地市逐行重复、不带「市」；
+      · 西片区：`地市|线路号|线路名|方向|起点桩号|终点桩号|里程|道路等级|管养单位|经营主体`，
+        类别取「道路等级」列（高速公路/一级/二级），地市只在块首（合并单元格）、带「市」。
+    无表头的工作表（如 Sheet3 旧版清单）自动跳过 —— 只认「地市 + 起止桩号」表头行。
+    桩号 `K1305+000` 走 `station_km`；里程以「检测里程」列为准（实测桩号差 0 行不符）。
+    """
     rows = []
     if not path:
         return rows
     try:
         import openpyxl
-        book = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        book = openpyxl.load_workbook(path, data_only=True)
     except Exception:
         return rows
-    for sheet in book.worksheets:
-        header = {}
-        city = block_type = ""
-        for row in sheet.iter_rows(values_only=True):
-            cells = ["" if cell is None else str(cell).strip() for cell in row]
-            if not "".join(cells):
-                continue
-            if not header:
-                if "地市" in cells and any(cell in ("起点桩号", "路段起点") for cell in cells):
-                    header = {cell: index for index, cell in enumerate(cells) if cell}
-                continue
+    try:
+        for sheet in book.worksheets:
+            header = {}
+            block_type = city = ""
+            # ponytail: read_only 模式下 `values_only` 的行宽按首个非空行确定；本表首行是
+            # 表头但 A 列为空，合并单元格还会让 read_only 少给一列 —— 直接实测发现这种组合
+            # 会漏读整表，故不用 read_only（表只有几百行，内存代价可忽略）。
+            for values in sheet.iter_rows(values_only=True):
+                cells = ["" if cell is None else str(cell).strip() for cell in values]
+                if not "".join(cells):
+                    continue
+                if not header:
+                    if "地市" in cells and any(cell in ("路段起点", "起点桩号") for cell in cells):
+                        header = {cell: index for index, cell in enumerate(cells) if cell}
+                    continue
 
-            def _cell(*names):
-                return next((cells[header[name]] for name in names
-                             if name in header and header[name] < len(cells)), "")
+                def _cell(*names):
+                    return next((cells[header[name]] for name in names
+                                 if name in header and header[name] < len(cells)), "")
 
-            if cells[0]:                      # 首列块标记：高速 / 国省道
-                block_type = cells[0]
-            if _cell("地市"):
-                city = _cell("地市").rstrip("市")
-            route, direction = _cell("路线", "线路号"), _cell("方向")
-            start = _float(_cell("起点桩号", "路段起点"))
-            if not route or start is None:
-                continue
-            kind = _cell("道路等级", "类型") or block_type
-            rows.append({
-                "city": city, "route": route, "direction": direction,
-                "category": "高速公路" if "高速" in kind else ("普通国省道" if kind else ""),
-                "start": start, "end": _float(_cell("终点桩号", "路段终点")),
-                "length": _float(_cell("检测里程（km）", "里程", "检测里程")),
-                "manager": _cell("管养单位"),
-            })
+                if cells[0] and cells[0] not in ("序号", "地市", "线路号"):
+                    block_type = cells[0]          # 首列块标记：高速 / 国省道（向下填充）
+                if _cell("地市"):
+                    city = re.sub(r"\s+", "", _cell("地市")).rstrip("市")
+                route, direction = _cell("路线", "线路号"), normalize_direction(_cell("方向"))
+                start = station_km(_cell("路段起点", "起点桩号"))
+                if not route or start is None:
+                    continue
+                kind = _cell("道路等级", "类型") or block_type
+                owner = re.sub(r"\s+", "", _cell("经营主体")) or None
+                rows.append({
+                    "city": city, "route": route, "direction": direction,
+                    "category": RouteCategoryIndex._row_category(kind) or "",
+                    "start": start, "end": station_km(_cell("路段终点", "终点桩号")),
+                    "length": _float(_cell("检测里程（km）", "里程", "检测里程")),
+                    "manager": _cell("管养单位"), "owner": owner,
+                    "route_name": _cell("线路名", "路线名称"),
+                })
+    finally:
+        book.close()
     return rows
 
 
@@ -3329,44 +3409,63 @@ PROVINCIAL_MANAGER_KEYWORDS = ("广东", "省", "集团", "交通集团")
 
 
 def gd_manager_lookup(route_segments, city=""):
-    """C4：路线分类表（清单表同源）的管养单位映射。
+    """C4：项目路线表（清单表同源）的管养单位映射，按路段给，**不是**按 (路线,方向) 给一个值。
 
-    返回 {(路线, 方向): 管养单位} 以及该路线在路线表中只对应一个管养单位时的 {(路线, ""): 管养单位}
-    兜底键（明细行缺方向时用）。明细行 manager 写法不统一（同一单位多种简称/全称）会让同一管养单位
-    在 ① 表被拆成多行，与引言句「分属 N 家管养单位」自相矛盾，故 ①/②/③ 表一律以路线表口径为准。
-    数据源即清单表行本身（与引言句、清单表完全同源）；标注了他市的路线表行剔除，无 city 字段的明细分
-    组行保留（明细聚合口径无 city 字段）。
+    返回 `{(路线, 方向): [(起点km, 终点km, 管养单位), …]}`。P4-1：同一 (路线,方向) 在项目
+    路线表里可能有多段不同管养单位（实测 27 组，如广州 G0425 下行 K0-K18 非集团 /
+    K20-K40 集团），旧的 `setdefault` 只会留下第一段，另一段整片明细被挂到错误管养单位名下，
+    ②表也并成一行。按路段返回后由 `gd_manager_name` 按记录自身桩号落段，②表自然分行。
     """
     wanted = str(city or "").rstrip("市")
     lookup = {}
-    per_route = {}
     for row in route_segments or []:
         row_city = str(row.get("city") or "").strip()
         if wanted and row_city and row_city != wanted:
             continue
         route = str(row.get("route") or "")
         name = str(row.get("manager") or "").strip()
-        if not route or not name:
+        start, end = _float(row.get("start")), _float(row.get("end"))
+        if not route or not name or start is None or end is None:
             continue
-        lookup.setdefault((route, str(row.get("direction") or "")), name)
-        per_route.setdefault(route, set()).add(name)
-    for route, names in per_route.items():
-        if len(names) == 1:
-            lookup.setdefault((route, ""), next(iter(names)))
+        lookup.setdefault((route, str(row.get("direction") or "")), []).append(
+            (min(start, end), max(start, end), name))
     return lookup
 
 
+# P4-1：明细记录落不进项目路线表任何路段时写入 manager 的哨兵值。
+# 与「查得到但管养单位为空」区分开：这类记录计入①表全市、不进②表（禁摊派、禁按里程比例分摊）。
+GD_UNASSIGNED = "未落段"
+
+
 def gd_manager_name(lookup, row):
-    """按 (路线, 方向) → (路线, "") 取路线表管养单位；路线表缺该路段时如实写「—」，不回退明细行口径。"""
+    """按记录自身桩号在项目路线表里落段取管养单位；落不进任何路段 → 哨兵 `未落段`。
+
+    查得到但管养单位为空、或无桩号的记录写「—」（数据缺失，与「未落段」不是一回事）。
+    """
     route = str(row.get("route") or "")
-    return (lookup.get((route, str(row.get("direction") or ""))) or lookup.get((route, "")) or "—")
+    spans = lookup.get((route, str(row.get("direction") or ""))) or []
+    km = _float(row.get("station_m"))
+    if spans and km is not None:
+        km /= 1000.0
+        for low, high, name in spans:            # 段内闭区间；相邻段边界归先命中的那段
+            if low <= km <= high:
+                return name
+        return GD_UNASSIGNED
+    if spans:
+        return spans[0][2] if len({name for _lo, _hi, name in spans}) == 1 else "—"
+    return "—"
 
 
 def gd_route_managed_rows(rows, lookup):
-    """C4：把明细行的 manager 覆写为路线表口径（路线表整体缺失时保持原值，生产链路必有清单表）。"""
+    """C4：把明细行的 manager 覆写为项目路线表口径（无路段表时保持原值）。"""
     if not lookup:
         return rows
     return [dict(row, manager=gd_manager_name(lookup, row)) for row in rows]
+
+
+def gd_matched_rows(rows):
+    """②表只收落进项目路线表路段的记录（①表全市仍收全部，分母口径不变）。"""
+    return [row for row in rows or () if str(row.get("manager") or "") != GD_UNASSIGNED]
 
 
 # 模板-1「（三）工作建议」3.养护提升建议 原文（该节模板无数据占位，逐字照抄；C1）：
@@ -3551,6 +3650,69 @@ def gd_mileage(inspection, category=None, manager=None, route=None, direction=No
     return total if hit else None
 
 
+def gd_inspection_range(inspection, category=None, manager=None, route=None, direction=None):
+    """P4f2-F：某分组的**清单表桩号区间**（米，floor/ceil 由调用方做）；无匹配行返回 `None`。
+
+    ②表「起止桩号」此前取**检测记录**的 min/max 再取整，区间比路线表声明范围窄
+    （review-p4 P2-1 实测 49/385 行被收窄，用户按②表去现场核对会少几公里）。
+    改与里程列 `gd_mileage` **同源**：同一批清单表行取 min(start)/max(end)，
+    再走 `_gd03_whole_range` 的 floor/ceil —— 与清单表完全同口径。
+    筛选键刻意与 gd_mileage 逐字一致（不含 class_prefix/owner：②表从不按这两维分组）。
+
+    返回 `None` 而不是 `(None, None)`：调用点的 `or (start_m, end_m)` 靠假值回退到检测记录跨度，
+    而 `(None, None)` 是**真值元组**，会把回退吃掉、渲染成「—」。
+    """
+    starts, ends = [], []
+    for row in inspection or ():
+        if category is not None and row.get("category") != category:
+            continue
+        if manager is not None and str(row.get("manager") or "") != str(manager):
+            continue
+        if route is not None and str(row.get("route") or "") != str(route):
+            continue
+        if direction is not None and str(row.get("direction") or "") != str(direction):
+            continue
+        start, end = _float(row.get("start")), _float(row.get("end"))
+        if start is None or end is None:
+            continue
+        starts.append(min(start, end))
+        ends.append(max(start, end))
+    return (min(starts) * 1000, max(ends) * 1000) if starts else None
+
+
+def gd_route_gap_note(inspection, route_units, rows, category):
+    """P4f2-E：②表/②图「XX市合计」与可见行之和差额的脚注句；差额为 0（或无数据）时返回 None。
+
+    合计值**保持 = ①表该市行**（必须与同页①表、②图首类同数，coordinator 已否「改成行和」），
+    因此当全市抽检里程里有若干 km 没被②表任何一个 (路线,管养单位[,方向]) 组覆盖到时，
+    表内各行之和 < 合计。脚注按实算逐市披露：全市 X km / 已纳入分段统计 Y km /
+    另有 Z km（W 条记录）桩号未落入，并说明该差额已计入①表全市值（禁摊派、禁静默）。
+    末句统一并入「±0.5 km 取整差」说明（段长为整数显示）。
+
+    `route_units` 用②表那一批行（其里程列的取值口径与 `listed` 逐字一致），
+    `rows` 是该指标的检测记录（用来数「未落段」条数）。
+    """
+    total_km = gd_mileage(inspection, category=category)
+    if total_km is None:
+        return None
+    listed = 0.0
+    for row in route_units or ():
+        km = gd_mileage(inspection, category=category, route=row.get("route"),
+                        direction=row.get("direction"), manager=row.get("manager"))
+        if km is not None:
+            listed += km
+    # 未纳入的检测记录：桩号落不进项目路线表任何路段（manager 被标成内部哨兵）的那批
+    unassigned = sum(1 for row in rows or ()
+                     if str(row.get("manager") or "") == GD_UNASSIGNED)
+    gap = total_km - listed
+    if abs(gap) < 0.5:
+        return None      # 差额为 0 的市不输出脚注
+    return (f"注：本表（图）各路段仅统计桩号落入项目路线表抽检路段的检测记录；"
+            f"全市抽检{category} {total_km:.0f} km，其中已纳入分段统计 {listed:.0f} km，"
+            f"另有 {gap:.0f} km（{unassigned} 条记录）桩号未落入路线表路段区间，未纳入本表，"
+            f"差额已计入表5-2 全市值。段长为整数显示，逐行合计可能与抽检里程有 ±0.5 km 取整差。")
+
+
 def gd_class_subset(rows, class_prefix=None):
     """按道路类别细分（G=普通国道 / S=普通省道）取检测记录子集。
 
@@ -3642,11 +3804,12 @@ def gd_owner_gap_note(inspection, category="高速公路"):
     parts = {owner: gd_mileage(inspection, category=category, owner=owner) or 0.0
              for owner in (GD_OWNER_NON_PROVINCIAL, GD_OWNER_PROVINCIAL)}
     gap = total - sum(parts.values())
-    cells = gd_km_split_text(total, parts[GD_OWNER_NON_PROVINCIAL], parts[GD_OWNER_PROVINCIAL])
     if abs(gap) < 5e-4:
-        return (f"本表「抽检{category}」经营主体已全部核定：非省交通集团 {cells[1]} km 与"
-                f"省交通集团 {cells[2]} km 合计 {cells[0]} km，与该行里程一致，"
-                f"「非省交通集团」与「省交通集团」两行之和等于抽检里程。")
+        # P4-7：用户要求删除「本表「抽检高速公路」经营主体已全部核定：…与该行里程一致。」整句。
+        # 差额归零时**不写任何说明句**（是删除，不是改写）；真实差额（江门）仍走下面的分支 ——
+        # 差额必须写明，沉默会掩盖未覆盖里程。
+        return None
+    cells = gd_km_split_text(total, parts[GD_OWNER_NON_PROVINCIAL], parts[GD_OWNER_PROVINCIAL])
     # 差额按**已显示的整数**倒推，保证句内 合计 = 非集团 + 集团 + 差额 逐位成立
     # （用 float 的 gap 四舍五入会与句子里另外三个整数对不上，甲方一加就露馅）。
     left = int(cells[0]) - int(cells[1]) - int(cells[2])
@@ -3654,8 +3817,7 @@ def gd_owner_gap_note(inspection, category="高速公路"):
             f"其中非省交通集团 {cells[1]} km、省交通集团 {cells[2]} km，"
             f"另有 {left} km 尚未核定经营主体，三者之和等于抽检里程合计；"
             f"该差额对应路段：{gd_owner_gap_routes(inspection, category)}。"
-            f"原因为《2026年全省高速公路基础信息表》未覆盖上述路段的桩号区间，"
-            f"且其管养单位在附件中未唯一对应一个经营主体，故不作推定、不摊派，"
+            f"原因为项目路线表未覆盖或未标注上述路段的经营主体，故不作推定、不摊派，"
             f"该部分里程不计入上述两行。")
 
 
@@ -3700,13 +3862,15 @@ def gd_cross_owner_spans(computed, start, end):
 
 
 def gd_owner_map(inspection):
-    """{(路线, 方向): 经营主体原值 | [(起, 止, 经营主体)] 桩号分段}；判不出主体的行不出现。
+    """{(路线, 方向): [(起km, 止km, 经营主体)]}；判不出主体的行不出现。
 
-    P1h：跨主体路线（G0425/G4 广州）的一行抽检里程横跨两个主体，单值装不下，①表按
-    (路线,方向) 取值的率分母会把整行算进一侧。这里改挂 gd_cross_owner_spans 桩号分段，
-    由 gd_mileage/gd_owner_rows 按桩号拆分，两侧都不重不漏（差额才可能归零）。
-    注意：拆分行的 `owner` 是 None（判不出单一归属），但它有 owner_spans，必须进 map，
-    否则整行里程在①表两侧都消失、差额反而变大。
+    P1h：跨主体路线的一行抽检里程横跨两个主体，单值装不下，①表按 (路线,方向) 取值的率分母
+    会把整行算进一侧。这里挂桩号分段，由 gd_mileage/gd_owner_rows 按桩号拆分，两侧都不重不漏。
+
+    P4-1：项目路线表是逐段给「经营主体」的，同一 (路线,方向) 天然有多段（广州 G0425 下行
+    K0-K18 非集团 / K20-K40 集团）。所以这里**统一返回分段列表**（原来是
+    `原值 | 分段列表` 二选一），落段逻辑只有一份。缺起止桩号的行（明细聚合后备口径）
+    退化成整段 (-inf, +inf)，行为与旧的单值路径一致。
     """
     out = {}
     for row in inspection or ():
@@ -3714,32 +3878,41 @@ def gd_owner_map(inspection):
         if not (row.get("owner") or spans):
             continue
         key = (str(row.get("route") or ""), str(row.get("direction") or ""))
-        out[key] = spans if spans else row["owner"]
+        if spans:
+            out.setdefault(key, []).extend(tuple(span) for span in spans)
+            continue
+        start, end = _float(row.get("start")), _float(row.get("end"))
+        out.setdefault(key, []).append(
+            (start if start is not None else -math.inf,
+             end if end is not None else math.inf, row["owner"]))
     return out
 
 
 def gd_owner_rows(rows, owner_map, owner):
     """明细行里归属于该经营主体的子集（①表经营主体两行的率分母/分子）。
 
-    owner_map 的值是桩号分段时，明细行按自身 station_m 落段判定归属；落不进任何一段
-    （跨主体切缝上的罕见测点）不计入，两侧都不吞。
+    owner_map 的值是桩号分段：明细行按自身 station_m 落段判定归属；落不进任何一段
+    （跨主体切缝上的罕见测点）不计入，两侧都不吞。缺桩号的记录不摊派 —— 只有当该
+    (路线,方向) 全段同属一个主体时才归到那一侧（旧单值口径的等价行为）。
     """
     out = []
     for row in rows or ():
         key = (str(row.get("route") or ""), str(row.get("direction") or ""))
-        found = owner_map.get(key)
-        if isinstance(found, list):
-            km = _float(row.get("station_m"))
-            if km is None:
-                continue
-            km /= 1000.0                      # 明细行 station_m 是米，桩号分段是 km
-            last = found[-1][1]
-            hit = next((value for a, b, value in found
-                        if a <= km < b or (km == b and b == last)), None)
-            if hit == owner:
+        spans = owner_map.get(key)
+        if not spans:
+            continue
+        km = _float(row.get("station_m"))
+        if km is None:
+            values = {value for _low, _high, value in spans}
+            if len(values) == 1 and owner in values:
                 out.append(row)
-        elif found == owner:
-            out.append(row)
+            continue
+        km /= 1000.0
+        for low, high, value in spans:
+            if low <= km <= high:
+                if value == owner:
+                    out.append(row)
+                break
     return out
 
 
@@ -4776,8 +4949,6 @@ class GuangdongStatistics:
 
     # ==================== GD03 四段式聚合（brief-gd03 §3） ====================
 
-    MARKING_UNIT_RECORDS = 5
-
     @staticmethod
     def _route_key(route):
         text = str(route or "")
@@ -4803,98 +4974,87 @@ class GuangdongStatistics:
         return marking_side_names([position]).get(str(position), str(position))
 
     @classmethod
-    def marking_units(cls, rows):
-        """100 m 平均值基准：每侧每 5 条 20 m 记录（按桩号排序）归为一个计算单元。
+    def marking_points(cls, rows):
+        """P4f2-A：**点级**基准 —— 每条检测记录 = 1 个点位，该记录 `value >= 其 target` 即合格。
 
-        分组口径与附件一致：路线+方向+管养单位+标线位置（不按检测区段拆分，
-        否则跨区段处会把 5 条记录截断，导致合格率偏差）。
+        废除了原「每侧每 5 条 20 m 记录归 1 个 100 m 平均单元、单元均值 ≥ 目标值」口径
+        （`marking_units`/`marking_unit_rates`/`_marking_km` 一并删除，产物不再出现「100米计算单元」）。
+        分组键与旧口径一致（路线+方向+管养单位+标线位置），不按检测区段拆分。
+        `target` 缺省 80（与旧实现 `max(..., default=80.0)` 同）。
         """
         fields = ("route", "direction", "manager", "marking_position")
-        units = []
+        points = []
         for key, selected in cls._group(rows, fields).items():
-            ordered = sorted((r for r in selected if _float(r.get("value")) is not None and r.get("station_m") is not None),
-                             key=lambda r: r["station_m"])
-            for index in range(0, len(ordered), cls.MARKING_UNIT_RECORDS):
-                chunk = ordered[index:index + cls.MARKING_UNIT_RECORDS]
-                values = [float(r["value"]) for r in chunk]
-                targets = [_float(r.get("target")) for r in chunk]
-                target = max((t for t in targets if t is not None), default=80.0)
-                average = sum(values) / len(values)
-                ends = [_float(r.get("end_m")) for r in chunk]
-                ends = [e for e in ends if e is not None]
-                units.append(dict(zip(fields, key), count=len(values), average=average, target=target,
-                                  qualified=average >= target, start_m=min(r["station_m"] for r in chunk),
-                                  end_m=max(ends) if ends else max(r["station_m"] for r in chunk)))
-        return units
+            for row in selected:
+                value = _float(row.get("value"))
+                if value is None or row.get("station_m") is None:
+                    continue
+                target = _float(row.get("target"))
+                target = 80.0 if target is None else target
+                end = _float(row.get("end_m"))
+                points.append(dict(zip(fields, key), value=value, target=target,
+                                   qualified=value >= target, start_m=float(row["station_m"]),
+                                   end_m=end if end is not None else float(row["station_m"])))
+        return points
 
     @classmethod
-    def marking_unit_rates(cls, units):
-        """按标线侧汇总 100 m 单元的合格率。"""
+    def marking_side_rates(cls, points):
+        """按标线侧汇总**点位**合格率（分母 = 该侧实际点位数，不按理论点补齐、不做段长加权）。"""
         result = {}
-        for unit in units:
-            side = cls._side_of(unit.get("marking_position"))
-            item = result.setdefault(side, {"unit_count": 0, "qualified_count": 0})
-            item["unit_count"] += 1
-            item["qualified_count"] += 1 if unit.get("qualified") else 0
+        for point in points:
+            side = cls._side_of(point.get("marking_position"))
+            item = result.setdefault(side, {"point_count": 0, "qualified_count": 0})
+            item["point_count"] += 1
+            item["qualified_count"] += 1 if point.get("qualified") else 0
         for item in result.values():
-            item["qualified_rate"] = item["qualified_count"] / item["unit_count"] if item["unit_count"] else None
+            item["qualified_rate"] = item["qualified_count"] / item["point_count"] if item["point_count"] else None
         return result
 
     @classmethod
-    @staticmethod
-    def _marking_km(units):
-        """检测里程（km）：每侧 100 m 计算单元数 × 0.1（oracle 口径，跨区段按单元累计）。"""
-        sides = {}
-        for unit in units:
-            side = GuangdongStatistics._side_of(unit.get("marking_position"))
-            sides[side] = sides.get(side, 0) + 1
-        return round(0.1 * max(sides.values()), 1) if sides else 0.0
-
-    @classmethod
-    def marking_overall(cls, units):
-        rates = cls.marking_unit_rates(units)
+    def marking_overall(cls, points):
+        rates = cls.marking_side_rates(points)
         left = rates.get("左侧标线", {}).get("qualified_rate")
         right = rates.get("右侧标线", {}).get("qualified_rate")
         return {"left_rate": left, "right_rate": right, "overall_rate": _gd03_overall(left, right),
-                "unit_count": len(units),
-                "qualified_count": sum(1 for unit in units if unit.get("qualified")),
-                "left_units": rates.get("左侧标线", {}).get("unit_count", 0),
-                "right_units": rates.get("右侧标线", {}).get("unit_count", 0)}
+                "point_count": len(points),
+                "qualified_count": sum(1 for point in points if point.get("qualified")),
+                "left_points": rates.get("左侧标线", {}).get("point_count", 0),
+                "right_points": rates.get("右侧标线", {}).get("point_count", 0)}
 
     @classmethod
     def marking_route_units(cls, rows):
-        """②“路线—管养单位”合并（跨检测区段）的 100 m 单元合格率。"""
-        units = cls.marking_units(rows)
+        """P4f2-A：②「路线—管养单位」区间（含方向）的**点位**合格率。"""
+        points = cls.marking_points(rows)
         result = []
-        for key, selected in cls._group(units, ("route", "manager")).items():
-            rates = cls.marking_unit_rates(selected)
+        for key, selected in cls._group(points, ("route", "manager")).items():
+            rates = cls.marking_side_rates(selected)
             left = rates.get("左侧标线", {}).get("qualified_rate")
             right = rates.get("右侧标线", {}).get("qualified_rate")
-            starts = [u["start_m"] for u in selected]
-            ends = [u["end_m"] for u in selected]
+            starts = [p["start_m"] for p in selected]
+            ends = [p["end_m"] for p in selected]
             result.append(dict(zip(("route", "manager"), key), left_rate=left, right_rate=right,
-                                overall_rate=_gd03_overall(left, right), km=cls._marking_km(selected),
-                                unit_count=len(selected), start_m=min(starts), end_m=max(ends)))
+                                overall_rate=_gd03_overall(left, right),
+                                point_count=len(selected), start_m=min(starts), end_m=max(ends)))
         return sorted(result, key=lambda row: cls._route_key(row["route"]))
 
     @classmethod
     def marking_per_km(cls, rows):
-        """逐公里 100 m 单元合格率（左侧/右侧/总体）。"""
+        """P4f2-A：③每公里区间的**点位**合格率（左侧/右侧/总体）。"""
         buckets = {}
-        for unit in cls.marking_units(rows):
-            km = int(unit["start_m"] // 1000)
-            entry = buckets.setdefault((unit.get("route"), unit.get("direction"), km), {})
-            side = cls._side_of(unit.get("marking_position"))
+        for point in cls.marking_points(rows):
+            km = int(point["start_m"] // 1000)
+            entry = buckets.setdefault((point.get("route"), point.get("direction"), km), {})
+            side = cls._side_of(point.get("marking_position"))
             cell = entry.setdefault(side, [0, 0])
             cell[0] += 1
-            cell[1] += 1 if unit.get("qualified") else 0
+            cell[1] += 1 if point.get("qualified") else 0
         result = []
         for (route, direction, km), sides in buckets.items():
             rates = {name: (cell[1] / cell[0] if cell[0] else None) for name, cell in sides.items()}
             result.append({"route": route, "direction": direction, "km": km,
                            "left_rate": rates.get("左侧标线"), "right_rate": rates.get("右侧标线"),
                            "overall_rate": _gd03_overall(rates.get("左侧标线"), rates.get("右侧标线")),
-                           "unit_count": sum(cell[0] for cell in sides.values())})
+                           "point_count": sum(cell[0] for cell in sides.values())})
         return sorted(result, key=lambda row: (cls._route_key(row["route"]), str(row["direction"] or ""), row["km"]))
 
     @classmethod
@@ -4944,40 +5104,38 @@ class GuangdongStatistics:
         return sorted(candidates, key=lambda row: (row["average"], -row["length_km"]))[:limit]
 
     @classmethod
-    def marking_long_runs(cls, rows, window=30, threshold=0.8, min_windows=3):
-        """⑤⑥长连续路段（oracle 口径）：按“路线—管养单位—标线侧”取 100 m 单元序列，
-        30 个单元（3 km）滑动窗口不合格率 > 80% 的最长连续窗口段，长度 ≥ 3 km 时输出。"""
+    def marking_long_runs(cls, rows, threshold=0.8, min_km=3):
+        """P4f2-A：⑤⑥长连续路段 —— 窗**以整公里为单位**（不再是 30 个 100 m 单元滑窗）。
+
+        按「路线—管养单位—标线侧」把点级记录归到整公里桶；某公里桶内
+        **不合格点数 ÷ 该公里实际点位数 > 80%** 判该公里窗不合格，
+        连续坏公里 ≥ `min_km`(3) 时输出。分母是该公里实有点位数，不按理论点补齐。
+        """
+        buckets = {}
+        for point in cls.marking_points(rows):
+            side = cls._side_of(point.get("marking_position"))
+            key = (point.get("route"), point.get("manager"), side, int(point["start_m"] // 1000))
+            cell = buckets.setdefault(key, [0, 0, point.get("marking_position")])
+            cell[0] += 1
+            cell[1] += 0 if point.get("qualified") else 1
         grouped = {}
-        for unit in cls.marking_units(rows):
-            side = cls._side_of(unit.get("marking_position"))
-            grouped.setdefault((unit.get("route"), unit.get("manager"), side), []).append(unit)
+        for (route, manager, side, km), (count, bad, position) in buckets.items():
+            grouped.setdefault((route, manager, side), []).append(
+                {"km": km, "count": count, "bad": bad, "position": position,
+                 "fail_ratio": bad / count if count else None})
         output = []
         for (route, manager, side), items in grouped.items():
-            items.sort(key=lambda u: u["start_m"])
-            flags = [bool(u.get("qualified")) for u in items]
-            n = len(flags)
-            if n < window:
-                continue
-            fails = [0] * (n + 1)
-            for index, ok in enumerate(flags):
-                fails[index + 1] = fails[index] + (0 if ok else 1)
-            bad = [fails[i + window] - fails[i] > threshold * window for i in range(n - window + 1)]
-            best = cur = 0
-            best_end = 0
-            for index, value in enumerate(bad):
-                cur = cur + 1 if value else 0
-                if cur > best:
-                    best, best_end = cur, index
-            if best < min_windows:
-                continue
-            start_index = best_end - best + 1
-            fail_rates = [(fails[i + window] - fails[i]) / window for i in range(start_index, best_end + 1)]
-            output.append({"route": route, "manager": manager, "position": items[0].get("marking_position"),
-                           "position_name": side,
-                           "start_m": items[start_index]["start_m"],
-                           "end_m": items[best_end]["start_m"] + window * 100,
-                           "length_km": round(3 + (best - 1) * 0.1, 1),
-                           "fail_rate": sum(fail_rates) / len(fail_rates)})
+            items.sort(key=lambda row: row["km"])
+            for block in cls._km_runs(items, lambda item: item["fail_ratio"] is not None
+                                      and item["fail_ratio"] > threshold):
+                if len(block) < min_km:
+                    continue
+                output.append({"route": route, "manager": manager, "position": block[0].get("position"),
+                               "position_name": side,
+                               "start_m": block[0]["km"] * 1000, "end_m": (block[-1]["km"] + 1) * 1000,
+                               "length_km": len(block),
+                               "fail_rate": sum(i["bad"] for i in block) / sum(i["count"] for i in block),
+                               "point_count": sum(i["count"] for i in block)})
         return sorted(output, key=lambda row: (-row["length_km"], row["fail_rate"]))
 
     @staticmethod
@@ -5564,24 +5722,30 @@ def apply_gd_table_widths(document):
     return applied
 
 
+# P4-12：所有表格行高固定 26 磅（26pt × 20 twips/pt = 520 twips），按 brief-v4 统一覆盖
+# 模板逐表实测值（`GD_TABLE_HEIGHTS_BY_CAPTION`）—— 用户口径是「所有表格行高固定 26 磅」。
+GD_ROW_HEIGHT_TWIPS = 520
+GD_ROW_HEIGHT_RULE = "exact"      # 固定值（非「最小值」）：多行单元格按 12pt 行距放得下 2 行
+
+
 def apply_gd_table_heights(document):
-    """T2h/A2：按表题套用模板-1 行高（表头/数据行两档，缺值 397）。
-    用 atLeast 而非 exact：多行单元格（类型列换行）不会被截断。"""
+    """P4-12：全部表格全部行 `trHeight=26 磅` 固定（`hRule=exact`）。
+
+    覆盖原先按表题套模板实测行高的做法（`GD_TABLE_HEIGHTS_BY_CAPTION`）—— 那是 T2h 的口径，
+    与本轮用户口径冲突，保留常量表仅作历史取证，本函数不再读它。
+    """
     from docx.enum.table import WD_ROW_HEIGHT_RULE
     from docx.shared import Emu
 
-    captions = gd_table_captions(document)
     applied = 0
-    for index, table in enumerate(document.tables):
+    for table in document.tables:
         if not table.rows:
             continue
-        key = captions[index] if index < len(captions) else ""
-        if key.endswith("交通安全设施抽检路段清单"):
-            key = "{市}交通安全设施抽检路段清单"  # T2i：题注含市名，tsv 键用占位
-        header, data = GD_TABLE_HEIGHTS_BY_CAPTION.get(key, (397, 397))
-        for position, row in enumerate(table.rows):
-            row.height = Emu(int(header if position == 0 else data) * 635)
-            row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
+        rule = (WD_ROW_HEIGHT_RULE.EXACTLY if GD_ROW_HEIGHT_RULE == "exact"
+                else WD_ROW_HEIGHT_RULE.AT_LEAST)
+        for row in table.rows:
+            row.height = Emu(GD_ROW_HEIGHT_TWIPS * 635)
+            row.height_rule = rule
         applied += 1
     return applied
 
@@ -5669,6 +5833,72 @@ GD_TABLE_HEIGHTS_BY_CAPTION = {
 }
 
 
+# P4-3：合格率图片在文档中的固定尺寸（宽 15cm × 高 7.5cm = 2:1）与 PNG 出图尺寸。
+GD_PICTURE_WIDTH_CM = 15.0
+GD_PICTURE_HEIGHT_CM = 7.5
+GD_CHART_FIGSIZE = (10.0, 5.0)      # matplotlib 英寸 = 25.4cm 换算，比例与文档一致（2:1）
+GD_CHART_DPI = 150                  # 10in × 150dpi = 1500 × 750 px
+# P4-5：图片边框 = 主题色「白色，深色 15%」；Word 的主题色变体用 lumMod 表达。
+GD_BORDER_THEME_LUM_MOD = "85000"   # 深色 15% → 白底亮度 ×0.85 = #D9D9D9（**不带 lumOff**）
+GD_BORDER_RGB = "D9D9D9"           # 主题色变体不可用时的同色退化值
+GD_BORDER_WIDTH_EMU = 12700         # 1 磅 = 12700 EMU
+
+
+def _unlock_picture_aspect(shape):
+    """P4-3：`noChangeAspect="0"` —— 允许 15cm×7.5cm 非等比拉伸（纵横比不锁定）。
+
+    python-docx 的 `add_picture` 把锁写在 `wp:cNvGraphicFramePr/a:graphicFrameLocks`
+    （不是 `pic:cNvPicPr/picLocks`），两处都改，谁在起作用算谁。
+    """
+    try:
+        for locks in shape._inline.xpath(".//a:graphicFrameLocks | .//a:picLocks"):
+            locks.set("noChangeAspect", "0")
+    except Exception:
+        pass
+    return shape
+
+
+def _picture_border(shape, theme=True):
+    """P4-5：图片外边框 1 磅实线，颜色 = 主题白「深色 15%」(#D9D9D9)。
+
+    `theme=True` 写 `<a:schemeClr val="bg1"><a:lumMod/><a:lumOff/>`（Word 主题色变体，
+    跟主题走）；`theme=False` 退化为 `<a:srgbClr val="D9D9D9">`（同色 RGB，写死）。
+    返回实际生效的写法（"theme" / "rgb" / "none"），供报告如实注明。
+    """
+    from docx.oxml import OxmlElement
+    a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    try:
+        sp_pr = shape._inline.graphic.graphicData.pic.spPr
+        for old in sp_pr.findall(a + "ln"):
+            sp_pr.remove(old)
+        line = OxmlElement("a:ln")
+        line.set("w", str(GD_BORDER_WIDTH_EMU))
+        line.set("cap", "flat")
+        line.set("cmpd", "sng")
+        line.set("algn", "ctr")
+        fill = OxmlElement("a:solidFill")
+        if theme:
+            color = OxmlElement("a:schemeClr")
+            color.set("val", "bg1")
+            # P4-5：白「深色 15%」= 白 × 0.85 = #D9D9D9。
+            # 只写 lumMod，**不能**再叠 lumOff：DrawingML 的变换是 L' = L×lumMod + lumOff，
+            # 0.85 + 0.15 = 1.0 → 渲染成纯白（Word 实测确认过，边框会消失）。
+            color.append(OxmlElement("a:lumMod"))
+            color[-1].set("val", GD_BORDER_THEME_LUM_MOD)
+        else:
+            color = OxmlElement("a:srgbClr")
+            color.set("val", GD_BORDER_RGB)
+        fill.append(color)
+        dash = OxmlElement("a:prstDash")
+        dash.set("val", "solid")
+        line.append(fill)
+        line.append(dash)
+        sp_pr.append(line)
+        return "theme" if theme else "rgb"
+    except Exception:
+        return "none"
+
+
 class GuangdongChapterWriter:
     @classmethod
     def _format_config(cls):
@@ -5691,15 +5921,48 @@ class GuangdongChapterWriter:
         return text if text.endswith("段") or text == "—" else text + "段"
 
     @staticmethod
-    def _picture(doc, path, width):
-        """插图统一居中、无缩进。直接 add_picture 会继承正文首行缩进把图片右推。"""
+    def _format_figure_paragraph(paragraph):
+        """插图段落版式的**唯一**入口：居中、无缩进、段前 12 磅/段后 3 磅（P4-3/P4-13）。
+
+        P3-1/P3-4：`_picture`（PNG）与 `_chart_anchor`（OOXML 锚点）建段时都调它，
+        `_format_all_run_fonts` 收尾再兜一遍 —— 收尾那遍是必须的，锚点段在注入前
+        没有 drawing，只靠建段时的设置会被后面的正文格式覆盖。
+        """
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.shared import Pt
         from backend import minimal_docx
-        paragraph = doc.add_paragraph()
-        paragraph.add_run().add_picture(str(path), width=width)
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         minimal_docx._clear_indent(paragraph)
+        paragraph.paragraph_format.space_before = Pt(12)     # P4-13
+        paragraph.paragraph_format.space_after = Pt(3)       # P4-13
         return paragraph
+
+    @staticmethod
+    def _picture(doc, path, width=None):
+        """插图统一居中、无首行缩进；P4-3 固定 15cm×7.5cm 且不锁定纵横比。
+
+        段前 12 磅、段后 3 磅（P4-13）。边框 = 主题白「深色 15%」(#D9D9D9)、1 磅、实线（P4-5），
+        写不进主题色变体时退化为同色 RGB（两者渲染一致，报告里注明用了哪种）。
+        """
+        from docx.shared import Cm
+        paragraph = doc.add_paragraph()
+        run = paragraph.add_run()
+        shape = run.add_picture(str(path), width=Cm(GD_PICTURE_WIDTH_CM), height=Cm(GD_PICTURE_HEIGHT_CM))
+        GuangdongChapterWriter._format_figure_paragraph(paragraph)
+        _unlock_picture_aspect(shape)                       # P4-3 lockAspectRatio=0
+        _picture_border(shape)                              # P4-5
+        return paragraph
+
+    @staticmethod
+    def _chart_anchor(doc, anchor):
+        """P4-Chart-Native：原生图表的占位锚点段。
+
+        版式与 `_picture` 逐项一致（居中、无首行缩进、段前 12 磅/段后 3 磅），注入时
+        Word 把图表插进**这一段**，所以最终成品的尺寸/居中/段距与旧 PNG 嵌图相同。
+        这里不设边框——图表的 #D9D9D9 细边框由 `_style_chart` 在图区上设。
+        """
+        paragraph = doc.add_paragraph(anchor)
+        return GuangdongChapterWriter._format_figure_paragraph(paragraph)
 
     @classmethod
     def _add_table(cls, doc, headers, rows, merge=None, vmerge=None, tail_merge=None):
@@ -6033,9 +6296,51 @@ class GuangdongChapterWriter:
         return f"{format_station(start_m)}-{format_station(end_m)}"
 
     @staticmethod
+    def _gd03_whole_range(start_m, end_m):
+        """P4-10：②表/清单表起止桩号按**整桩号**显示 —— 起点向下取整、终点向上取整。
+
+        `K2151+020-K2189+980` → `K2151-K2190`（用户原话「采用整桩号到整桩号显示」）。
+        入参是米；缺值写「—」。区间本身不因取整而变窄/变宽的语义问题由调用方承担
+        （②表是检测记录的实际跨度，整桩号只是显示口径）。
+        """
+        if start_m is None or end_m is None:
+            return "—"
+        low, high = sorted((float(start_m), float(end_m)))
+        return f"K{math.floor(low / 1000)}-K{math.ceil(high / 1000)}"
+
+    @staticmethod
     def _g03_km_range(km):
         """③表逐公里起止桩号：K407-K408（模板表 12/15/33/36 逐公里写法，不带米数）。"""
         return f"K{km}-K{km + 1}"
+
+    @classmethod
+    def _marking_long_run_sentence(cls, rows):
+        """P4f2-A：⑤⑥长连续路段结论句 —— 整公里窗口径，且**按实算结果**出句。
+
+        P4-6 曾把「共识别长连续不合格路段…明细见交安设施统计图表工作簿。」整句删掉后，
+        这里残留了一句写死的「未识别到…」，与工作簿里实有的长连续路段自相矛盾。
+        现在按 `marking_long_runs` 的实算条数出句（尾部不引工作簿，两处 0 残留口径不变）。
+        """
+        runs = GuangdongStatistics.marking_long_runs(rows)
+        tail = "整公里窗内不合格点数占比超过80%的长连续路段"
+        if not runs:
+            return f"未识别到{tail}。"
+        return f"共识别{tail}{len(runs)}处。"
+
+    @staticmethod
+    def _g03_route_chart(city, route_units, series_spec, totals):
+        """P4f2-B：②图（路段对比图）**最左**一列放「XX市合计」＝该市整体值（与①表该市行一致）。
+
+        P4-2 原本追加在末尾；用户指令改为挪到最左。柱值与配色不变，只是类目顺序对调
+        （`categories` 与每个 `series` 的取值同步前置，保证图上数值仍与②表逐行同源）。
+        `series_spec` = [(系列名, 取值函数, 颜色)]；`totals` = ①表该市行的同名字典。
+        返回 (categories, series)。
+        """
+        categories = [f"{city}合计"] + [f"{row['route']}{manager_display(row.get('manager'), city)}"
+                                        for row in route_units]
+        series = [(name, [pick(totals)] + [pick(row) for row in route_units], color)
+                  for name, pick, color in series_spec]
+        return categories, series
 
     @classmethod
     def _g03_km_manager(cls, rows, item, km, city=""):
@@ -6077,35 +6382,46 @@ class GuangdongChapterWriter:
 
     @classmethod
     def _g03_chart(cls, base, prefix, key, categories, series, ylabel="合格率（%）", kind="bar", rotation=0, value_fmt="%.1f", ylim=None, horizontal=False, scale=100.0):
-        path = Path(base) / f"{prefix}gd03_{key}.png"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        builder = gd03_bar_chart if kind == "bar" else gd03_line_chart
-        kwargs = dict(ylabel=ylabel, rotation=rotation, value_fmt=value_fmt)
-        if ylim is not None:
-            kwargs["ylim"] = ylim
-        if horizontal:
-            kwargs["horizontal"] = True
-        # 口径统一：合格率/缺失率传入的是 0–1 比率，默认换算为百分数（与附件图表单位一致）；计数类传 scale=1。
-        percent_series = [(name, [None if value is None else value * scale + 0.0 for value in values], color)
-                          for name, values, color in series]
-        try:
-            builder(str(path), categories, percent_series, **kwargs)
-        except Exception:
+        """P4-Chart-Native：登记一张待注入的 **Word 原生可编辑图表**，不再出 PNG。
+
+        类别与数值直接来自现有①/②表的同一批率值（不再经 matplotlib/CSV 推算），
+        `doc.save` 之后由 `backend.gd_native_chart.inject_charts` 依锚点顺序写进内嵌工作簿。
+        `base`/`prefix`/`key` 保留在签名里只为不打乱 6 个调用点，内容不再用于落盘。
+        口径统一：合格率/缺失率传入 0–1 比率，默认换算百分数（与附件图表单位一致）；计数类传 scale=1。
+
+        返回 :class:`ChartSpec`（`if chart:` 判定与旧约定一致——对象为真值）；
+        登记由 `_figure` 收进本次文档的局部列表，不走类级全局，避免多市并发互相串图。
+        """
+        from backend.gd_native_chart import ChartSpec
+        if not categories or not series:
             return None
-        return str(path)
+        spec = ChartSpec(categories=list(categories), series=list(series), ylabel=ylabel,
+                         kind=kind, ylim=ylim, value_fmt=value_fmt, horizontal=horizontal,
+                         rotation=rotation)
+        # P1-1：把每个值收敛成**表格将要打印的那一串数字**。
+        # 表格走 `_g03_num` = f"{v*scale:.{d}f}"（Python 按 IEEE754 实际值 + round-half-even），
+        # 而 Word/Excel 渲染 `c:numFmt` 走 half-away-from-zero —— 源值恰在 .x5 半分界时
+        # 两条路径会印出不同数字（34 点差 0.1，如表 49.0 / 图 49.1）。
+        # 这里先按表格的舍入定稿，cache、内嵌工作簿、图形、标签四处拿到的都是同一个值。
+        # `None` 是断点，必须原样保留（写成 0 会在图上凭空长出一根柱）。
+        digits = spec.decimals()
+        spec.series = [(name, [None if v is None else float(f"{v * scale:.{digits}f}") for v in values], color)
+                       for name, values, color in series]
+        return spec
 
     @classmethod
     def _marking_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city="", route_names=None,
                               inspection=None):
         heading = lambda text: cls._heading(doc, text, 5)
         route_names = route_names or {}
-        units = GuangdongStatistics.marking_units(rows)
-        if not units:
+        points = GuangdongStatistics.marking_points(rows)
+        if not points:
             heading("①总体情况")
             cls._body(doc, f"本次未读取到{category}标线逆反射亮度系数有效检测数据，该指标暂不评价。")
             return
-        overall = GuangdongStatistics.marking_overall(units)
-        route_units = GuangdongStatistics.marking_route_units(rows)
+        overall = GuangdongStatistics.marking_overall(points)
+        # P4-1：②表只列落进项目路线表路段的记录（未落段的仍计入①表全市，不摊派到②表任何一行）。
+        route_units = GuangdongStatistics.marking_route_units(gd_matched_rows(rows))
 
         heading("①总体情况")
         cls._body(doc, f"{city}抽检{'高速公路' if category == '高速公路' else '普通国省道'}主车道标线总体合格率为"
@@ -6115,8 +6431,8 @@ class GuangdongChapterWriter:
         # P1b：km 改由 gd_mileage 从清单表行求和（mileage 键 = 分组键），不再按检测单元数算。
         def _marking_group(subset, **km_key):
             # P1n-1：class_prefix 同时筛「检测记录子集」与里程口径，速率不再照抄全市值
-            subset_units = GuangdongStatistics.marking_units(gd_class_subset(subset, km_key.get("class_prefix")))
-            overall_sub = GuangdongStatistics.marking_overall(subset_units)
+            subset_points = GuangdongStatistics.marking_points(gd_class_subset(subset, km_key.get("class_prefix")))
+            overall_sub = GuangdongStatistics.marking_overall(subset_points)
             return {"km": gd_mileage(inspection, category=category, **km_key),
                     "overall": overall_sub["overall_rate"], "left": overall_sub["left_rate"],
                     "right": overall_sub["right_rate"]}
@@ -6169,7 +6485,10 @@ class GuangdongChapterWriter:
             headers[3] = "检测范围"
             headers[5:] = ["总体合格率(%)", "左侧合格率(%)", "右侧合格率(%)"]
         route_rows = [[row["route"], route_names.get(row["route"], "—"), manager_display(row.get("manager"), city),
-                       cls._gd03_range(row.get("start_m"), row.get("end_m")),
+                       cls._gd03_whole_range(*gd_inspection_range(          # P4f2-F：②表区间与清单表同源
+                           inspection, category=category, route=row["route"],
+                           direction=row.get("direction"), manager=row.get("manager"))
+                           or (row.get("start_m"), row.get("end_m"))),   # 无清单表行时回退检测记录跨度
                        gd_km_text(gd_mileage(inspection, category=category, route=row["route"],
                                              direction=row.get("direction"), manager=row.get("manager"))),
                        cls._g03_num(row["overall_rate"]), cls._g03_num(row["left_rate"]), cls._g03_num(row["right_rate"])]
@@ -6182,14 +6501,21 @@ class GuangdongChapterWriter:
               "高速公路各路段公司标线逆反射亮度系数合格率汇总表" if category == "高速公路"
               else "普通国省道各抽检路段标线逆反射亮度系数合格率汇总表",
               tail_merge={0: 4})
-        chart = cls._g03_chart(base, chart_prefix, f"marking_route_{category}",
-                               [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units],
-                               [("左侧标线", [row["left_rate"] for row in route_units], GD03_COLORS[0]),
-                                ("右侧标线", [row["right_rate"] for row in route_units], GD03_COLORS[1]),
-                                ("总体", [row["overall_rate"] for row in route_units], GD03_COLORS[2])])
+        # P4f2-E：②表/②图合计值 = ①表该市行（与①表必然一致），与可见行之和的差额在表下图下脚注披露。
+        # ①表该市行（`_route_totals`）与②表行（`route_units`）的键名不同，两边都取。
+        _cats, _series = cls._g03_route_chart(
+            city, route_units,
+            [("左侧标线", lambda r: r.get("left_rate", r.get("left")), GD03_COLORS[0]),
+             ("右侧标线", lambda r: r.get("right_rate", r.get("right")), GD03_COLORS[1]),
+             ("总体", lambda r: r.get("overall_rate", r.get("overall")), GD03_COLORS[2])],
+            _route_totals)
+        chart = cls._g03_chart(base, chart_prefix, f"marking_route_{category}", _cats, _series)
         if chart:
             figure(chart, "高速公路各路段公司标线逆反射亮度系数合格率对比图" if category == "高速公路"
                    else "普通国省道各抽检路段标线逆反射亮度系数合格率对比图")
+        # P4f2-E：②表/②图合计（=①表该市行）与可见行之和的差额脚注；差额为 0 的市不输出。
+        if note := gd_route_gap_note(inspection, route_units, rows, category):
+            cls._body(doc, note)
 
         if category == "高速公路":
             heading("③典型状况不佳路段及原因分析")
@@ -6199,7 +6525,7 @@ class GuangdongChapterWriter:
                 cls._body(doc, "未识别到标线合格率明显偏低的典型路段。")
             if typical:
                 # P1a（brief-v3 §5）：③表逐公里列明，一个典型段每个有检测数据的公里一行，
-                # 各行取该公里原始 100 m 单元复算值，不用段平均填充。
+                # 各行取该公里原始点位复算值，不用段平均填充。
                 table(["路线编号", "管养单位", "起止桩号", "总体合格率(%)", "左侧合格率(%)", "右侧合格率(%)"],
                       [[item["route"], cls._g03_km_manager(rows, item, km["km"], city),
                         cls._g03_km_range(km["km"]), cls._g03_num(km["overall_rate"]),
@@ -6210,21 +6536,22 @@ class GuangdongChapterWriter:
                 # P1b P3：模板逐字为 `1）S51下行K162+000-K142+000段`，`下行` 后无空格。
                 seg = f"{item['route']}{item['direction']}{cls._gd03_range(item['start_m'], item['end_m'])}"
                 cls._typical_segment_heading(doc, f"{index}）{seg}段")
+                # P4f2-A：点级口径 —— 区间内合格点数 ÷ 区间实际点位数。
+                # 用户 2026-09-28：统一为**合格率**表述、数值不反转（与①②③表列名「合格率(%)」一致）。
+                # 要回退成「不合格率」：这两处改回 `1 - x` 并把「合格率」四字换回「不合格率」。
                 cls._body(doc, f"该路段由{manager_display(cls._manager_for_km(rows, item, city), city)}管养，"
-                               f"标线100米计算单元总体合格率仅{cls._g03_rate(item['average'])}，"
-                               f"左侧{cls._g03_rate(item['left_rate'])}、右侧{cls._g03_rate(item['right_rate'])}。"
+                               f"该区间标线总体合格率为{cls._g03_rate(item['average'])}，"
+                               f"左侧{cls._g03_rate(item['left_rate'])}、"
+                               f"右侧{cls._g03_rate(item['right_rate'])}。"
                                + gd_km_detail(item))
                 cls._body(doc, "原因分析：该路段标线逆反射亮度系数偏低，主要受路面标线自然磨耗、车辆轮迹带污染、"
                                "重载交通渠化作用及标线施划年限较长等因素影响，需现场复核标线磨损与污染状况。")
                 # D16/Q1：模板无「典型状况不佳路段标线合格率分布图」，逐公里明细入工作簿「标线典型路段逐公里」表
             # D16/Q1：模板无「长连续不合格路段清单」表与「长连续路段分布图」，正文只留结论，
             # 明细与分档数据写进交安设施统计图表工作簿「标线长连续不合格」表。
-            runs = GuangdongStatistics.marking_long_runs(rows)
-            if runs:
-                cls._body(doc, f"共识别长连续不合格路段{len(runs)}处，最长{max(row['length_km'] for row in runs):.2f}公里，"
-                               "建议纳入现场复核与处治计划，明细见交安设施统计图表工作簿。")
-            else:
-                cls._body(doc, "未识别到100米基准下3公里窗口不合格率超过80%的长连续路段。")
+            # P4-6：用户要求删除「共识别长连续不合格路段…明细见交安设施统计图表工作簿。」整句；
+            # P4f2-A：长连续句改为**整公里窗口径**并按实算条数出句（不再写死「未识别到」）。
+            cls._body(doc, cls._marking_long_run_sentence(rows))
         else:
             heading("③典型状况不佳路段及原因分析")
             cls._body(doc, "根据抽检路段每公里合格率评定明细结果，筛查左侧或右侧标线合格率小于20%的路段，并对其中长连续的标线逆反射亮度系数典型状况不佳路段进行统计分析。")
@@ -6242,16 +6569,14 @@ class GuangdongChapterWriter:
                 seg = f"{item['route']}{item['direction']}{cls._gd03_range(item['start_m'], item['end_m'])}"
                 cls._typical_segment_heading(doc, f"{index}）{seg}段")
                 cls._body(doc, f"该路段由{manager_display(cls._manager_for_km(rows, item, city), city)}管养，"
-                               f"标线100米计算单元总体合格率仅{cls._g03_rate(item['average'])}，"
-                               f"左侧{cls._g03_rate(item['left_rate'])}、右侧{cls._g03_rate(item['right_rate'])}。"
+                               f"该区间标线总体合格率为{cls._g03_rate(item['average'])}，"
+                               f"左侧{cls._g03_rate(item['left_rate'])}、"
+                               f"右侧{cls._g03_rate(item['right_rate'])}。"
                                + gd_km_detail(item))
                 cls._body(doc, "原因分析：标线逆反射亮度系数偏低主要与标线磨耗、污染及施划年限有关，建议现场复核。")
             # D16/Q1：同高速分支，删表删图，数据入工作簿「标线长连续不合格」表
-            runs = GuangdongStatistics.marking_long_runs(rows)
-            if runs:
-                cls._body(doc, f"共识别长连续不合格路段{len(runs)}处，建议纳入现场复核与处治计划，明细见交安设施统计图表工作簿。")
-            else:
-                cls._body(doc, "未识别到100米基准下3公里窗口不合格率超过80%的长连续路段。")
+            # P4f2-A：同高速分支，整公里窗口径 + 按实算条数出句。
+            cls._body(doc, cls._marking_long_run_sentence(rows))
 
     @classmethod
     def _height_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city="", route_names=None,
@@ -6263,7 +6588,8 @@ class GuangdongChapterWriter:
             cls._body(doc, f"本次未读取到{category}波形梁护栏中心高度有效检测数据，该指标暂不评价。")
             return
         stats = GuangdongStatistics.height_overall(rows)
-        route_units = GuangdongStatistics.height_route_units(rows)
+        # P4-1：②表只列落进项目路线表路段的记录（未落段的仍计入①表全市，不摊派到②表任何一行）。
+        route_units = GuangdongStatistics.height_route_units(gd_matched_rows(rows))
         heading("①总体情况")
         cls._body(doc, f"{city}抽检{'高速公路' if category == '高速公路' else '普通国省道'}波形梁护栏中心高度总体合格率为"
                        f"{cls._g03_num(stats['rate'])}%，其中两波护栏合格率{cls._g03_num(stats['二波']['rate'])}%，"
@@ -6319,7 +6645,10 @@ class GuangdongChapterWriter:
             # 模板-1 分支差异逐字照抄：普通分支该三列列头不带括号
             height_headers[5:] = ["总体合格率%", "两波合格率%", "三波合格率%"]
         height_rows = [[row["route"], route_names.get(row["route"], "—"), manager_display(row.get("manager"), city),
-                        cls._gd03_range(row.get("start_m"), row.get("end_m")),
+                        cls._gd03_whole_range(*gd_inspection_range(         # P4f2-F：②表区间与清单表同源
+                            inspection, category=category, route=row["route"],
+                            direction=row.get("direction"), manager=row.get("manager"))
+                            or (row.get("start_m"), row.get("end_m"))),  # 无清单表行时回退检测记录跨度
                         gd_km_text(gd_mileage(inspection, category=category, route=row["route"],
                                               direction=row.get("direction"), manager=row.get("manager"))),
                         cls._g03_num(row["rate"]), cls._g03_num(row["二波"]["rate"]), cls._g03_num(row["三波"]["rate"])]
@@ -6332,14 +6661,21 @@ class GuangdongChapterWriter:
               "高速公路各路段公司波形梁护栏中心高度合格率汇总表" if category == "高速公路"
               else "普通国省道各抽检路段波形梁护栏中心高度合格率汇总表",
               tail_merge={0: 4})
-        chart = cls._g03_chart(base, chart_prefix, f"height_route_{category}",
-                               [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units],
-                               [("二波护栏", [row["二波"]["rate"] for row in route_units], GD03_COLORS[0]),
-                                ("三波护栏", [row["三波"]["rate"] for row in route_units], GD03_COLORS[1]),
-                                ("总体", [row["rate"] for row in route_units], GD03_COLORS[2])])
+        # P4-2：②图末尾追加「XX市合计」列（值取①表该市行，与①表必然一致）
+        # ①表该市行（`_height_totals`）与②表行（`route_units`）的键名不同，两边都取。
+        _cats, _series = cls._g03_route_chart(
+            city, route_units,
+            [("二波护栏", lambda r: r["二波"]["rate"] if "二波" in r else r.get("two"), GD03_COLORS[0]),
+             ("三波护栏", lambda r: r["三波"]["rate"] if "三波" in r else r.get("three"), GD03_COLORS[1]),
+             ("总体", lambda r: r.get("rate", r.get("overall")), GD03_COLORS[2])],
+            _height_totals)
+        chart = cls._g03_chart(base, chart_prefix, f"height_route_{category}", _cats, _series)
         if chart:
             figure(chart, "高速公路各路段公司波形梁护栏中心高度合格率对比" if category == "高速公路"
                    else "普通国省道波形梁护栏中心高度合格率对比图")
+        # P4f2-E：②表/②图合计与可见行之和的差额脚注（差额为 0 的市不输出）。
+        if note := gd_route_gap_note(inspection, route_units, rows, category):
+            cls._body(doc, note)
 
         if category == "高速公路":
             heading("③典型状况不佳路段及原因分析")
@@ -6368,12 +6704,10 @@ class GuangdongChapterWriter:
                                "建议结合路面结构与立柱埋深现场核查后实施抬升、调整或更换。")
             # D16/Q1：模板无「超10cm长连续路段清单」表与「最低公里段分布图」，
             # 正文只留结论，明细与逐公里分档入工作簿「高度超10cm长连续」「高度最低公里段」表
-            runs = GuangdongStatistics.height_over10_runs(rows)
-            if runs:
-                cls._body(doc, f"共识别整公里偏差超过10 cm占比大于5%的长连续路段{len(runs)}处，"
-                               "建议结合路面结构与立柱埋深核查后处治，明细见交安设施统计图表工作簿。")
-            else:
-                cls._body(doc, "未识别到整公里偏差超过10 cm占比大于5%的长连续路段。")
+            # P4f2-C：用户指令删除「共识别整公里偏差超过10 cm占比大于5%的长连续路段…」整句
+            # （含「明细见交安设施统计图表工作簿。」尾串），15 市 0 残留。
+            # 引擎内 `height_over10_runs` 计算与工作簿「高度超10cm长连续」表**照旧保留**，信息不丢。
+            GuangdongStatistics.height_over10_runs(rows)
         else:
             heading("③典型状况不佳路段及原因分析")
             cls._body(doc, "根据抽检路段每公里合格率评定明细结果，筛查整体波形梁护栏中心高度合格率小于50%的路段，并对其中长连续的波形梁护栏中心高度典型状况不佳路段进行统计分析。")
@@ -6397,12 +6731,8 @@ class GuangdongChapterWriter:
                                + gd_gtype_note(item.get("gtype")))
                 cls._body(doc, "原因分析：护栏中心高度偏差与路面加铺、路缘石及立柱埋深等因素有关，建议现场核查。")
             # D16/Q1：同高速分支
-            runs = GuangdongStatistics.height_over10_runs(rows)
-            if runs:
-                cls._body(doc, f"共识别整公里偏差超过10 cm占比大于5%的长连续路段{len(runs)}处，"
-                               "建议现场核查后处治，明细见交安设施统计图表工作簿。")
-            else:
-                cls._body(doc, "未识别到整公里偏差超过10 cm占比大于5%的长连续路段。")
+            # P4f2-C：同高速分支，删除同类句；引擎计算与工作簿表保留。
+            GuangdongStatistics.height_over10_runs(rows)
 
     @classmethod
     def _bolt_gd03_section(cls, doc, category, rows, table, figure, base, chart_prefix, city="", route_names=None,
@@ -6414,7 +6744,8 @@ class GuangdongChapterWriter:
             cls._body(doc, f"本次未读取到{category}波形梁护栏螺栓有效检测数据，该指标暂不评价。")
             return
         stats = GuangdongStatistics.bolt_overall(rows)
-        route_units = GuangdongStatistics.bolt_route_units(rows)
+        # P4-1：②表只列落进项目路线表路段的记录（未落段的仍计入①表全市，不摊派到②表任何一行）。
+        route_units = GuangdongStatistics.bolt_route_units(gd_matched_rows(rows))
         heading("①总体情况")
         cls._body(doc, f"{city}抽检{'高速公路' if category == '高速公路' else '普通国省道'}路侧波形梁护栏螺栓总体缺失率为"
                        f"{cls._g03_num(stats['rate'], 2)}%，其中拼接螺栓缺失率{cls._g03_num(stats['splice_rate'], 2)}%，"
@@ -6474,7 +6805,10 @@ class GuangdongChapterWriter:
             # 模板-1 分支差异逐字照抄：普通分支为全角括号版（`里程（Km)` 右括号半角，照抄模板）
             bolt_headers[4:] = ["里程（Km)", "总体缺失率（%）", "拼接缺失率（%）", "连接缺失率（%）"]
         bolt_rows = [[row["route"], route_names.get(row["route"], "—"), manager_display(row.get("manager"), city),
-                      cls._gd03_range(row.get("start_m"), row.get("end_m")),
+                      cls._gd03_whole_range(*gd_inspection_range(          # P4f2-F：②表区间与清单表同源
+                          inspection, category=category, route=row["route"],
+                          direction=row.get("direction"), manager=row.get("manager"))
+                          or (row.get("start_m"), row.get("end_m"))),   # 无清单表行时回退检测记录跨度
                       gd_km_text(gd_mileage(inspection, category=category, route=row["route"],
                                             direction=row.get("direction"), manager=row.get("manager"))),
                       cls._g03_num(row["rate"], 2), cls._g03_num(row["splice_rate"], 2), cls._g03_num(row["conn_rate"], 2)]
@@ -6487,15 +6821,23 @@ class GuangdongChapterWriter:
               "高速公路各路段公司螺栓缺失率汇总表" if category == "高速公路"
               else "普通国省道各路段公司螺栓缺失率汇总表",
               tail_merge={0: 4})
-        chart = cls._g03_chart(base, chart_prefix, f"bolt_route_{category}",
-                               [f"{row['route']}{manager_display(row.get('manager'), city)}" for row in route_units],
-                               [("拼接", [row["splice_rate"] for row in route_units], GD03_COLORS[0]),
-                                ("连接", [row["conn_rate"] for row in route_units], GD03_COLORS[1]),
-                                ("总体", [row["rate"] for row in route_units], GD03_COLORS[2])],
-                               ylabel="螺栓缺失率（%）", ylim=(0, max(10.0, max((row["rate"] or 0) * 100 * 1.1 for row in route_units))), value_fmt="%.2f")
+        # P4-2：②图末尾追加「XX市合计」列（值取①表该市行，与①表必然一致）
+        # ①表该市行（`_bolt_totals`）与②表行（`route_units`）的键名不同，两边都取。
+        _cats, _series = cls._g03_route_chart(
+            city, route_units,
+            [("拼接", lambda r: r.get("splice_rate", r.get("splice")), GD03_COLORS[0]),
+             ("连接", lambda r: r.get("conn_rate", r.get("conn")), GD03_COLORS[1]),
+             ("总体", lambda r: r.get("rate", r.get("overall")), GD03_COLORS[2])],
+            _bolt_totals)
+        chart = cls._g03_chart(base, chart_prefix, f"bolt_route_{category}", _cats, _series,
+                               ylabel="螺栓缺失率（%）",
+                               ylim=(0, max(10.0, max((row["rate"] or 0) * 100 * 1.1 for row in route_units))), value_fmt="%.2f")
         if chart:
             figure(chart, "高速公路各路段公司波形梁护栏螺栓缺失率对比图" if category == "高速公路"
                    else "普通国省道各路段波形梁护栏螺栓缺失率对比图")
+        # P4f2-E：②表/②图合计与可见行之和的差额脚注（差额为 0 的市不输出）。
+        if note := gd_route_gap_note(inspection, route_units, rows, category):
+            cls._body(doc, note)
 
         if category == "高速公路":
             heading("③典型状况不佳路段及原因分析")
@@ -6575,6 +6917,14 @@ class GuangdongChapterWriter:
             if value is None: return "—"
             return f"{value:+.{digits}f}" if sign else f"{value:.{digits}f}"
 
+        # P4-11：标线逆反射测值保留 1 位小数；护栏中心高度只保留整数（四舍五入）。
+        # 合格率/缺失率列**不动**（brief-v4 §1「维持 1 位小数不变」，口径与显示均保持原样）。
+        def _marking_measure(value):
+            return _num(value, 1)
+
+        def _height_measure(value):
+            return "—" if value is None else f"{float(value):.0f}"
+
         def _int(value):
             return "—" if value is None else f"{int(value)}"
 
@@ -6607,22 +6957,17 @@ class GuangdongChapterWriter:
                        f"波形梁护栏中心高度（{counts['height']}个路段）和螺栓缺失情况（{counts['bolt']}个路段）的"
                        "人工检测复核结果与自动化检测结果，排除极个别路段在人工复核前进行局部养护处治导致结果发生变化的特殊情况，"
                        "总体而言，人工复核数据与自动化检测结果具有良好的一致性。各指标明细对比情况详见下表。")
-        # 口径说明：标线/高度一致性 = 两侧合格判定是否相同（不再用测值偏差/允许偏差阈值）；螺栓按缺失数量差值
-        bolt_limit = thresholds.get("bolt", GD_BOLT_DIFF_THRESHOLD)
-        cls._body(doc, "说明：本表“结果一致性”对标线逆反射亮度系数、波形梁护栏中心高度只比较人工复核与自动化检测两侧的合格判定结果，"
-                       "同为合格或同为不合格记为一致，一合格一不合格记为不一致；任一侧合格判定无法确定时记为“—”，不参与一致性占比统计。"
-                       "合格判定按设施标准执行：标线逆反射亮度系数以该颜色目标值为限（白色80、黄色50），"
-                       "波形梁护栏中心高度按护栏型式取合格值（三波697±20mm、两波/双波600±20mm）。"
-                       f"波形梁护栏螺栓缺失对比表没有合格判定列，改按人工与自动化两侧缺失数量的差值判定："
-                       f"差值小于{bolt_limit:g}记为一致，不小于该值记为不一致。")
+        # P4-9：用户要求删除（4）人工复核对比情况里的「说明：XXX」整段，15 市 0 残留。
+        # 口径本身（一致性怎么判）不变 —— `gd_consistent` / `gd_pass` 仍是唯一判定出口，
+        # 删除的只是把口径复述一遍的说明文字。
 
         marking = groups["marking"]
         if marking:
             table(["路线编号", "桩号区段", "标线颜色", "人工检测复核结果", "测值", "合格判定",
                    "自动化检测结果", "测值", "合格判定", "结果一致性"],
                   [[row.get("route") or "—", row.get("segment") or "—", gd_marking_color(row, marking_rows),
-                    _num(row.get("manual")), _judge("marking", row.get("manual")),
-                    _num(row.get("automatic")), _judge("marking", row.get("automatic")), _consistent(row)]
+                    _marking_measure(row.get("manual")), _judge("marking", row.get("manual")),
+                    _marking_measure(row.get("automatic")), _judge("marking", row.get("automatic")), _consistent(row)]
                    for row in marking],
                   f"{category}标线逆反射亮度系数人工复核对比明细表",
                   merge={3: ("人工检测复核结果", 3), 6: ("自动化检测结果", 3)})
@@ -6640,8 +6985,8 @@ class GuangdongChapterWriter:
             table(["路线编号", "桩号区段", "护栏类型", "合格值(mm)", "人工检测复核结果", "测值", "合格判定",
                    "自动化检测结果", "测值", "合格判定", "结果一致性"],
                   [[row.get("route") or "—", row.get("segment") or "—", _gtype_short(row.get("gtype")),
-                    _height_grade(row.get("gtype")), _num(row.get("manual")),
-                    _judge("height", row.get("manual"), row.get("gtype")), _num(row.get("automatic")),
+                    _height_grade(row.get("gtype")), _height_measure(row.get("manual")),
+                    _judge("height", row.get("manual"), row.get("gtype")), _height_measure(row.get("automatic")),
                     _judge("height", row.get("automatic"), row.get("gtype")), _consistent(row)]
                    for row in height],
                   f"{category}波形梁护栏中心高度人工复核对比明细表",
@@ -6802,6 +7147,7 @@ class GuangdongChapterWriter:
     def _format_all_run_fonts(cls, doc):
         from docx.oxml.ns import qn
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from backend import gd_native_chart
         from backend import minimal_docx
         format_config = cls._format_config()
         main_prefix = "五、交通安全设施技术状况检测评价"
@@ -6811,6 +7157,13 @@ class GuangdongChapterWriter:
             level = cls._outline_level(paragraph)
             is_main = text.startswith(main_prefix)
             is_heading = is_main or level is not None or style.startswith("Heading")
+            # P3-1/P3-4：图表锚点段在本函数跑的时候**还没有 drawing**（`save_with_charts` 在
+            # `doc.save` 之后才注入），只有一段 `@@GDCHART0001@@` 文本——旧判定只看 drawing/pict，
+            # 于是它掉进正文分支，被套上首行缩进 480 + 两端对齐 + 段距归零，图整体右移。
+            # `_picture`（PNG 路径）不受影响是因为它当场就插了真 drawing。
+            is_figure = bool(paragraph._p.findall(".//" + qn("w:drawing"))
+                             or paragraph._p.findall(".//" + qn("w:pict"))
+                             or text.startswith(gd_native_chart.ANCHOR_PREFIX))
             if style == "Caption":
                 cls._format_chart_caption(paragraph)
             elif style == "TOC Heading":
@@ -6819,10 +7172,9 @@ class GuangdongChapterWriter:
                     minimal_docx._apply_run(run, format_config["heading"]["1"])
             elif is_heading:
                 cls._apply_heading_format(paragraph, level or 1, main_title=is_main)
-            elif paragraph._p.findall(".//" + qn("w:drawing")) or paragraph._p.findall(".//" + qn("w:pict")):
-                # 图片段落不是正文：套用正文格式会加回首行缩进并改成两端对齐，把插图推右
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                minimal_docx._clear_indent(paragraph)
+            elif is_figure:
+                # 图片/图表段落不是正文：套用正文格式会加回首行缩进并改成两端对齐，把插图推右
+                cls._format_figure_paragraph(paragraph)
             else:
                 minimal_docx._apply_paragraph(paragraph, format_config["body"])
                 for run in paragraph.runs:
@@ -6985,7 +7337,7 @@ class GuangdongChapterWriter:
                 media_path = (template.parent / caption).resolve()
                 if media_path.is_file():
                     try:
-                        cls._picture(doc, media_path, Pt(380))
+                        cls._picture(doc, media_path)
                     except Exception:
                         pass
             except Exception:
@@ -7013,12 +7365,17 @@ class GuangdongChapterWriter:
 
             km_totals[row["category"]] = km_totals.get(row["category"], 0.0) + row["length_km"]
 
-        # P1b：经营主体按附件原值定（A1 §6.1 P0→P4，用本行起止桩号消歧），判不出写 None 走「—」，不猜。
+        # P4-1：经营主体直接取项目路线表该行的「经营主体」列 —— ①表非省/省两行 = 路线表
+        # 逐段求和（`经营主体=非集团`→非省、`集团`→省），不再经附件基础信息表消歧。
+        # 表内没有该列的行（明细聚合后备口径）才回退 P1b 的附件匹配，行为逐值不变。
         route_index = bundle.get("route_index")
         owner_for = getattr(route_index, "owner_for", None)
         for row in inspection:
-            row["owner"] = (owner_for(city, row.get("route"), row.get("start"), row.get("end"),
-                                      row.get("manager")) if owner_for else None) or None
+            if row.get("owner") in (GD_OWNER_PROVINCIAL, GD_OWNER_NON_PROVINCIAL):
+                continue                       # 项目路线表已核定，无需再判
+            row["owner"] = row.get("owner") or (
+                owner_for(city, row.get("route"), row.get("start"), row.get("end"),
+                          row.get("manager")) if owner_for else None) or None
         # P1h：分类表标「跨主体」的行，一行抽检里程横跨两个主体，单值装不下 → ①表两侧都漏、
         # 出现「非集团+集团 < 全市」的差额。按 A1 §6.1 的 P2 桩号区间把这行拆到两侧
         # （附件覆盖不到的尾段用 P3 管养单位），拆不干净就不拆，仍如实报差额。
@@ -7121,6 +7478,8 @@ class GuangdongChapterWriter:
             apply_marking_superscripts(_paragraph)
         chapter_no = 5
         caption_counts={"figure":0,"table":0}
+        after_figure=[False]        # P4-8：上一元素是不是图（图后紧跟表格时插空段）
+        native_charts=[]            # P4-Chart-Native：本次文档待注入的原生图表（按插入顺序）
 
         def _caption(kind,title):
             caption_counts[kind]+=1
@@ -7130,23 +7489,51 @@ class GuangdongChapterWriter:
             cls._format_chart_caption(cap)
 
         def _table(headers,rows,title,merge=None,vmerge=None,tail_merge=None):
+            # P4-8：图片与表格之间空一行。只在图后插（表格之间不插，否则整篇多出成堆空行）。
+            if after_figure[0]:
+                doc.add_paragraph()
+                after_figure[0]=False
             _caption("table",title)
             return cls._add_table(doc,headers,rows,merge=merge,vmerge=vmerge,tail_merge=tail_merge)
 
-        def _figure(path,title):
-            cls._picture(doc, path, Pt(440))
+        def _figure(chart,title):
+            """P4-Chart-Native：`chart` 是 `ChartSpec` → 写锚点段，交给 Word COM 换成原生图表。
+
+            锚点段沿用 `_picture` 的全部版式（居中、无首行缩进、段前 12pt/段后 3pt），
+            注入时图表落进这一段，所以尺寸/居中/段距与旧的 PNG 嵌图完全一致。
+            仍兼容旧的图片路径入参（`chart` 是 str）——模板骨架照片走 `_skeleton_picture`，不经这里。
+            """
+            from backend import gd_native_chart
+            if isinstance(chart, gd_native_chart.ChartSpec):
+                chart.anchor = gd_native_chart.build_anchor(len(native_charts) + 1)
+                cls._chart_anchor(doc, chart.anchor)
+                native_charts.append(chart)
+            else:
+                cls._picture(doc, chart)      # P4-3/P4-4/P4-5/P4-13 全部在 _picture 内统一处理
             _caption("figure",title)
+            after_figure[0]=True        # P4-8
 
         route_names=_names
 
         if inspection:
-            def _gdk(value):
-                """D19：清单表 起点/终点桩号、段长 一律输出整数公里（四舍五入）。"""
-                return "—" if value is None else f"{int(float(value) + 0.5)}"
+            def _gdk(value, mode="round"):
+                """D19：清单表 段长 输出整数公里（四舍五入）。
+
+                P4-10：起点桩号向下取整、终点桩号向上取整（与②表 `_gd03_whole_range` 同口径）。
+                """
+                if value is None:
+                    return "—"
+                number = float(value)
+                if mode == "floor":
+                    return f"{math.floor(number)}"
+                if mode == "ceil":
+                    return f"{math.ceil(number)}"
+                return f"{int(number + 0.5)}"
 
             _table(["类型", "路线编号", "路线名称", "检测方向", "起点桩号", "终点桩号", "段长（Km)", "管养单位", "备注"],
                    [[gd_stacked_category(row["category"]), row["route"], route_names.get(row["route"], "—"),
-                     row["direction"] or "—", _gdk(row.get("start")), _gdk(row.get("end")), _gdk(row.get("length")),
+                     row["direction"] or "—", _gdk(row.get("start"), "floor"), _gdk(row.get("end"), "ceil"),
+                     _gdk(row.get("length")),
                      row.get("manager") or "—", row.get("remark") or "—"]
                     for row in inspection],
                    f"{city}交通安全设施抽检路段清单",
@@ -7171,11 +7558,22 @@ class GuangdongChapterWriter:
             cls._heading(doc,"（1）标线逆反射亮度系数情况",4)
             segment_sort_key=lambda row: tuple(str(row.get(field) or "") for field in ("route","direction","segment"))
             GuangdongStatistics.fill_managers(all_mark,all_height,all_bolt)
-            # C4：①/②/③ 表管养单位统一到路线分类表口径（与清单表、引言句同源；缺则「—」）
+            # C4：①/②/③ 表管养单位统一到项目路线表口径（与清单表、引言句同源）
             manager_lookup=gd_manager_lookup(inspection,city)
             all_mark=gd_route_managed_rows(all_mark,manager_lookup)
             all_height=gd_route_managed_rows(all_height,manager_lookup)
             all_bolt=gd_route_managed_rows(all_bolt,manager_lookup)
+            # P4-1：落不进项目路线表任何路段的记录 —— 仍计入①表全市（分母口径不变）、
+            # **不进②表**（禁摊派、禁按里程比例分摊）。条数与路线必须可查，故逐类打印。
+            if manager_lookup:
+                for _label, _rows in (("marking", all_mark), ("height", all_height), ("bolt", all_bolt)):
+                    _miss = defaultdict(int)
+                    for _r in _rows:
+                        if str(_r.get("manager") or "") == GD_UNASSIGNED:
+                            _miss[f"{_r.get('route') or '—'}/{_r.get('direction') or '—'}"] += 1
+                    if _miss:
+                        detail = "、".join(f"{k} {v}行" for k, v in sorted(_miss.items()))
+                        print(f"[未落段] {city}{category} {_label}={sum(_miss.values())}行：{detail}", flush=True)
             cls._marking_gd03_section(doc,category,all_mark,_table,_figure,base,chart_prefix,city,route_names,
                                       inspection=inspection)
 
@@ -7199,8 +7597,21 @@ class GuangdongChapterWriter:
         cls._format_all_run_fonts(doc)
         cls._apply_typical_heading_font(doc)
         folder=Path(output_dir)/city; folder.mkdir(parents=True,exist_ok=True); path=folder/f"{city}在役公路技术状况检测评价报告第五部分.docx"
-        try: doc.save(path)
-        except PermissionError as exc: raise PermissionError(f"Word文件被占用：{path}") from exc
+        # P4-Chart-OOXML：落盘 + 注入原生图表 + 逐图校验 + 原子替换，**全程不启动 Word/Excel**。
+        # 生成阶段零 Office（brief-v4 §3 用户最终选择方案 B）：c:chart / 内嵌 xlsx / 绘图锚点
+        # 由 `backend.gd_chart_ooxml` 直接在 DOCX 的 OPC 包里生成，用户在 Word 里仍可
+        # 「编辑数据」改内嵌数值。任一图校验不过就抛，旧的完整文件原封不动。
+        if native_charts:
+            from backend import gd_chart_ooxml
+            try:
+                gd_chart_ooxml.save_with_charts(
+                    doc, path, native_charts,
+                    width_cm=GD_PICTURE_WIDTH_CM, height_cm=GD_PICTURE_HEIGHT_CM,
+                    log=lambda text: print(text, flush=True))
+            except PermissionError as exc: raise PermissionError(f"Word文件被占用：{path}") from exc
+        else:
+            try: doc.save(path)
+            except PermissionError as exc: raise PermissionError(f"Word文件被占用：{path}") from exc
         return path
 
 
@@ -7460,8 +7871,12 @@ def split_manager_company(manager):
 def manager_display(manager, city=""):
     """表格/正文显示名：统一到路线分类表口径（与清单表一致），不做二次简写；缺值写 —。
     P2-5：T2c 已把①/②/③表分组键统一到路线表口径，T2f 把显示名也统一
-    （此前取二级公司/去地市前缀，导致同一实体在不同表出现两种写法）。"""
-    return str(manager or "").strip() or "—"
+    （此前取二级公司/去地市前缀，导致同一实体在不同表出现两种写法）。
+    P4f2-D：内部哨兵 `GD_UNASSIGNED`（明细桩号落不进项目路线表任何路段）在此**渲染为「—」**，
+    不再把内部占位符 `未落段` 泄到客户可见的③表/清单表。该行仍然保留（是不佳路段，删行丢信息）。
+    """
+    text = str(manager or "").strip()
+    return "—" if (not text or text == GD_UNASSIGNED) else text
 
 
 def _gd03_overall(left, right):
@@ -7481,55 +7896,64 @@ def _gd03_axes():
 
 
 def gd03_bar_chart(path, categories, series, ylabel="合格率（%）", ylim=(0, 100), rotation=0, value_fmt="%.1f", horizontal=False):
-    """GD03 分组柱状图（附件样式）：柱顶数据标签、水平网格线、图例右上带框、纵轴 0–100。"""
+    """GD03 分组柱状图（附件样式）：柱顶数据标签、水平网格线、图例右上带框、纵轴 0–100。
+
+    P4-3：出图 2:1（`GD_CHART_FIGSIZE` = 10in×5in @ `GD_CHART_DPI` 150 → 1500×750 px），
+    边距与图例压缩以提高绘图区占比；横向图同比例（宽 = 2×高），高度按类别数缩放。
+    """
     plt = _gd03_axes()
     if horizontal:
-        figure, axes = plt.subplots(figsize=(max(6.4, 3.2), max(3.0, 0.42 * len(categories) + 1.4)), dpi=160)
-        height = 0.8 / max(len(series), 1)
+        height = max(2.5, 0.32 * len(categories) + 1.0)
+        figure, axes = plt.subplots(figsize=(GD_CHART_FIGSIZE[0] * height / GD_CHART_FIGSIZE[1],
+                                              height), dpi=GD_CHART_DPI)
+        width = 0.8 / max(len(series), 1)
         for index, (name, values, color) in enumerate(series):
-            offsets = [position + (index - (len(series) - 1) / 2) * height for position in range(len(categories))]
+            offsets = [position + (index - (len(series) - 1) / 2) * width for position in range(len(categories))]
             bars = axes.barh(offsets, [float("nan") if value is None else float(value) for value in values],
-                             height=height * 0.9, label=name, color=color)
-            axes.bar_label(bars, fmt=value_fmt, fontsize=7, padding=1)
+                             height=width * 0.9, label=name, color=color)
+            axes.bar_label(bars, fmt=value_fmt, fontsize=6.5, padding=1)
         axes.set_yticks(range(len(categories)))
-        axes.set_yticklabels(categories, fontsize=8)
+        axes.set_yticklabels(categories, fontsize=7)
         axes.invert_yaxis()
         axes.set_xlim(*ylim)
-        axes.set_xlabel(ylabel, fontsize=9)
+        axes.set_xlabel(ylabel, fontsize=8)
         axes.grid(axis="x", color="#D9D9D9", linewidth=0.8)
         axes.set_axisbelow(True)
-        axes.legend(loc="lower right", frameon=True, fontsize=8)
+        axes.legend(loc="lower right", frameon=True, fontsize=7)
         for side in ("top", "right"):
             axes.spines[side].set_visible(False)
-        figure.tight_layout()
-        figure.savefig(path)
+        figure.subplots_adjust(left=0.20, right=0.99, top=0.97, bottom=0.10)   # P4-3 压缩边距
+        figure.savefig(path)          # 不加 bbox_inches="tight"：那会把 2:1 拉回标签实际范围
         plt.close(figure)
         return str(path)
-    figure, axes = plt.subplots(figsize=(max(6.4, 1.15 * len(categories) + 2.2), 3.8), dpi=160)
+    # P4-3：固定 2:1 画幅，宽度不随类别数增长（类别多时靠 45° 标签与自适应字号消化）
+    figure, axes = plt.subplots(figsize=GD_CHART_FIGSIZE, dpi=GD_CHART_DPI)
     width = 0.8 / max(len(series), 1)
+    _tick_size = 7 if len(categories) > 12 else 8
     for index, (name, values, color) in enumerate(series):
         offsets = [position + (index - (len(series) - 1) / 2) * width for position in range(len(categories))]
         bars = axes.bar(offsets, [float("nan") if value is None else float(value) for value in values],
                         width=width * 0.9, label=name, color=color)
-        axes.bar_label(bars, fmt=value_fmt, fontsize=7, padding=1)
+        axes.bar_label(bars, fmt=value_fmt, fontsize=6.5, padding=1)
     axes.set_xticks(range(len(categories)))
-    # P1c：② 图类别标签是「路线号+管养单位」（实测 8 类时长 20~27 字，rotation=0 时相邻标签
+    # P1c：② 图类别标签是「路线号+管养单位」（实测 8 类时长 20~27 字），rotation=0 时相邻标签
     # 压字到读不出）。Excel 图表会自动旋转长标签，matplotlib 不会 —— 这里按标签长度补旋转，
     # 内容一字不改。阈值 12：① 图标签 6~7 字（实测压字 0，保持横排）；② 图 20~27 字（必转）。
     _need_rotate = rotation or max((len(str(c)) for c in categories), default=0) > 12
-    axes.set_xticklabels(categories, rotation=45 if _need_rotate else 0, fontsize=8,
+    axes.set_xticklabels(categories, rotation=45 if _need_rotate else 0, fontsize=_tick_size,
                          ha="right" if _need_rotate else "center")
     axes.set_ylim(*ylim)
-    axes.set_ylabel(ylabel, fontsize=9)
+    axes.set_ylabel(ylabel, fontsize=8)
     axes.grid(axis="y", color="#D9D9D9", linewidth=0.8)
     axes.set_axisbelow(True)
-    axes.legend(loc="upper right", frameon=True, fontsize=8)
+    axes.legend(loc="upper right", frameon=True, fontsize=7)   # P4-3 压缩图例
     for side in ("top", "right"):
         axes.spines[side].set_visible(False)
-    figure.tight_layout()
-    # P1c：标签转 45° 后首尾两条会伸出画布被切（人眼实测 image2 左/右端「司」字缺字）。
-    # 与本文件其它图表函数一致用 bbox_inches="tight" 让 matplotlib 自算边界，图形内容不变。
-    figure.savefig(path, bbox_inches="tight", pad_inches=0.1)
+    # P4-3：手动边距取代 tight_layout，且**不**用 bbox_inches="tight" ——
+    # 后两者都会按标签实际范围重算画布，把 2:1 拉回去，图片尺寸就不可控了。
+    figure.subplots_adjust(left=0.075, right=0.99, top=0.94,
+                            bottom=0.34 if _need_rotate else 0.16)
+    figure.savefig(path)
     plt.close(figure)
     return str(path)
 
@@ -7621,9 +8045,17 @@ def write_guangdong_route_workbook_all(route_index, route_names, output_dir, log
 
 
 def write_guangdong_route_workbook(bundle, output_dir, log=lambda _: None):
-    """导出本市的路线分类表（补充路线名称），文件可直接作为后续「路线分类表」导入使用。"""
-    rows = list(bundle.get("route_rows") or [])
-    if not rows:
+    """导出本市的项目路线表（分段级），格式对齐附件《广东交安省检项目线路统计》。
+
+    P4-14：原导出件是 5 列「地市/路线编号/路线名称/道路类别/经营主体」的路线级汇总，
+    用户要求改为附件的**分段级**格式：地市/路线/方向/起止桩号/检测里程/管养单位/经营主体。
+    数据源即 `bundle["route_segments"]`（与清单表、①表、②表同源）；本市没有路段时返回
+    None（不产出空表），此时报告里程本就不是路线表口径，不会造成两套数并存。
+    """
+    segments = [row for row in (bundle.get("route_segments") or [])
+                if RouteCategoryIndex._norm_city(row.get("city"))
+                == RouteCategoryIndex._norm_city(bundle.get("city"))]
+    if not segments:
         return None
     import openpyxl
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -7632,35 +8064,35 @@ def write_guangdong_route_workbook(bundle, output_dir, log=lambda _: None):
     folder = Path(output_dir) / city
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{city}路线分类表.xlsx"
-    names = bundle.get("route_names") or {}
-    # P1b：第 5 列「经营主体」（任务书第 3 项）。值取 A1 §6.1 的 P0→P4 匹配结果，匹配不到写「缺失」；
-    # docx 内表格列不动（模板列固定，加列会破坏逐字对齐）。
-    route_index = bundle.get("route_index")
-    owner_for = getattr(route_index, "owner_for", None)
     book = openpyxl.Workbook()
     sheet = book.active
-    sheet.title = "路线分类表"
-    sheet.append(["地市", "路线编号", "路线名称", "道路类别", "经营主体"])
+    sheet.title = "项目路线表"
+    # P4-14：表头与附件分段级格式逐字对齐（检测里程列是「①表里程」的取数依据）。
+    sheet.append(["地市", "路线", "方向", "起点桩号", "终点桩号", "检测里程（km）", "管养单位", "经营主体"])
     for cell in sheet[1]:
         cell.font = Font(name="宋体", size=11, bold=True)
         cell.fill = PatternFill("solid", fgColor="D9D9D9")
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    owner_missing = []
-    for row in sorted(rows, key=lambda item: (str(item.get("category") or ""), str(item.get("route") or ""))):
-        # P1d-b 裁决：普通国省道在附件里没有分段，无权威来源，一律「缺失」，不写「非集团」。
-        owner = ((owner_for(row.get("city") or bundle.get("city"), row.get("route")) if owner_for else None)
-                 or "缺失")
-        if owner == "缺失":
-            owner_missing.append(f"{row.get('city') or bundle.get('city')}/{row.get('route')}")
-        sheet.append([row.get("city") or bundle.get("city"), row.get("route"),
-                      names.get(row.get("route"), ""), row.get("category"), owner])
-    for column, width in zip("ABCDE", (14, 16, 34, 16, 12)):
+    unknown = []
+    for row in sorted(segments, key=lambda item: (0 if item.get("category") == "高速公路" else 1,
+                                                  str(item.get("route") or ""), _float(item.get("start")) or 0.0)):
+        name = row.get("manager") or ""
+        if not name:
+            unknown.append(f"{row.get('route') or '—'}")
+        sheet.append([
+            row.get("city") or bundle.get("city"), row.get("route") or "",
+            normalize_direction(row.get("direction")) or "—",
+            format_station(row["start"] * 1000) if _float(row.get("start")) is not None else "—",
+            format_station(row["end"] * 1000) if _float(row.get("end")) is not None else "—",
+            _float(row.get("length")), name or "—",
+            # 普通国省道行附件本就没有经营主体，写「—」而非「非集团」（不推定）。
+            row.get("owner") or "—",
+        ])
+    for column, width in zip("ABCDEFGH", (12, 12, 8, 14, 14, 14, 40, 12)):
         sheet.column_dimensions[column].width = width
     book.save(path)
-    filled = len(rows) - len(owner_missing)
-    log(f"路线分类表已导出：{path}")
-    log(f"经营主体有值 {filled}/{len(rows)} 行；「缺失」{len(owner_missing)} 行"
-        + (f"：{'、'.join(owner_missing)}" if owner_missing else ""))
+    log(f"项目路线表（分段级）已导出：{path}（{len(segments)} 行）"
+        + (f"；管养单位缺失 {len(unknown)} 行：{'、'.join(unknown[:8])}" if unknown else ""))
     return path
 
 
@@ -7715,9 +8147,9 @@ def write_gd_removed_data_sheets(bundle, workbook):
         }))
 
     added = []
-    added.append(fill(new_sheet("标线长连续不合格", ["道路类别", "路线", "管养单位", "标线侧", "起止桩号", "长度（km）", "3 km窗口不合格率（%）"]),
+    added.append(fill(new_sheet("标线长连续不合格", ["道路类别", "路线", "管养单位", "标线侧", "起止桩号", "长度（km）", "检测点数（个）", "不合格点数占比（%）"]),
                       [[category, r["route"], manager_display(r.get("manager"), city), r["position_name"], span(r["start_m"], r["end_m"]),
-                        round(r["length_km"], 2), (r["fail_rate"] or 0) * 100]
+                        round(r["length_km"], 2), r.get("point_count"), (r["fail_rate"] or 0) * 100]
                        for category, group in groups for r in GuangdongStatistics.marking_long_runs(group["marking"])]))
 
     added.append(fill(new_sheet("高度超10cm长连续", ["道路类别", "路线", "方向", "管养单位", "公里区间", "长度（km）", "波形梁类型", "检测点数（个）", "超10cm占比（%）"]),
@@ -7730,9 +8162,9 @@ def write_gd_removed_data_sheets(bundle, workbook):
                         r.get("type"), span(r.get("start_m"), r.get("end_m")), r.get("manager"), r.get("reason")]
                        for r in bundle.get("weak_segments") or []]))
 
-    added.append(fill(new_sheet("标线典型路段逐公里", ["道路类别", "路线", "方向", "公里", "总体合格率(%)", "左侧合格率(%)", "右侧合格率(%)", "有效计算单元数"]),
+    added.append(fill(new_sheet("标线典型路段逐公里", ["道路类别", "路线", "方向", "公里", "总体合格率(%)", "左侧合格率(%)", "右侧合格率(%)", "有效检测点数"]),
                       [[category, item["route"], item["direction"], r["km"], (r["overall_rate"] or 0) * 100,
-                        (r["left_rate"] or 0) * 100, (r["right_rate"] or 0) * 100, r["unit_count"]]
+                        (r["left_rate"] or 0) * 100, (r["right_rate"] or 0) * 100, r["point_count"]]
                        for category, group in groups
                        for item in GuangdongStatistics.marking_typical_segments(group["marking"], limit=3)
                        for r in item["km_items"]]))
@@ -8273,8 +8705,18 @@ def run_guangdong_project(config, log=lambda _x: None):
         log(f"无法判定道路类别的记录 {unknown_rows} 行（记入对应市 issues，报告未中断）：{detail}")
     else:
         log("无法判定道路类别的记录 0 行")
-    route_segments=load_route_segments(config.route_xlsx)
-    if route_segments: log(f"路线表起止桩号读取完成：{config.route_xlsx}（{len(route_segments)}个抽检路段）")
+    # P4-1：项目路线表升级为一级数据源（分段/里程/管养单位/经营主体）。
+    # 显式路径 → requirements 副本目录 → 路线表同目录 → 引擎仓 references/requirements → 数据目录。
+    route_table = Path(config.project_route_xlsx) if config.project_route_xlsx else \
+        discover_project_route_table(config.route_xlsx, GD_ROUTE_TABLE_DIRS)
+    route_segments = load_route_segments(route_table) if route_table else []
+    if route_segments:
+        cities = len({row.get("city") for row in route_segments})
+        log(f"项目路线表读取完成：{route_table}（{len(route_segments)}个抽检路段，覆盖{cities}市）——分段/里程/管养单位/经营主体均以本表为准")
+    else:
+        log(f"项目路线表：未找到或读不出路段（显式={config.project_route_xlsx}，已搜索 "
+            f"{len(GD_ROUTE_TABLE_DIRS)} 个副本目录 + 路线表同目录 + 引擎 references/requirements + 数据目录），"
+            "退化为明细行聚合口径（①表里程不再等于路线表）")
     review_before=load_manual_review_spans(before_xlsx)
     review_after=load_manual_review_spans(config.manual_xlsx)
     if review_before: log(f"进场前人工复核覆盖读取完成（{len(review_before)}个路段）")

@@ -759,8 +759,10 @@ class T2bTemplateAlignmentTests(unittest.TestCase):
         self.assertEqual(headers, ["类型", "路线编号", "路线名称", "检测方向", "起点桩号", "终点桩号",
                                    "段长（Km)", "管养单位", "备注"])
         self.assertIsNotNone(engine.GD_TABLE_WIDTHS.get(tuple(engine._norm_header_text(h) for h in headers)))
-        # Q3 整数公里：964.986→965、40.0109→40、44.014→44
-        self.assertEqual([table.rows[1].cells[i].text.strip() for i in (4, 5, 6)], ["965", "1009", "44"])
+        # P4-10：起止桩号改**整桩号**（起点向下取整、终点向上取整）。
+        # 旧值（Q3/D19）：964.986→965（四舍五入）；新值：964→964（floor）、965（ceil）。
+        # 段长仍四舍五入不变（44.014→44）；终点桩号 1009.0 恰为整公里，floor/ceil 同为 1009。
+        self.assertEqual([table.rows[1].cells[i].text.strip() for i in (4, 5, 6)], ["964", "1009", "44"])
         self.assertEqual([table.rows[2].cells[i].text.strip() for i in (4, 5, 6)], ["1009", "2000", "991"])
         self.assertEqual([table.rows[3].cells[i].text.strip() for i in (4, 5, 6)], ["40", "60", "20"])
 
@@ -788,6 +790,118 @@ class T2bTemplateAlignmentTests(unittest.TestCase):
         self.assertEqual([c.text.strip() for c in overall.rows[1].cells[1:]], ["", "", "", ""])
         # D10：② 前置句逐字（模板句型）
         self.assertIn("抽检的各高速公路路段波形梁护栏中心高度总体合格率明细如下表所示。", body)
+
+
+class P4LayoutTests(unittest.TestCase):
+    """P4-3/4/5/8/12/13：图片尺寸/纵横比/边框/段距/行高/表图空段 —— XML 层实测。
+
+    这几条是甲方目检项，回归时必须钉死；只测「函数被调用」不够，必须读产物 XML。
+    """
+
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import tempfile
+        from docx import Document as _Doc
+        from docx.shared import Cm
+        cls._tmp = tempfile.TemporaryDirectory()
+        png = Path(cls._tmp.name) / "chart.png"
+        # 造一张 2:1 的真 PNG（1x2 像素即可，尺寸由文档里的 extent 决定）
+        png.write_bytes(bytes.fromhex(
+            "89504e470d0a1a0a0000000d4948445200000001000000020802000000907753"
+            "de0000000c4944415408d763f8cfc00000030101003c2f8a3e0000000049454e44ae426082"))
+        doc = _Doc()
+        engine.GuangdongChapterWriter._picture(doc, png)
+        cls.document = doc
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _drawing(self):
+        return next(iter(self.document.element.body.iter(f"{self.W}drawing")))
+
+    def test_picture_is_15x7_5cm_and_ratio_2(self) -> None:
+        """P4-3：宽 15cm × 高 7.5cm = 精确 2:1。"""
+        ext = self._drawing().find(f".//{self.WP}extent")
+        cx, cy = int(ext.get("cx")) / 360000, int(ext.get("cy")) / 360000
+        self.assertAlmostEqual(cx, 15.0, places=2)
+        self.assertAlmostEqual(cy, 7.5, places=2)
+        self.assertAlmostEqual(cx / cy, 2.0, places=4)
+
+    def test_picture_aspect_ratio_is_unlocked(self) -> None:
+        """P4-3：`noChangeAspect="0"`（不锁纵横比）。
+
+        旧值（v3）：python-docx `add_picture` 默认写 `"1"` —— 锁着，15×7.5 之外的图会被拉回原比例。
+        锁写在 `wp:cNvGraphicFramePr/a:graphicFrameLocks`，不是 `picLocks`。
+        """
+        locks = self._drawing().findall(f".//{self.A}graphicFrameLocks")
+        self.assertTrue(locks, "未找到 a:graphicFrameLocks")
+        for node in locks:
+            self.assertEqual(node.get("noChangeAspect"), "0")
+
+    def test_picture_paragraph_is_centered_without_indent(self) -> None:
+        """P4-4：图片段落居中 + 首行缩进 0。"""
+        node = self._drawing()
+        while node.tag != f"{self.W}p":
+            node = node.getparent()
+        ppr = node.find(f"{self.W}pPr")
+        self.assertEqual(ppr.find(f"{self.W}jc").get(f"{self.W}val"), "center")
+        self.assertEqual(ppr.find(f"{self.W}ind").get(f"{self.W}firstLine"), "0")
+
+    def test_picture_paragraph_spacing_is_12pt_before_3pt_after(self) -> None:
+        """P4-13：段前 12 磅、段后 3 磅。"""
+        node = self._drawing()
+        while node.tag != f"{self.W}p":
+            node = node.getparent()
+        spc = node.find(f"{self.W}pPr/{self.W}spacing")
+        self.assertEqual(int(spc.get(f"{self.W}before")) / 20, 12.0)
+        self.assertEqual(int(spc.get(f"{self.W}after")) / 20, 3.0)
+
+    def test_picture_border_is_1pt_solid_theme_white_darker_15(self) -> None:
+        """P4-5：边框 = 主题色「白色，深色 15%」+ 1 磅 + 实线 = #D9D9D9。
+
+        优先写主题色变体 `<a:schemeClr val="bg1"><a:lumMod 85000/>`；
+        退化路径才用同色 `<a:srgbClr val="D9D9D9"/>`，两者渲染一致。
+
+        回归点：曾写成 `lumMod 85000` + `lumOff 15000`，DrawingML 变换是
+        L' = L×lumMod + lumOff → 0.85+0.15 = 1.0，Word 渲染成**纯白**，边框等于没有。
+        所以这里必须断言 **没有 lumOff**。
+        """
+        ln = self._drawing().find(f".//{self.A}ln")
+        self.assertIsNotNone(ln, "图片无 a:ln 边框")
+        self.assertEqual(int(ln.get("w")) / 12700, 1.0)        # 1 磅
+        self.assertEqual(ln.find(f"{self.A}prstDash").get("val"), "solid")
+        fill = ln.find(f"{self.A}solidFill")[0]
+        if fill.tag == f"{self.A}schemeClr":
+            self.assertEqual(fill.get("val"), "bg1")
+            self.assertEqual(fill.find(f"{self.A}lumMod").get("val"), "85000")
+            self.assertIsNone(fill.find(f"{self.A}lumOff"),
+                              "lumMod 85000 + lumOff 15000 = 纯白，边框会消失")
+        else:                                                   # 退化：同色 RGB
+            self.assertEqual(fill.get("val"), "D9D9D9")
+
+    def test_all_table_rows_are_26pt_exact(self) -> None:
+        """P4-12：所有表格行高固定 26 磅（520 twips）、`hRule=exact`。
+
+        旧值（A2/T2h）：按表题套模板实测值（397/601/283/510…），`atLeast`。
+        """
+        self.assertEqual(engine.GD_ROW_HEIGHT_TWIPS, 520)
+        document = T2bTemplateAlignmentTests._write(T2bTemplateAlignmentTests())
+        self.assertTrue(document.tables, "报告里一张表都没有，行高无从验")
+        counts = {}
+        for table in document.tables:
+            for row in table.rows:
+                height = row._tr.find(f"{self.W}trPr/{self.W}trHeight")
+                self.assertIsNotNone(height, f"表 {table.rows[0].cells[0].text} 有行缺 trHeight")
+                key = (height.get(f"{self.W}val"), height.get(f"{self.W}hRule"))
+                counts[key] = counts.get(key, 0) + 1
+        for key, cnt in counts.items():
+            self.assertEqual(key, ("520", "exact"), f"{cnt} 行的行高不是 26 磅 exact")
+        self.assertIn(("520", "exact"), counts)
 
 
 class T2dTableLayoutTests(unittest.TestCase):
@@ -2359,7 +2473,12 @@ class ManualConsistencyRuleTests(unittest.TestCase):
         self.assertEqual(mixed["height"]["consistency_rate"], 1.0)
 
     def test_section_table_uses_row_consistent_and_drops_old_wording(self):
-        """三张 Word 表读行级 consistent；旧「测值偏差不大于允许偏差」说明必须消失。"""
+        """三张 Word 表读行级 consistent；旧「测值偏差不大于允许偏差」说明必须消失。
+
+        P4-9 口径变更：（4）人工复核对比情况里的「说明：XXX」整段被用户要求删除，
+        正文不再复述一致性口径。旧值：正文含「两侧的合格判定结果」「差值小于5记为一致」；
+        新值：两段说明均 0 残留（判定逻辑 `gd_consistent`/`gd_pass` 不变，只是文字不再复述）。
+        """
         detail, _ = engine.ManualAutoComparator(self.THRESHOLDS).compare([
             {"indicator": "height", "city": "测试市", "route": "G1", "gtype": "双波护栏",
              "segment": "K1+000~K1+100", "manual": 579.0, "automatic": 582.0},
@@ -2374,10 +2493,10 @@ class ManualConsistencyRuleTests(unittest.TestCase):
                 tables.append((title, [list(row) for row in rows])))
         body = "\n".join(paragraph.text for paragraph in document.paragraphs)
         self.assertNotIn("测值偏差不大于允许偏差", body)
-        self.assertIn("两侧的合格判定结果", body)
+        self.assertNotIn("两侧的合格判定结果", body)   # P4-9：说明段已删
         # M2：旧「螺栓缺失数量合计为0判合格」口径必须消失，改为差值口径
         self.assertNotIn("合计为0判合格", body)
-        self.assertIn("差值小于5记为一致", body)
+        self.assertNotIn("差值小于5记为一致", body)    # P4-9：说明段已删
         height_rows = dict(tables)["高速公路波形梁护栏中心高度人工复核对比明细表"]
         self.assertEqual([row[-1] for row in height_rows], ["不一致", "—"])
         self.assertEqual([row[3] for row in height_rows], ["600±20mm", "—"])
@@ -2528,7 +2647,14 @@ class Gd03ManualReviewAdviceTests(unittest.TestCase):
                          {3: ("人工检测复核结果", 3), 6: ("自动化检测结果", 3)})
         marking_row = by_title["高速公路标线逆反射亮度系数人工复核对比明细表"]["rows"][0]
         self.assertEqual(marking_row[0], "G2518")
-        self.assertEqual(marking_row[3:], ["105.76", "合格", "101.04", "合格", "一致"])
+        # P4-11：标线逆反射测值只保留 1 位小数。旧值 105.76/101.04（2 位）→ 新值 105.8/101.0。
+        self.assertEqual(marking_row[3:], ["105.8", "合格", "101.0", "合格", "一致"])
+        # P4-11：护栏中心高度只保留整数（四舍五入）。
+        height_rows = by_title["高速公路波形梁护栏中心高度人工复核对比明细表"]["rows"]
+        for row in height_rows:
+            for index in (4, 7):                      # 人工/自动化「测值」列
+                if row[index] != "—":
+                    self.assertNotIn(".", row[index], row)
         bolt_row = by_title["高速公路路侧波形梁护栏螺栓缺失人工复核对比明细表"]["rows"][0]
         # M2：螺栓无合格判定列，按两侧缺失数量差值（|1−38|=37 ≥ 阈值 5）判不一致
         self.assertEqual(bolt_row[3:], ["1", "0", "1", "30", "8", "38", "不一致"])
@@ -2938,16 +3064,16 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(len(engine.gd_owner_rows(details, owner_map, "集团")), 2)
 
     def test_owner_gap_note_is_visible_in_report_text(self):
-        """P1i：①表差额必须有产物内可见的说明句（闭合写事实句，有差额写未定主体的路线/里程/原因）。
+        """P1i/P1m：①表**有差额**时必须有产物内可见的说明句（写未定主体的路线/里程/原因）。
 
-        P1m：说明句数字改为与 ① 表同源的整数（原先 `:.3f` 精确值与整数表对不上）。
+        P4-7 口径变更：差额归零时**不再写**「已全部核定：…与该行里程一致。」那句
+        （用户要求整句删除）—— `gd_owner_gap_note` 返回 None。真实差额（江门）仍必须写明。
+        旧值：闭合时返回「…经营主体已全部核定：非省交通集团 33 km 与省交通集团 0 km
+        合计 33 km，与该行里程一致，…」；新值：None（正文无此句）。
         """
         closed = [{"route": "G0422", "direction": "下行", "category": "高速公路",
                    "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}]
-        note = engine.gd_owner_gap_note(closed, "高速公路")
-        self.assertIsNotNone(note)
-        self.assertIn("经营主体已全部核定", note or "")
-        self.assertIn("33 km", note or "")
+        self.assertIsNone(engine.gd_owner_gap_note(closed, "高速公路"))   # P4-7：闭合不写说明句
 
         gap = [{"route": "G0422", "direction": "下行", "category": "高速公路",
                 "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": None}]
@@ -3092,14 +3218,15 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
             self.assertTrue(any("未找到" in line for line in logs), logs)
 
     def test_owner_gap_note_shares_table_rounding(self):
-        """P1m：说明句与 ① 表同源同取整（整数），不再一个 3 位小数一个整数互相打架。"""
-        # 闭合：说明句数字 == ① 表三格
+        """P1m：说明句与 ① 表同源同取整（整数），不再一个 3 位小数一个整数互相打架。
+
+        P4-7 口径变更：闭合（差额=0）时**不再输出说明句**（用户要求删除「已全部核定」整句），
+        `gd_owner_gap_note` 返回 None；差额分支逐字不变，只是原因措辞随一级数据源改为
+        「项目路线表」。旧值：闭合 → 整句事实说明；新值：None。
+        """
         closed = [{"route": "G0422", "direction": "下行", "category": "高速公路",
                    "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}]
-        note = engine.gd_owner_gap_note(closed, "高速公路")
-        self.assertEqual(note, "本表「抽检高速公路」经营主体已全部核定：非省交通集团 33 km 与"
-                               "省交通集团 0 km 合计 33 km，与该行里程一致，"
-                               "「非省交通集团」与「省交通集团」两行之和等于抽检里程。")
+        self.assertIsNone(engine.gd_owner_gap_note(closed, "高速公路"))   # P4-7
 
         # 差额分支：合计 = 非集团 + 集团 + 差额 精确成立，且点名路段与里程（不再只写「—」）
         gapped = [{"route": "G4", "direction": "下行", "category": "高速公路",
@@ -5337,24 +5464,21 @@ class T2hTableDisplayTests(unittest.TestCase):
             self.assertEqual(node.get(qn("w:type")), "fixed")
 
     def test_every_row_has_template_height(self) -> None:
-        """A2：每行都有 trHeight（atLeast；模板缺值 fallback=397），③ 表首行照模板 601。"""
+        """P4-12：每行都有 `trHeight`，且**一律 26 磅（520 twips）、`hRule=exact`**。
+
+        旧值（A2/T2h）：按表题套 `GD_TABLE_HEIGHTS_BY_CAPTION` 的模板实测值（397/601/510…）、
+        `hRule=atLeast`。新值（P4-12 用户口径「所有表格行高固定 26 磅」）：全部 520 + exact。
+        """
         document = self._write()
+        seen = 0
         for table in document.tables:
             for row in table.rows:
                 node = row._tr.find(qn("w:trPr")).find(qn("w:trHeight"))
                 self.assertIsNotNone(node)
-                self.assertGreater(int(node.get(qn("w:val"))), 0)
-                self.assertEqual(node.get(qn("w:hRule")), "atLeast")
-        captions = engine.gd_table_captions(document)
-        for index, table in enumerate(document.tables):
-            expected = engine.GD_TABLE_HEIGHTS_BY_CAPTION.get(captions[index] if index < len(captions) else "")
-            if not expected:
-                continue
-            node = table.rows[0]._tr.find(qn("w:trPr")).find(qn("w:trHeight"))
-            self.assertEqual(int(node.get(qn("w:val"))), expected[0], captions[index])
-            data_heights = [int(r._tr.find(qn("w:trPr")).find(qn("w:trHeight")).get(qn("w:val")))
-                            for r in table.rows[1:]]
-            self.assertIn(expected[1], data_heights, captions[index])
+                self.assertEqual(int(node.get(qn("w:val"))), engine.GD_ROW_HEIGHT_TWIPS)
+                self.assertEqual(node.get(qn("w:hRule")), "exact")
+                seen += 1
+        self.assertGreater(seen, 0)
 
     def test_cells_use_exact_line_spacing(self) -> None:
         """A3：单元格段落 12pt 固定行距（w:spacing line=240 lineRule=exact）。"""

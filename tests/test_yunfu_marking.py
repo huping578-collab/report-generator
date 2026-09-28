@@ -3,7 +3,6 @@ from collections import Counter
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-import hashlib
 from docx import Document
 
 import openpyxl
@@ -144,13 +143,16 @@ class YunfuMarkingTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             images = engine.guangdong_report_images(bundle, tmp)
             self.assertEqual(len(images), 9)  # 4 identities x 2 sides + right-only gap（Excel 逐区段图不变）
-            doc = Document(engine.GuangdongChapterWriter.write("云浮", bundle, tmp, TEMPLATE, {"marking": 5, "height": 5, "bolt": 5}))
+            out = engine.GuangdongChapterWriter.write("云浮", bundle, tmp, TEMPLATE, {"marking": 5, "height": 5, "bolt": 5})
+            doc = Document(out)
             chart_dir = Path(tmp) / "云浮" / "charts"
-            generated = {hashlib.sha256(p.read_bytes()).hexdigest() for p in chart_dir.glob("*gd03_*.png")}
-            embedded = {hashlib.sha256(doc.part.related_parts[shape._inline.graphic.graphicData.pic.blipFill.blip.embed].blob).hexdigest()
-                        for shape in doc.inline_shapes}
-            self.assertTrue(generated, "未生成 GD03 统计图")
-            self.assertTrue(embedded and embedded <= generated, "docx 内嵌图必须来自本次生成的 GD03 统计图")
+            # P4-Chart-Native：统计图不再出 PNG 嵌 Word，改 Word 原生图表。
+            # 这里仍要求 docx 内不含任何 GD03 统计图 PNG（照片/骨架图不受影响）。
+            self.assertEqual(list(chart_dir.glob("*gd03_*.png")), [],
+                             "GD03 统计图不应再生成 PNG（已改为 Word 原生图表）")
+            for shape in doc.inline_shapes:
+                self.assertIsNone(shape._inline.graphic.graphicData.pic,
+                                 "docx 内不应再有 PNG 嵌图（统计图已改为原生图表）")
             table = next(t for t in doc.tables if "起止桩号" in [c.text for c in t.rows[0].cells])
             headers = [c.text for c in table.rows[0].cells]
             self.assertIn("管养单位", headers)
@@ -252,13 +254,16 @@ class TypicalPerKmTests(unittest.TestCase):
 
     @staticmethod
     def _marking(km, left_ok, right_ok, direction="下行", route="G94", manager="甲管养单位"):
-        """一个公里：每侧 10 个 100 m 计算单元（每单元 5 条 20 m 记录，引擎按 MARKING_UNIT_RECORDS 归并）；
-        left_ok/right_ok 为该侧合格单元数。"""
+        """一个公里：每侧 10 组 × 5 条 20 m 记录 = 50 个点位；left_ok/right_ok 为该侧合格组数。
+
+        P4f2-A 标线改**点级**口径后，点数 = 组数 × 5，合格率 = 5·ok/50 = ok/10（与旧单元口径同值），
+        所以本组用例断言的合格率全部不变，只有计数字段名 `unit_count` → `point_count`（20 → 100）。
+        """
         rows = []
         for side, ok in (("左侧标线", left_ok), ("右侧标线", right_ok)):
             for index in range(10):
                 value = 100.0 if index < ok else 10.0
-                for record in range(engine.GuangdongStatistics.MARKING_UNIT_RECORDS):
+                for record in range(5):
                     station = km * 1000.0 + index * 100.0 + record * 20.0
                     rows.append({"route": route, "direction": direction, "manager": manager,
                                  "station_m": station, "end_m": station + 20.0,
@@ -297,7 +302,7 @@ class TypicalPerKmTests(unittest.TestCase):
             self.assertEqual(row[1], "甲管养单位")
             # 该公里左侧 (km-407)%5 个单元合格、右侧 (km-406)%5 个，共 20 个单元
             left, right = (km["km"] - 407) % 5, (km["km"] - 406) % 5
-            self.assertEqual(km["unit_count"], 20)
+            self.assertEqual(km["point_count"], 100)
             self.assertAlmostEqual(km["left_rate"], left / 10)
             self.assertAlmostEqual(km["right_rate"], right / 10)
             # 总体 =（左侧率 + 右侧率）/2，两侧先按 1 位小数取整（引擎 _gd03_overall 口径）

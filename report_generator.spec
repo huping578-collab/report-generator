@@ -12,6 +12,10 @@ a = Analysis(
     datas=[
         (str(ROOT / "frontend" / "index.html"), "frontend"),
         (str(ROOT / "frontend" / "app.js"), "frontend"),
+        # P4-Chart-OOXML：Word 原生图表的静态种子（微软图表样式部件）。
+        # 桌面版必须在**没有 Word/Excel 的机器**上也能生成图表，所以它必须随包，
+        # 不能去 Temp 找。运行时路径见 backend/gd_chart_ooxml.py:seed_path()。
+        (str(ROOT / "assets" / "gd_native_chart_seed.docx"), "assets"),
         *webview_datas,
     ],
     hiddenimports=[
