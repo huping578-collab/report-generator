@@ -2798,8 +2798,10 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(dup_index.category_for_records("广州", "广河高速"), None)
 
     def test_route_code_errata_only_rewrites_the_declared_pair(self):
-        """P1d-b：茂名/G291 是录入笔误，实为 S291（用户 2026-09-27 澄清）；其它市/其它码不受影响。"""
-        self.assertEqual(engine.ROUTE_CODE_ERRATA, {("茂名", "G291"): "S291"})
+        """P1d-b：茂名/G291 是录入笔误，实为 S291（用户 2026-09-27 澄清）；其它市/其它码不受影响。
+
+        P1n-2：同源表另有 1 行连前缀都没写（`291`），同样归一到 S291。"""
+        self.assertEqual(engine.ROUTE_CODE_ERRATA, {("茂名", "G291"): "S291", ("茂名", "291"): "S291"})
         index = engine.RouteCategoryIndex({
             ("茂名", "S291"): "普通国省道", ("茂名", "S292"): "普通国省道",
             ("佛山", "G291"): "普通国省道",
@@ -2808,6 +2810,9 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(index.category_for_records("茂名", "G291"), "普通国省道")
         self.assertEqual(index.category_for_records("茂名市", " g291 "), "普通国省道")
         self.assertEqual(index.category_or_none("茂名", "G291"), "普通国省道")
+        # P1n-2：裸 `291` 同笔误，也必须归一到 S291（否则整行因判不出类别被丢出报告）
+        self.assertEqual(index.category_for_records("茂名", "291"), "普通国省道")
+        self.assertIsNone(index.category_for_records("佛山", "291"))   # 勘误只对茂名生效
         # 其它市不误伤
         self.assertEqual(index.category_for_records("佛山", "G291"), "普通国省道")
         # 茂名的其它码不受影响
@@ -2933,19 +2938,22 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
         self.assertEqual(len(engine.gd_owner_rows(details, owner_map, "集团")), 2)
 
     def test_owner_gap_note_is_visible_in_report_text(self):
-        """P1i：①表差额必须有产物内可见的说明句（闭合写事实句，有差额写未定主体的路线/里程/原因）。"""
+        """P1i：①表差额必须有产物内可见的说明句（闭合写事实句，有差额写未定主体的路线/里程/原因）。
+
+        P1m：说明句数字改为与 ① 表同源的整数（原先 `:.3f` 精确值与整数表对不上）。
+        """
         closed = [{"route": "G0422", "direction": "下行", "category": "高速公路",
                    "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}]
         note = engine.gd_owner_gap_note(closed, "高速公路")
         self.assertIsNotNone(note)
         self.assertIn("经营主体已全部核定", note or "")
-        self.assertIn("33.000", note or "")
+        self.assertIn("33 km", note or "")
 
         gap = [{"route": "G0422", "direction": "下行", "category": "高速公路",
                 "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": None}]
         note = engine.gd_owner_gap_note(gap, "高速公路")
         self.assertIsNotNone(note)
-        self.assertIn("少 33.000 km", note or "")
+        self.assertIn("另有 33 km 尚未核定经营主体", note or "")
         self.assertIn("G0422", note or "")       # 点名未核定主体的路段
         self.assertIn("未覆盖", note or "")      # 写明原因，不空话
         self.assertIsNone(engine.gd_owner_gap_note([], "高速公路"))
@@ -3007,9 +3015,10 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
     def test_owner_km_display_stays_additive_across_cities(self):
         """P1j：① 表三行里程用最大余数法取整，整数显示恒等（深圳 237=163+74，不是 238）。
 
-        精确值取自 7 市产物说明句：说明句承担 3 位小数，表承担恒等。
+        P1m：补齐只吃取整残差（每格最多 1），**不摊派真实差额**。
+        7 市的精确值全部闭合，故三个整数格不变；末尾另锁「有真实缺口时不得摊派」。
         """
-        # (全市, 非集团, 集团) → 期望的三个整数格
+        # (全市, 非集团, 集团) → 期望的三个整数格（7 市精确值闭合）
         for total, non_prov, prov, expected in (
             (226.818, 156.804, 70.014, ("227", "157", "70")),    # 东莞
             (173.065, 91.000, 82.065, ("173", "91", "82")),      # 中山
@@ -3027,12 +3036,102 @@ class GuangdongRouteTableFormatTests(unittest.TestCase):
                 self.assertLessEqual(abs(int(cells[1]) - non_prov), 1.0)
                 self.assertLessEqual(abs(int(cells[2]) - prov), 1.0)
 
-        # 无值行不参与分配，仍写「—」；说明句的 3 位小数不受影响
+        # P1m 回归：真实缺口 79km（广州退化口径）不得被摊成 540/115 —— 原实现就是这么造出
+        # 「①表闭合但与说明句矛盾」的假象。各分项按自身值取整，如实显示不闭合。
+        gap_cells = engine.gd_km_split_text(654.668, 500.647, 75.021)
+        self.assertEqual(gap_cells, ("655", "500", "75"))
+        self.assertNotEqual(int(gap_cells[1]) + int(gap_cells[2]), int(gap_cells[0]))
+        # 说明句按这三个整数倒推差额，句内 500+75+80=655 精确成立
+        # （精确值缺口是 79.000，但句子里其余三个数都是整数，用整数倒推才闭合）
+        self.assertEqual(int(gap_cells[0]) - int(gap_cells[1]) - int(gap_cells[2]), 80)
+        self.assertEqual(int(gap_cells[1]) + int(gap_cells[2]) + 80, int(gap_cells[0]))
+
+        # 无值行不参与分配，仍写「—」
         self.assertEqual(engine.gd_km_split_text(100.0, None, 60.0), ("100", "—", "60"))
-        note = engine.gd_owner_gap_note(
-            [{"route": "G0422", "direction": "下行", "category": "高速公路",
-              "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}], "高速公路")
-        self.assertIn("33.000", note or "")       # 说明句仍是 3 位精确值
+
+    def test_owner_attachment_auto_discovered_when_not_passed(self):
+        """P1m：`owner_xlsx` 忘传时自动发现附件 —— 两个入口必须逐值相同，不能静默退化成路线级口径。
+
+        P1m 实测的分叉：`run_gd.py` 传了附件、`run_gd_all.py` 没传，广州 ①表跑成
+        655=540+115（路线级）vs 655=541+114（附件桩号级）。发现逻辑放在 `merge_owner_table`
+        这个唯一出口，任何调用方漏传都拿同一份附件。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            attachment = data / "2026年全省高速公路基础信息表.xlsx"
+            book = openpyxl.Workbook()
+            sheet = book.active
+            sheet.append(["路线编码", "地市", "起点桩号", "止点桩号", "管养单位", "经营主体"])
+            sheet.append(["G0425", "广州市", 0, 18.339, "广州公路工程集团有限公司", "非集团"])
+            sheet.append(["G0425", "广州市", 18.339, 40.0, "广东京珠高速公路广珠北段有限公司", "集团"])
+            book.save(attachment)
+            route_xlsx = data / "路线分类表（含路线名称）.xlsx"
+            book2 = openpyxl.Workbook()
+            book2.active.append(["地市", "路线编码", "道路类别", "路线名称"])
+            book2.active.append(["广州市", "G0425", "高速公路", "广州－澳门"])
+            book2.save(route_xlsx)
+
+            # 不传 owner_xlsx → 自动发现同目录附件，建出带桩号的分段索引
+            index = engine.merge_owner_table(engine.RouteCategoryIndex.from_file(route_xlsx), route_xlsx)
+            self.assertEqual(len(index.owner_index), 1)
+            self.assertEqual(index.owner_route_key("广州", "G0425"), ("广州", "G0425"))
+            self.assertEqual(engine.match_owner(index.owner_index, "广州", "G0425", 0, 40, None), None)
+            self.assertEqual(engine.match_owner(index.owner_index, "广州", "G0425", 0, 18, None), "非集团")
+            self.assertEqual(engine.match_owner(index.owner_index, "广州", "G0425", 19, 40, None), "集团")
+
+            # 显式传同一份文件 → 与自动发现结果逐值相同（两个入口一致性）
+            explicit = engine.merge_owner_table(engine.RouteCategoryIndex.from_file(route_xlsx),
+                                                route_xlsx, attachment)
+            self.assertEqual(explicit.owner_index, index.owner_index)
+
+            # 目录里没有附件 → owner_index 为空，如实退化（不报错、不猜），且日志说明来源
+            logs = []
+            bare = engine.merge_owner_table(engine.RouteCategoryIndex.from_file(route_xlsx),
+                                            data / "子目录" / "不存在.xlsx", log=logs.append)
+            self.assertEqual(bare.owner_index, {})
+            self.assertTrue(any("未找到" in line for line in logs), logs)
+
+    def test_owner_gap_note_shares_table_rounding(self):
+        """P1m：说明句与 ① 表同源同取整（整数），不再一个 3 位小数一个整数互相打架。"""
+        # 闭合：说明句数字 == ① 表三格
+        closed = [{"route": "G0422", "direction": "下行", "category": "高速公路",
+                   "start": 0.0, "end": 33.0, "length_km": 33.0, "owner": "非集团"}]
+        note = engine.gd_owner_gap_note(closed, "高速公路")
+        self.assertEqual(note, "本表「抽检高速公路」经营主体已全部核定：非省交通集团 33 km 与"
+                               "省交通集团 0 km 合计 33 km，与该行里程一致，"
+                               "「非省交通集团」与「省交通集团」两行之和等于抽检里程。")
+
+        # 差额分支：合计 = 非集团 + 集团 + 差额 精确成立，且点名路段与里程（不再只写「—」）
+        gapped = [{"route": "G4", "direction": "下行", "category": "高速公路",
+                   "start": 0.0, "end": 39.0, "length_km": 39.0, "owner": "跨主体"},
+                  {"route": "G0422", "direction": "下行", "category": "高速公路",
+                   "start": 0.0, "end": 40.0, "length_km": 40.0, "owner": None}]
+        note = engine.gd_owner_gap_note(gapped, "高速公路") or ""
+        self.assertIn("非省交通集团 0 km、省交通集团 0 km", note)
+        self.assertIn("另有 79 km 尚未核定经营主体", note)
+        self.assertIn("G4 39.000 km", note)     # 跨主体拆分失败的行也要点名
+        self.assertIn("G0422 40.000 km", note)
+        # 0 + 0 + 79 = 79 → 全市取整 79，恒等在「非集团+集团+差额」这一层精确成立
+        self.assertIn("抽检里程合计 79 km", note)
+
+    def test_owner_gap_note_names_hole_inside_split_row(self):
+        """P1m：拆分行**内部空洞**也要点名（江门 G2518 实测 3.153 km）。
+
+        `gd_cross_owner_spans` 只保证分段首尾盖住整行，附件在该行桩号区间内没覆盖到的
+        中间段仍是差额。原实现「有 spans 就跳过」，江门说明句因此写成「该差额对应路段：无」——
+        差额在、路段不写，正是任务书第 2 条「「—」不接受」要禁的那种情况。
+        """
+        holed = [{"route": "G2518", "direction": "下行", "category": "高速公路",
+                  "start": 148.02, "end": 210.0, "length_km": 61.98, "owner": None,
+                  "owner_spans": [(148.02, 164.521, "非集团"), (167.674, 210.0, "集团")]}]
+        routes = engine.gd_owner_gap_routes(holed, "高速公路")
+        self.assertEqual(routes, "G2518 3.153 km")      # 61.980 - 16.501 - 42.326
+        note = engine.gd_owner_gap_note(holed, "高速公路") or ""
+        self.assertIn("该差额对应路段：G2518 3.153 km", note)
+        self.assertNotIn("对应路段：无", note)
+        # 空洞为 0 的行不点名（分段盖满）
+        full = [dict(holed[0], owner_spans=[(148.02, 210.0, "集团")])]
+        self.assertEqual(engine.gd_owner_gap_routes(full, "高速公路"), "无")
 
     def test_owner_km_rows_only_split_highway_owner_triple(self):
         """P1j：取整只作用于高速的「全市/非集团/集团」三行；普通国省道的全市/国道/省道原样。"""
@@ -5472,3 +5571,62 @@ class P1cTemplatePaletteAndRouteNameTests(unittest.TestCase):
         self.assertEqual(engine.gd_km_row_texts(
             [("XX市抽检普通国省道", {"km": 16.0}), ("XX市抽检普通国道", {"km": 8.0}),
              ("XX市抽检普通省道", {"km": 8.0})]), ["16", "8", "8"])
+
+    def test_ordinary_class_rows_split_by_route_prefix(self):
+        """P1n-1：普通①表「国道/省道」两行必须按 G/S 取**子集**，速率不再照抄全市值。
+
+        东莞 62=43+19 里程对，但三行速率 39.3/43.3/35.3 完全相同（无信息量）；
+        R1 独立反算的真实值是 G220 国道 49.52%、S120 省道 25.33%。
+        """
+        rows = [{"route": "G220"}, {"route": "G220"}, {"route": "S120"}, {"route": "S120"}]
+        self.assertEqual(len(engine.gd_class_subset(rows)), 4)               # 不筛选 = 全市
+        self.assertEqual([r["route"] for r in engine.gd_class_subset(rows, "G")], ["G220", "G220"])
+        self.assertEqual([r["route"] for r in engine.gd_class_subset(rows, "S")], ["S120", "S120"])
+        # 只有一类路线时，另一类取到空子集 → stats 全 None → 显示「—」而不是重复全市值
+        self.assertEqual(engine.gd_class_subset([{"route": "G220"}], "S"), [])
+        self.assertIsNone(engine.GuangdongStatistics.marking_overall([])["overall_rate"])
+        self.assertIsNone(engine.GuangdongStatistics.height_overall([])["rate"])
+        self.assertIsNone(engine.GuangdongStatistics.bolt_overall([])["rate"])
+        # 判据与 gd_mileage 的 class_prefix 逐字一致：里程子集与速率子集必须同源
+        inspection = [{"category": "普通国省道", "route": "G220", "length_km": 43.0},
+                      {"category": "普通国省道", "route": "S120", "length_km": 19.0}]
+        self.assertEqual(engine.gd_mileage(inspection, category="普通国省道"), 62.0)
+        self.assertEqual(engine.gd_mileage(inspection, category="普通国省道", class_prefix="G"), 43.0)
+        self.assertEqual(engine.gd_mileage(inspection, category="普通国省道", class_prefix="S"), 19.0)
+
+    def test_ordinary_class_subset_feeds_group_closures(self):
+        """P1n-1 回归：三处 group 闭包必须把 class_prefix 用到 stats 上（守卫「只传 km 不筛行」）。"""
+        source = Path(engine.__file__).read_text(encoding="utf-8")
+        for fn in ("_marking_group", "_height_group", "_bolt_group"):
+            start = source.index(f"def {fn}(subset, **km_key):")
+            body = source[start:source.index("return {", start)]
+            self.assertIn("gd_class_subset(subset, km_key.get(\"class_prefix\"))", body,
+                          f"{fn} 没用 class_prefix 筛子集，速率会照抄全市值")
+
+    def test_manual_before_rows_are_merged_into_report_detail(self):
+        """P1n-2：进场前对比表明细必须并入报告用的 manual 记录（此前只进了「覆盖里程」）。
+
+        回归依据：15 市进场前覆盖率实测全为 0% —— 不是 3 市问题。进场后工作簿只是碰巧
+        含同名路线（中山 G105/S268），桩号段与进场前那份完全不同。
+        """
+        import inspect
+        source = inspect.getsource(engine.run_guangdong_project)
+        # 明细并入发生在 build_bundles 之前，且两支各自按所在文件夹定市
+        self.assertLess(source.index("ManualAutoComparator.read_file(before_xlsx)"),
+                        source.index("build_bundles("))
+        self.assertIn("folder_city_for(before_xlsx, route_index)", source)
+        # 同文件不得自并（否则同一批行翻倍）
+        self.assertIn("Path(before_xlsx)!=Path(config.manual_xlsx)", source)
+        # 两支是同一路线的两次独立测量：仅当 (指标,路线,方向,桩号,人工,自动) 完全相同才去重，
+        # 惠州 G324 / 云浮 S265 各有 1 段桩号相同但测值与护栏型式都不同 → 必须都保留。
+        after = [{"indicator": "height", "route": "G324", "direction": "上行",
+                  "segment": "K805+200~K805+300", "manual": 593.9, "automatic": 594.035}]
+        before = [{"indicator": "height", "route": "G324", "direction": "上行",
+                   "segment": "K805+200~K805+300", "manual": 590.0, "automatic": 594.0}]
+        key = lambda r: (r.get("indicator"), r.get("route"), r.get("direction"),
+                         r.get("segment"), r.get("manual"), r.get("automatic"))
+        seen = {key(r) for r in after}
+        self.assertEqual([r for r in before if key(r) not in seen], before)   # 测值不同 → 两条都留
+        self.assertEqual([r for r in after if key(r) in {key(x) for x in before}], [])  # 完全相同才去重
+
+

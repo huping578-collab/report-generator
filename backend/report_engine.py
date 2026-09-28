@@ -3102,8 +3102,11 @@ OWNER_ALIASES = ("经营主体", "主体", "经营主体名称")
 # 路线号录入笔误勘误表：{(归一地市, 路线号原值): 正确路线号}。
 # 依据：用户 2026-09-27 澄清「茂名/G291 实为 S291」——茂名该段抽检的是省道 S291，
 # 源表「进场前人工复核原始数据（缺标线数据）.xlsx」螺栓缺失 sheet 的 5 行把 S291 误写成 G291。
+# P1n-2：同一份「进场前人工自动化对比_统计结果.xlsx」螺栓 sheet 另有 1 行连前缀都没写（`291`），
+# 桩号 K165~K166 落在同文件高度/标线 sheet 记为 S291 的 K164+900~K167+200 区间内 → 同一处笔误。
+# 该行若不归一，category_for_records 返回 None（分类表没有裸 `291` 行），整行被丢出报告。
 # 分类表本就有 茂名/S291/普通国省道 行，故不新增表行，只在记录用路线号归一入口改写。
-ROUTE_CODE_ERRATA = {("茂名", "G291"): "S291"}
+ROUTE_CODE_ERRATA = {("茂名", "G291"): "S291", ("茂名", "291"): "S291"}
 
 # 实测抽检段落入两个经营主体时写入分类表第 5 列的取值（非主体名，仅作「本行跨主体」标记）。
 CROSS_OWNER = "跨主体"
@@ -3142,15 +3145,28 @@ def load_measured_segments(root, route_index):
     return segments
 
 
-def merge_owner_table(route_index, route_xlsx, owner_xlsx=None):
+def merge_owner_table(route_index, route_xlsx, owner_xlsx=None, log=None):
     """补齐经营主体来源：附件分段索引 + 同目录带该列的路线表。
 
     优先级：`owner_xlsx`（附件《全省高速公路基础信息表》，唯一带桩号、可按 P2 消歧的源）→
     同目录的 `路线分类表（含经营主体）.xlsx`（P1d 导出，只有 (地市,路线) 级归属）→ 都没有就原样返回，
     后续如实显示「—」/「缺失」，不猜。
+
+    P1m：`owner_xlsx` 为 None 时**自动发现**附件（与本函数的「同目录发现」同思路），
+    否则调用方忘传 `GuangdongConfig.owner_xlsx` 就会静默退化成路线级口径 ——
+    P1m 实测 `run_gd.py`（传）与 `run_gd_all.py`（没传）跑出的广州 ①表 655=540+115 vs 655=541+114。
+    任何入口跑同一市必须逐值相同，所以发现放在这里这个唯一出口，而不是每个 run_*.py 各传一次。
     """
-    if owner_xlsx and not getattr(route_index, "owner_index", None):
-        route_index.owner_index = load_owner_index(owner_xlsx)
+    if not getattr(route_index, "owner_index", None):
+        found = Path(owner_xlsx) if owner_xlsx else discover_owner_xlsx(route_xlsx)
+        if found and Path(found).is_file():
+            route_index.owner_index = load_owner_index(found)
+            if log:
+                log(f"经营主体附件（权威来源，带桩号）：{found}"
+                    f"（{'显式传入' if owner_xlsx else '自动发现'}），分段索引 {len(route_index.owner_index)} 组")
+        elif log:
+            log("经营主体附件：未找到（显式路径不存在且未自动发现），"
+                "退化为路线分类表「经营主体」列（路线级、无桩号）——①表两行可能不闭合")
     if getattr(route_index, "owners", None) or not route_xlsx:
         return route_index
     try:
@@ -3168,6 +3184,31 @@ def merge_owner_table(route_index, route_xlsx, owner_xlsx=None):
             route_index.owners = other.owners
             return route_index
     return route_index
+
+
+def discover_owner_xlsx(route_xlsx=None):
+    """自动发现附件《2026年全省高速公路基础信息表.xlsx》：路线表同目录 → 引擎仓 references → 常见项目目录。
+
+    找不到返回 None（调用方如实退化为路线级口径并打日志，不静默猜）。
+    ponytail: 只认这一个文件名；将来附件改名时改这里一处，升级路径 = 读配置里的候选名列表。
+    """
+    name = "2026年全省高速公路基础信息表.xlsx"
+    folders = []
+    if route_xlsx:
+        try:
+            folders.append(Path(route_xlsx).parent)
+        except Exception:
+            pass
+    folders.append(application_root() / "references")
+    folders.append(application_root() / "requirements")
+    for folder in folders:
+        try:
+            hit = Path(folder) / name
+            if hit.is_file():
+                return hit
+        except Exception:
+            continue
+    return None
 
 
 def load_owner_index(path):
@@ -3510,6 +3551,19 @@ def gd_mileage(inspection, category=None, manager=None, route=None, direction=No
     return total if hit else None
 
 
+def gd_class_subset(rows, class_prefix=None):
+    """按道路类别细分（G=普通国道 / S=普通省道）取检测记录子集。
+
+    P1n-1：① 表「普通国道」「普通省道」两行此前只把 class_prefix 传给 gd_mileage（里程列对），
+    速率列仍用**全市** rows 算，于是 45 张普通①表的「全市/国道/省道」三行速率完全相同。
+    判据与 gd_mileage 里的 class_prefix 逐字一致，两处必须同步，否则里程与速率口径分裂。
+    """
+    if class_prefix is None:
+        return list(rows or [])
+    return [row for row in (rows or [])
+            if str(row.get("route") or "").upper().startswith(class_prefix)]
+
+
 def gd_km_text(km):
     """里程单元格：无值写「—」，否则整数显示（`{:,}` 对 float 不取整，会输出 226.818）。"""
     return "—" if km is None else f"{km:.0f}"
@@ -3522,6 +3576,14 @@ def gd_km_split_text(total, *parts):
     先各自向下取整，再把 round(全市)-Σfloor 的差值按小数余数从大到小逐个 +1，
     保证 sum(分项整数) == 整(全市)（深圳 163+75=238≠237 → 163+74=237）。
     无值（None）时该格照旧写「—」且不参与分配；全市为 None 时全走原逻辑。
+
+    P1m：补齐只允许吃掉**取整残差**，绝不摊派真实差额。
+    原实现对任意 target-Σfloor 都逐个 +1，于是把「附件未覆盖、判不出主体」的真实缺口也摊进
+    两侧：广州 500.647+75.021=575.668（差 79.000）被摊成 540+115，①表整数看着闭合，
+    却与说明句/引言的精确值直接矛盾（甲方把说明句的数字一加就露馅）。
+    判据用**真实缺口** `total - Σparts` 而非缺口格数：取整残差最多 len(parts) 格，
+    缺口 ≥0.5 km 必然来自未核定里程 → 各分项按自身值取整，如实显示不闭合，
+    由 `gd_owner_gap_note` 点名路段解释。
     """
     total_text = gd_km_text(total)
     if total is None or any(part is None for part in parts):
@@ -3529,7 +3591,8 @@ def gd_km_split_text(total, *parts):
     target = int(f"{total:.0f}")
     base = [math.floor(part) for part in parts]
     order = sorted(range(len(parts)), key=lambda i: -(parts[i] - base[i]))
-    for step in range(max(0, target - sum(base))):
+    steps = 0 if abs(total - sum(parts)) >= 0.5 else max(0, min(target - sum(base), len(parts)))
+    for step in range(steps):
         base[order[step % len(order)]] += 1
     return (total_text,) + tuple(f"{value}" for value in base)
 
@@ -3545,9 +3608,12 @@ def gd_km_row_texts(groups):
     if "非省交通集团" in labels and "省交通集团" in labels:
         i, j = labels.index("非省交通集团"), labels.index("省交通集团")
         total = next((groups[k][1]["km"] for k in range(i - 1, -1, -1) if groups[k][1]), None)
-        if groups[i][1] and groups[j][1]:
+        if total is not None and groups[i][1] and groups[j][1]:
+            # P1m：本市有高速抽检行时，某主体 0 段是**核定出来的 0 km**（云浮非省交通集团），
+            # 写 0 不写「—」——「—」在本项目里表示「无数据」（全省行同理留空），两者不能混。
+            # gd_mileage 对 0 段返回 None（hit=0），这里按 0 参与恒等，与引言/说明句同一口径。
             texts[i], texts[j] = gd_km_split_text(
-                total, groups[i][1]["km"], groups[j][1]["km"])[1:]
+                total, groups[i][1]["km"] or 0.0, groups[j][1]["km"] or 0.0)[1:]
     return texts
 
 
@@ -3561,6 +3627,12 @@ def gd_owner_gap_note(inspection, category="高速公路"):
 
     差额归零 → 事实句「已全部核定」；有差额 → 如实列出未定主体的路线与里程及原因
     （附件未覆盖该桩号 / 管养单位在附件内对应多个主体）。无数据时返回 None，不写占位。
+
+    P1m：三个数与 ① 表**同源同取整** —— 走 `gd_km_split_text`（① 表 `gd_km_row_texts` 调的同一函数），
+    句子按整数写，`合计 = 非集团 + 集团 (+ 差额)` 精确成立；原先这里按 `:.3f` 写精确值、
+    ① 表按最大余数法写整数，两套取整，广州 500.647/75.021（说明句）对 540/115（①表）直接矛盾。
+    差额分支列出**每条未定主体路段及其里程**（原先只列 `owner is None` 的路线，
+    跨主体拆分失败的行 owner 非 None，整列出来是「—」，等于没交代差额来自哪里）。
     """
     if not inspection:
         return None
@@ -3570,20 +3642,48 @@ def gd_owner_gap_note(inspection, category="高速公路"):
     parts = {owner: gd_mileage(inspection, category=category, owner=owner) or 0.0
              for owner in (GD_OWNER_NON_PROVINCIAL, GD_OWNER_PROVINCIAL)}
     gap = total - sum(parts.values())
+    cells = gd_km_split_text(total, parts[GD_OWNER_NON_PROVINCIAL], parts[GD_OWNER_PROVINCIAL])
     if abs(gap) < 5e-4:
-        return (f"本表「抽检{category}」经营主体已全部核定：非省交通集团 "
-                f"{parts[GD_OWNER_NON_PROVINCIAL]:.3f} km 与省交通集团 "
-                f"{parts[GD_OWNER_PROVINCIAL]:.3f} km 合计 {total:.3f} km，与该行里程一致，"
+        return (f"本表「抽检{category}」经营主体已全部核定：非省交通集团 {cells[1]} km 与"
+                f"省交通集团 {cells[2]} km 合计 {cells[0]} km，与该行里程一致，"
                 f"「非省交通集团」与「省交通集团」两行之和等于抽检里程。")
-    rows = [row for row in inspection if row.get("category") == category and row.get("owner") is None]
-    detail = "、".join(f"{row.get('route') or '—'}" for row in rows) or "—"
-    return (f"本表「抽检{category}」经营主体核定说明：抽检里程合计 {total:.3f} km，"
-            f"其中非省交通集团 {parts[GD_OWNER_NON_PROVINCIAL]:.3f} km、省交通集团 "
-            f"{parts[GD_OWNER_PROVINCIAL]:.3f} km，两者之和较抽检里程少 {gap:.3f} km；"
-            f"该差额对应里程尚未核定经营主体，涉及路段：{detail}。"
+    # 差额按**已显示的整数**倒推，保证句内 合计 = 非集团 + 集团 + 差额 逐位成立
+    # （用 float 的 gap 四舍五入会与句子里另外三个整数对不上，甲方一加就露馅）。
+    left = int(cells[0]) - int(cells[1]) - int(cells[2])
+    return (f"本表「抽检{category}」经营主体核定说明：抽检里程合计 {cells[0]} km，"
+            f"其中非省交通集团 {cells[1]} km、省交通集团 {cells[2]} km，"
+            f"另有 {left} km 尚未核定经营主体，三者之和等于抽检里程合计；"
+            f"该差额对应路段：{gd_owner_gap_routes(inspection, category)}。"
             f"原因为《2026年全省高速公路基础信息表》未覆盖上述路段的桩号区间，"
             f"且其管养单位在附件中未唯一对应一个经营主体，故不作推定、不摊派，"
             f"该部分里程不计入上述两行。")
+
+
+def gd_owner_gap_routes(inspection, category="高速公路"):
+    """差额里程对应的路段清单（`G2518 3.153 km`）；无差额返回「无」。
+
+    差额的两种来源都要点名（P1m，江门 G2518 实测）：
+      ① 整行判不出主体：`owner` 既不是集团也不是非集团（None / `跨主体` / 其他值）且无桩号分段；
+      ② 拆分行**内部空洞**：`owner_spans` 首尾盖住整行（`gd_cross_owner_spans` 的守卫），
+         但附件在该行桩号区间内没覆盖到，中间留了洞 —— 这段里程两侧都不落，
+         却因为「这行有 spans」而被漏掉（P1m 首版就栽在这，江门说明句写了「无」）。
+    两者都按**该行实际未落侧的里程**点名，不写「—」。
+    """
+    out = []
+    for row in inspection or ():
+        if row.get("category") != category:
+            continue
+        km = _float(row.get("length_km")) or 0.0
+        spans = row.get("owner_spans")
+        if spans:
+            hole = km - sum(b - a for a, b, value in spans if value in (GD_OWNER_PROVINCIAL, GD_OWNER_NON_PROVINCIAL))
+        elif str(row.get("owner") or "") in (GD_OWNER_PROVINCIAL, GD_OWNER_NON_PROVINCIAL):
+            continue
+        else:
+            hole = km
+        if hole > 5e-4:
+            out.append(f"{row.get('route') or '—'} {hole:.3f} km")
+    return "、".join(out) or "无"
 
 
 # 跨主体行只在「≥2 个主体且桩号分段首尾完整覆盖该行起止」时才拆；其余情况返回 None，
@@ -6014,7 +6114,8 @@ class GuangdongChapterWriter:
         # G1（用户第 3 轮）：① 总体情况 下只保留合格率/缺失率句——模板该节无统计口径段，删除原第 2 段。
         # P1b：km 改由 gd_mileage 从清单表行求和（mileage 键 = 分组键），不再按检测单元数算。
         def _marking_group(subset, **km_key):
-            subset_units = GuangdongStatistics.marking_units(subset)
+            # P1n-1：class_prefix 同时筛「检测记录子集」与里程口径，速率不再照抄全市值
+            subset_units = GuangdongStatistics.marking_units(gd_class_subset(subset, km_key.get("class_prefix")))
             overall_sub = GuangdongStatistics.marking_overall(subset_units)
             return {"km": gd_mileage(inspection, category=category, **km_key),
                     "overall": overall_sub["overall_rate"], "left": overall_sub["left_rate"],
@@ -6170,7 +6271,8 @@ class GuangdongChapterWriter:
         # G1（用户第 3 轮）：① 总体情况 下只保留合格率句（删除原有效检测点/判定标准段）。
         # P1b：km 改由 gd_mileage 从清单表行求和（分组键 = 里程分组键），不再按覆盖公里桶数算。
         def _height_group(subset, **km_key):
-            sub_stats = GuangdongStatistics.height_overall(subset)
+            # P1n-1：同 _marking_group，速率按道路类别子集算
+            sub_stats = GuangdongStatistics.height_overall(gd_class_subset(subset, km_key.get("class_prefix")))
             return {"km": gd_mileage(inspection, category=category, **km_key), "overall": sub_stats["rate"],
                     "two": sub_stats["二波"]["rate"], "three": sub_stats["三波"]["rate"]}
 
@@ -6320,7 +6422,8 @@ class GuangdongChapterWriter:
         # G1（用户第 3 轮）：① 总体情况 下只保留缺失率句（删除原应安装/缺失数量口径段）。
         # P1b：km 改由 gd_mileage 从清单表行求和（分组键 = 里程分组键），不再按覆盖公里桶数算。
         def _bolt_group(subset, **km_key):
-            sub_stats = GuangdongStatistics.bolt_overall(subset)
+            # P1n-1：同 _marking_group，速率按道路类别子集算
+            sub_stats = GuangdongStatistics.bolt_overall(gd_class_subset(subset, km_key.get("class_prefix")))
             return {"km": gd_mileage(inspection, category=category, **km_key), "overall": sub_stats["rate"],
                     "splice": sub_stats["splice_rate"], "conn": sub_stats["conn_rate"]}
 
@@ -8081,7 +8184,7 @@ def run_guangdong_project(config, log=lambda _x: None):
     if config.guardrail_dir and not config.guardrail_dir.is_dir():
         raise FileNotFoundError(f"护栏数据文件夹不存在：{config.guardrail_dir}")
     route_index=merge_owner_table(RouteCategoryIndex.from_file(config.route_xlsx),config.route_xlsx,
-                                 getattr(config,"owner_xlsx",None)); log("路线分类表读取完成")
+                                 getattr(config,"owner_xlsx",None),log); log("路线分类表读取完成")
 
     scanned = {"height": [], "bolt": [], "marking": [], "notes": [], "issues": []}
     if config.marking_dir or config.guardrail_dir:
@@ -8136,11 +8239,28 @@ def run_guangdong_project(config, log=lambda _x: None):
     if not any(scanned[k] for k in ("marking","height","bolt")): raise ValueError("未识别到任何有效数据")
     manual,manual_issues=ManualAutoComparator.read_file(config.manual_xlsx); scanned["issues"].extend(manual_issues)
     # R2：人工复核对比明细行同样以所在市文件夹定市（“地市”列不再决定归属），否则 build_bundles
-    # 的 norm(city)==key 过滤会把整批行丢掉。进场前对比表当前只用于「人工复核覆盖里程」（按
-    # 路线/方向，不含地市），无归属行可丢；若后续接入其明细行，同用 folder_city_for(config.manual_before_xlsx, route_index)。
+    # 的 norm(city)==key 过滤会把整批行丢掉。
     manual_city=folder_city_for(config.manual_xlsx, route_index)
     if manual_city:
         for row in manual: row["city"]=manual_city
+    # P1n-2：进场前对比表此前**只**用于「人工复核覆盖里程」（load_manual_review_spans），
+    # 其明细行从未进 manual → 三张人工复核对比明细表整支缺进场前数据。
+    # 实测 15 市进场前覆盖率全为 0%（不是 3 市）：进场后工作簿只是「碰巧」含同名路线
+    # （中山 G105/S268），桩号段与进场前那份完全不同，按路线名比对会误判为「两支都有」。
+    # 两支按并集读入：进场前/进场后是同一路线的两次独立测量（惠州 G324、云浮 S265 各有
+    # 1 段桩号相同但人工/自动测值与护栏型式都不同，是两次测量而非重复行），故不按段去重。
+    before_xlsx=config.manual_before_xlsx or detect_manual_before_workbook(config.project_dir)
+    if before_xlsx and Path(before_xlsx)!=Path(config.manual_xlsx):
+        before,before_issues=ManualAutoComparator.read_file(before_xlsx); scanned["issues"].extend(before_issues)
+        before_city=folder_city_for(before_xlsx, route_index)
+        if before_city:
+            for row in before: row["city"]=before_city
+        seen={(r.get("indicator"),r.get("route"),r.get("direction"),r.get("segment"),
+               r.get("manual"),r.get("automatic")) for r in manual}
+        manual.extend(row for row in before
+                      if (row.get("indicator"),row.get("route"),row.get("direction"),row.get("segment"),
+                          row.get("manual"),row.get("automatic")) not in seen)
+        log(f"进场前人工复核对比明细并入 {len(before)} 行（{before_xlsx}）")
     route_name_path=config.route_name_xlsx or detect_route_name_workbook(config.project_dir)
     route_names=load_route_names(route_name_path) if route_name_path else {}
     if route_names: log(f"路线名称表读取完成：{route_name_path}（{len(route_names)}条路线）")
@@ -8155,7 +8275,7 @@ def run_guangdong_project(config, log=lambda _x: None):
         log("无法判定道路类别的记录 0 行")
     route_segments=load_route_segments(config.route_xlsx)
     if route_segments: log(f"路线表起止桩号读取完成：{config.route_xlsx}（{len(route_segments)}个抽检路段）")
-    review_before=load_manual_review_spans(config.manual_before_xlsx or detect_manual_before_workbook(config.project_dir))
+    review_before=load_manual_review_spans(before_xlsx)
     review_after=load_manual_review_spans(config.manual_xlsx)
     if review_before: log(f"进场前人工复核覆盖读取完成（{len(review_before)}个路段）")
     for bundle in bundles.values():
